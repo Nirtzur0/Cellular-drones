@@ -1,7 +1,7 @@
-"""Join cell-sighting records with the nearest GPS fix on monotonic time.
+"""Join UE sightings with the nearest GPS fix on monotonic time.
 
 Inputs:
-  one or more `scan-*.jsonl` (cell sightings, gps possibly null)
+  one or more `ue-*.jsonl`   (UE sightings, gps possibly null)
   one or more `gps-*.jsonl`  (geotag-only records)
 
 Output:
@@ -67,7 +67,7 @@ def join(scan_paths: list[str], gps_paths: list[str], out_dir: str,
     try:
         for p in scan_paths:
             for rec in read_jsonl(p):
-                if rec.get("kind") != "cell_sighting":
+                if rec.get("kind") != "ue_sighting":
                     continue
                 mid = rec["mission_id"]
                 gps_list = gps_by_mission.get(mid, [])

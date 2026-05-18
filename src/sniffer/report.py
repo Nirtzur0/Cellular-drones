@@ -1,73 +1,91 @@
-"""Human-readable summary + trajectory/RSRP/localization plot.
+"""Human-readable summary + per-UE positioning plot.
 
 Reads the same `geotagged-*.jsonl` files the localizer reads. Plot uses
-matplotlib's default Agg backend so it runs headless.
+matplotlib's Agg backend so it runs headless.
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
-import math
 import os
 from collections import defaultdict
 
-from sniffer.localize import locate_file, weighted_centroid, path_loss_wls
+from sniffer.localize import path_loss_wls_ue, weighted_centroid_ue
 from sniffer.schema import read_jsonl
 
 
 def _summarize(records: list[dict]) -> dict:
-    by_pci: dict[int, list[dict]] = defaultdict(list)
-    geotagged = 0
+    """Group ue_sighting records by (PCI, C-RNTI)."""
+    groups: dict[tuple, list[dict]] = defaultdict(list)
     untagged = 0
+    geotagged = 0
     for r in records:
-        if r.get("kind") != "cell_sighting":
+        if r.get("kind") != "ue_sighting":
             continue
         if not r.get("gps"):
             untagged += 1
             continue
         geotagged += 1
-        by_pci[int(r["cell"]["pci"])].append(r)
+        key = (int(r["ue"]["pci"]), int(r["ue"]["c_rnti"]))
+        groups[key].append(r)
     return {
         "total": geotagged + untagged,
         "geotagged": geotagged,
         "untagged": untagged,
-        "by_pci": by_pci,
+        "by_ue": groups,
     }
 
 
-def text_summary(path: str) -> str:
+def text_summary(path: str, default_ues=None) -> str:
     records = list(read_jsonl(path))
     summary = _summarize(records)
-    lines = []
-    lines.append(f"# Report for {path}")
-    lines.append(f"  total sightings:    {summary['total']}")
-    lines.append(f"  geotagged:          {summary['geotagged']}")
-    lines.append(f"  untagged (dropped): {summary['untagged']}")
-    lines.append(f"  unique PCIs:        {len(summary['by_pci'])}")
-    lines.append("")
-    for pci, recs in sorted(summary["by_pci"].items()):
-        rsrp_vals = [r["cell"]["rsrp_dbm"] for r in recs if r["cell"].get("rsrp_dbm") is not None]
-        lines.append(f"PCI {pci}: {len(recs)} samples, "
-                     f"RSRP min={min(rsrp_vals):.1f} max={max(rsrp_vals):.1f} dBm")
-        cent = weighted_centroid(recs)
-        wls = path_loss_wls(recs)
-        if cent is not None:
-            alt = f"{cent.alt_m:.1f}" if cent.alt_m is not None else "—"
-            lines.append(f"  centroid: lat={cent.lat:.6f} lon={cent.lon:.6f} "
-                         f"alt={alt}m cep95={cent.cep95_m:.1f}m")
-            if cent.notes:
-                lines.append(f"    {cent.notes}")
-        if wls is not None:
-            alt = f"{wls.alt_m:.1f}" if wls.alt_m is not None else "—"
-            lines.append(f"  WLS:      lat={wls.lat:.6f} lon={wls.lon:.6f} "
-                         f"alt={alt}m cep95={wls.cep95_m:.1f}m")
+    truth_by_rnti = {ue.c_rnti: ue for ue in (default_ues or [])}
+    lines = [
+        f"# UE report for {path}",
+        f"  total UE sightings:    {summary['total']}",
+        f"  geotagged:             {summary['geotagged']}",
+        f"  untagged (dropped):    {summary['untagged']}",
+        f"  unique (PCI, C-RNTI):  {len(summary['by_ue'])}",
+        "",
+    ]
+    if not summary["by_ue"]:
+        lines.append("  (no UE sightings — confirm the LTESniffer feed is live)")
+        return "\n".join(lines)
+    for (pci, rnti), recs in sorted(summary["by_ue"].items()):
+        ul = [r for r in recs
+              if (r.get("ue") or {}).get("direction", "").lower() == "ul"
+              and r["ue"].get("ul_rssi_dbm") is not None]
+        dl = [r for r in recs
+              if (r.get("ue") or {}).get("direction", "").lower() == "dl"]
+        lines.append(f"PCI {pci} C-RNTI {rnti:#06x}: "
+                     f"{len(recs)} grants ({len(ul)} UL, {len(dl)} DL)")
+        if ul:
+            ul_vals = [r["ue"]["ul_rssi_dbm"] for r in ul]
+            lines.append(f"  UL RSSI min={min(ul_vals):.1f} max={max(ul_vals):.1f} dBm")
+            cent = weighted_centroid_ue(recs)
+            wls = path_loss_wls_ue(recs)
+            if cent is not None:
+                alt = f"{cent.alt_m:.1f}" if cent.alt_m is not None else "—"
+                lines.append(f"  centroid: lat={cent.lat:.6f} lon={cent.lon:.6f} "
+                             f"alt={alt}m cep95={cent.cep95_m:.1f}m")
+            if wls is not None:
+                alt = f"{wls.alt_m:.1f}" if wls.alt_m is not None else "—"
+                lines.append(f"  WLS:      lat={wls.lat:.6f} lon={wls.lon:.6f} "
+                             f"alt={alt}m cep95={wls.cep95_m:.1f}m")
+            if rnti in truth_by_rnti and cent is not None:
+                from pyproj import Geod
+                _, _, err = Geod(ellps="WGS84").inv(
+                    truth_by_rnti[rnti].lon, truth_by_rnti[rnti].lat,
+                    cent.lon, cent.lat)
+                tag = " (mobile UE — bias expected)" if truth_by_rnti[rnti].waypoints else ""
+                lines.append(f"  error vs truth (centroid): {err:.1f} m{tag}")
+        else:
+            lines.append("  (no UL grants — DL-only grants cannot localize a UE)")
     return "\n".join(lines)
 
 
-def make_plot(path: str, out_png: str,
-              ground_truth_lat: float | None = None,
-              ground_truth_lon: float | None = None,
+def make_plot(path: str, out_png: str, truth_ues=None,
               title: str | None = None) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -75,46 +93,62 @@ def make_plot(path: str, out_png: str,
     import numpy as np
 
     records = list(read_jsonl(path))
-    by_pci: dict[int, list[dict]] = defaultdict(list)
-    for r in records:
-        if r.get("kind") != "cell_sighting":
+    summary = _summarize(records)
+    fig, ax = plt.subplots(figsize=(9, 8))
+
+    truth_by_rnti = {ue.c_rnti: ue for ue in (truth_ues or [])}
+    traj_lats = [r["gps"]["lat"] for r in records
+                 if r.get("kind") == "ue_sighting" and r.get("gps")]
+    traj_lons = [r["gps"]["lon"] for r in records
+                 if r.get("kind") == "ue_sighting" and r.get("gps")]
+    if traj_lats:
+        ax.plot(traj_lons, traj_lats, color="#999", linewidth=0.6,
+                alpha=0.5, label="drone trajectory")
+
+    colors = plt.cm.tab10.colors
+    sc = None
+    for i, ((pci, rnti), recs) in enumerate(sorted(summary["by_ue"].items())):
+        color = colors[i % len(colors)]
+        ul = [r for r in recs
+              if (r.get("ue") or {}).get("direction", "").lower() == "ul"]
+        if not ul:
             continue
-        if not r.get("gps"):
-            continue
-        by_pci[int(r["cell"]["pci"])].append(r)
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-
-    for pci, recs in sorted(by_pci.items()):
-        lats = np.array([r["gps"]["lat"] for r in recs])
-        lons = np.array([r["gps"]["lon"] for r in recs])
-        rsrp = np.array([r["cell"]["rsrp_dbm"] for r in recs])
-        sc = ax.scatter(lons, lats, c=rsrp, cmap="viridis", s=18,
-                        label=f"PCI {pci} (n={len(recs)})", alpha=0.85)
-        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label("RSRP (dBm)")
-
-        cent = weighted_centroid(recs)
+        lats = np.array([r["gps"]["lat"] for r in ul])
+        lons = np.array([r["gps"]["lon"] for r in ul])
+        ul_rssi = np.array([r["ue"]["ul_rssi_dbm"] for r in ul])
+        sc = ax.scatter(lons, lats, c=ul_rssi, cmap="viridis", s=22,
+                        marker="o", edgecolors=[color], linewidths=1.2,
+                        label=f"C-RNTI {rnti:#06x} (n={len(ul)} UL)",
+                        alpha=0.85)
+        cent = weighted_centroid_ue(recs)
+        wls = path_loss_wls_ue(recs)
         if cent is not None:
-            ax.plot(cent.lon, cent.lat, marker="x", color="red",
-                    markersize=14, mew=3,
-                    label=f"PCI {pci} centroid")
-        wls = path_loss_wls(recs)
+            ax.plot(cent.lon, cent.lat, marker="x", color=color,
+                    markersize=14, mew=2.4)
         if wls is not None:
-            ax.plot(wls.lon, wls.lat, marker="+", color="darkorange",
-                    markersize=18, mew=3,
-                    label=f"PCI {pci} WLS")
-
-    if ground_truth_lat is not None and ground_truth_lon is not None:
-        ax.plot(ground_truth_lon, ground_truth_lat, marker="*",
-                color="black", markersize=18, label="ground truth")
+            ax.plot(wls.lon, wls.lat, marker="+", color=color,
+                    markersize=18, mew=2.4)
+        if rnti in truth_by_rnti:
+            t = truth_by_rnti[rnti]
+            if t.waypoints:
+                t_lats = [w.lat for w in t.waypoints]
+                t_lons = [w.lon for w in t.waypoints]
+                ax.plot(t_lons, t_lats, linestyle=":", color=color,
+                        linewidth=1.4, alpha=0.7,
+                        label=f"C-RNTI {rnti:#06x} truth path")
+            else:
+                ax.plot(t.lon, t.lat, marker="*", color=color, markersize=16,
+                        markeredgecolor="black", markeredgewidth=0.7,
+                        label=f"C-RNTI {rnti:#06x} truth")
+    if sc is not None:
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("UL RSSI (dBm)")
 
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    ax.set_title(title or "Drone trajectory, RSRP, and emitter estimate")
+    ax.set_title(title or "Drone trajectory + per-UE positioning (UL only)")
     ax.grid(True, alpha=0.3)
     ax.set_aspect("equal", adjustable="datalim")
-    # Tight legend, dedupe duplicate scatter color entries
     handles, labels = ax.get_legend_handles_labels()
     seen = set()
     keep = []
@@ -133,8 +167,6 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("input_glob", help="glob for geotagged-*.jsonl files")
     p.add_argument("--plot", help="path to write PNG (optional)")
-    p.add_argument("--truth-lat", type=float, default=None)
-    p.add_argument("--truth-lon", type=float, default=None)
     args = p.parse_args()
     paths = sorted(glob.glob(args.input_glob))
     if not paths:
@@ -147,7 +179,7 @@ def main() -> int:
             out = args.plot if len(paths) == 1 else (
                 args.plot.replace(".png", f"-{os.path.basename(path)}.png")
             )
-            make_plot(path, out, args.truth_lat, args.truth_lon)
+            make_plot(path, out)
             print(f"wrote plot: {out}")
     return 0
 

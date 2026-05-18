@@ -1,13 +1,13 @@
 """Synthetic data sources for end-to-end pipeline testing.
 
-We can't plug a HackRF into a remote runner, so this module produces
-text streams that look like:
+We can't plug a USRP into a CI runner, so this module produces text
+streams that look like:
 
-  • `CellSearch` stdout (parsed by `sniffer.parse_cellsearch`)
+  • LTESniffer `DECODED key=value` lines (parsed by `sniffer.parse_ltesniffer`)
   • `gpspipe -w` JSON stream (parsed by `sniffer.parse_gpsd`)
 
-…for a configurable emitter and drone trajectory under a log-distance
-path-loss model with optional shadow fading.
+…for a configurable eNB + UE roster + drone trajectory under a
+log-distance path-loss model with optional shadow fading.
 
 The same module powers the `demo` entry point and the `tests/test_e2e.py`
 integration test.
@@ -56,17 +56,43 @@ class Waypoint:
 
 
 @dataclass
+class UeProfile:
+    """A virtual UE attached to a cell. Has its own location + activity rate.
+
+    `waypoints`, if set, makes the UE mobile; otherwise it sits at (lat, lon, alt_m).
+    `activity_rate_hz` is the average rate of PDCCH grants visible for this UE.
+    `c_rnti` is the temporary connection ID — we expose it as configurable so
+    simulator tests can pin it.
+    """
+
+    c_rnti: int
+    lat: float
+    lon: float
+    alt_m: float = 1.5
+    tx_power_dbm: float = 23.0       # typical UE max-power Cat-4
+    antenna_gain_db: float = 0.0
+    n_path_loss: float = 3.2          # UL link tends to be slightly worse than DL
+    activity_rate_hz: float = 1.0     # average grants per second (DL+UL combined)
+    ul_share: float = 0.4             # fraction of grants that are UL
+    waypoints: list[Waypoint] = field(default_factory=list)
+
+
+@dataclass
 class SimulationConfig:
     mission_id: str = "sim-mission"
     emitter: Emitter = field(
         default_factory=lambda: Emitter(lat=32.0853, lon=34.7818, alt_m=25.0)
     )
     waypoints: list[Waypoint] = field(default_factory=list)
-    sample_period_s: float = 0.5  # one CellSearch line every 0.5 s
+    ues: list[UeProfile] = field(default_factory=list)
     gps_period_s: float = 0.1     # one gpsd TPV every 0.1 s
+    ltesniffer_period_s: float = 0.05  # PDCCH decode tick (20 Hz)
     shadow_fading_db: float = 1.5
     seed: int = 0
+    # eNB-DL is the gate: if the drone can't even hear the cell, no PDCCH
+    # decode happens. UL grants then gate further on UE→drone link budget.
     detect_threshold_rsrp_dbm: float = -110.0
+    ul_detect_threshold_dbm: float = -120.0
 
 
 def box_trajectory(emitter: Emitter, half_size_m: float = 150.0,
@@ -153,74 +179,168 @@ def _rsrp_dbm(em: Emitter, w: Waypoint, rng: random.Random,
     return rsrp
 
 
-def _rsrq_db(rsrp_dbm: float) -> float:
-    # Crude mapping: link gets worse with weaker RSRP, capped between -20..-3
-    return max(-20.0, min(-3.0, -10.0 + 0.2 * (rsrp_dbm + 90)))
-
-
-def _snr_db(rsrp_dbm: float, rng: random.Random) -> float:
-    return max(-5.0, rsrp_dbm + 100.0 + rng.gauss(0.0, 1.0))
-
-
-def cellsearch_lines(cfg: SimulationConfig) -> Iterator[str]:
-    """Yield text lines as if from the LTE-Cell-Scanner JiaoXianjun fork.
-
-    Mirrors both output blocks the real binary produces:
-      • realtime per-detection block (cell ID / PSS ID / RX power / residual
-        frequency offset / k_factor)
-      • end-of-scan summary table (DPX CID A fc freq-offset RXPWR C nRB ...)
-    """
-    rng = random.Random(cfg.seed + 1)
-    em = cfg.emitter
-    if not cfg.waypoints:
-        return
-    yield f"# simulated CellSearch stream for mission {cfg.mission_id}\n"
-    yield f"Scanning EARFCN {em.earfcn} ({em.center_hz / 1e6:.1f} MHz)\n"
-    t = cfg.waypoints[0].t_offset_s
-    t_end = cfg.waypoints[-1].t_offset_s
-    detections = 0
-    last_rxpwr: float | None = None
-    last_freq_off: float | None = None
-    while t <= t_end:
-        w = _interp_waypoint(cfg.waypoints, t)
-        if w is None:
-            t += cfg.sample_period_s
-            continue
-        rsrp = _rsrp_dbm(em, w, rng, cfg.shadow_fading_db)
-        if rsrp >= cfg.detect_threshold_rsrp_dbm:
-            freq_off_hz = rng.gauss(0.0, 250.0)
-            k_factor = 1.0 + rng.gauss(0.0, 1.5e-7)
-            yield (f"Detected a FDD cell! At freqeuncy {em.center_hz/1e6:.1f}MHz, "
-                   f"try {detections}\n")
-            yield f"  cell ID: {em.pci}\n"
-            yield f"   PSS ID: {em.n_id_2}\n"
-            yield f"  RX power level: {rsrp:.2f} dB\n"
-            yield f"  residual frequency offset: {freq_off_hz:.1f} Hz\n"
-            yield f"                   k_factor: {k_factor:.8f}\n"
-            yield "\n"
-            detections += 1
-            last_rxpwr = rsrp
-            last_freq_off = freq_off_hz
-        t += cfg.sample_period_s
-
-    # End-of-scan summary table with the richer identity fields.
-    if detections > 0 and last_rxpwr is not None:
-        n_ports = 2
-        n_rb_dl = 50  # 10 MHz cell
-        crystal = 0.99999987
-        yield "Detected the following cells:\n"
-        yield "DPX:TDD/FDD; A: #antenna ports; CP: normal/extended; PR: PHICH resource\n"
-        yield "DPX CID A      fc   freq-offset RXPWR C nRB P  PR CrystalCorrectionFactor\n"
-        yield (f"FDD {em.pci}  {n_ports}  {em.center_hz/1e6:.1f}M   "
-               f"{last_freq_off or 0:.1f}Hz   {last_rxpwr:.2f} N  {n_rb_dl} N 1/6 "
-               f"{crystal:.8f}\n")
-        yield "\n"
-
-
 def _utc_iso(mission_start_unix: float, t_offset: float) -> str:
     return time.strftime(
         "%Y-%m-%dT%H:%M:%SZ", time.gmtime(mission_start_unix + t_offset)
     )
+
+
+def _ue_position(ue: UeProfile, t: float) -> Waypoint:
+    """Where the UE is at simulation time `t`. Stationary UEs return their
+    fixed location; mobile UEs interpolate along their waypoint list."""
+    if not ue.waypoints:
+        return Waypoint(lat=ue.lat, lon=ue.lon, alt_m=ue.alt_m, t_offset_s=t)
+    interp = _interp_waypoint(ue.waypoints, t)
+    if interp is None:
+        # Before/after the UE's track — clamp to nearest endpoint.
+        anchor = ue.waypoints[0] if t < ue.waypoints[0].t_offset_s else ue.waypoints[-1]
+        return Waypoint(lat=anchor.lat, lon=anchor.lon, alt_m=anchor.alt_m,
+                        t_offset_s=t)
+    return interp
+
+
+def _ul_rssi_dbm(ue: UeProfile, ue_pos: Waypoint, drone: Waypoint,
+                 carrier_hz: float, rng: random.Random,
+                 shadow_db: float) -> float:
+    """UL signal energy at the drone receiver from the UE.
+
+    Same log-distance model as the DL link, but with UE-side EIRP and a
+    slightly steeper path-loss exponent (UEs are at ground level, dense
+    scatter dominates).
+    """
+    _, _, ground_d = GEOD.inv(ue_pos.lon, ue_pos.lat, drone.lon, drone.lat)
+    d = math.sqrt(ground_d ** 2 + (drone.alt_m - ue_pos.alt_m) ** 2)
+    d = max(1.0, d)
+    eirp = ue.tx_power_dbm + ue.antenna_gain_db
+    l0 = 20.0 * math.log10(4.0 * math.pi * carrier_hz / 299_792_458.0)
+    rssi = eirp - l0 - 10.0 * ue.n_path_loss * math.log10(d)
+    if shadow_db > 0:
+        rssi += rng.gauss(0.0, shadow_db)
+    return rssi
+
+
+def _default_ues(emitter: Emitter) -> list[UeProfile]:
+    """Three synthetic UEs around the emitter.
+
+    Two stationary (localizable), one moving across the scene (intentionally
+    biased — exposes the limit of single-RX positioning for mobile targets).
+    """
+    cos_lat = math.cos(math.radians(emitter.lat))
+    # Stationary UE just NE of the eNB, at street level.
+    ue_a = UeProfile(
+        c_rnti=0x4ad2,
+        lat=emitter.lat + 50.0 / 111_320.0,
+        lon=emitter.lon + 60.0 / (111_320.0 * cos_lat),
+        alt_m=1.5, activity_rate_hz=1.8, ul_share=0.4,
+    )
+    # Stationary UE further SW, weaker UL.
+    ue_b = UeProfile(
+        c_rnti=0x73a1,
+        lat=emitter.lat - 80.0 / 111_320.0,
+        lon=emitter.lon - 40.0 / (111_320.0 * cos_lat),
+        alt_m=1.5, activity_rate_hz=1.2, ul_share=0.3,
+    )
+    # Mobile UE: walks from W → E across the cell during the mission.
+    track: list[Waypoint] = []
+    for i in range(20):
+        f = i / 19.0
+        dx = -100.0 + f * 200.0
+        dy = -10.0 + f * 20.0
+        track.append(Waypoint(
+            lat=emitter.lat + dy / 111_320.0,
+            lon=emitter.lon + dx / (111_320.0 * cos_lat),
+            alt_m=1.5,
+            t_offset_s=f * 240.0,
+        ))
+    ue_c = UeProfile(
+        c_rnti=0x91ff,
+        lat=track[0].lat, lon=track[0].lon, alt_m=1.5,
+        activity_rate_hz=2.4, ul_share=0.5, waypoints=track,
+    )
+    return [ue_a, ue_b, ue_c]
+
+
+def ltesniffer_lines(cfg: SimulationConfig) -> Iterator[str]:
+    """Yield DECODED key=value lines as if from `LTESniffer --dl-only`.
+
+    Each tick (`ltesniffer_period_s`), every UE *may* be granted a PDCCH DCI
+    according to its activity rate. UL grants carry `ul_rssi_dbm` (UE energy
+    at the drone). DL grants carry `dl_rsrp_dbm` (eNB energy at the drone)
+    and are mostly informational — DL energy is the same for all UEs on this
+    cell, so it doesn't help per-UE positioning.
+    """
+    rng = random.Random(cfg.seed + 3)
+    em = cfg.emitter
+    if not cfg.waypoints:
+        return
+    ues = cfg.ues if cfg.ues else _default_ues(em)
+    yield f"# simulated LTESniffer stream for mission {cfg.mission_id}\n"
+    yield (f"# target cell PCI={em.pci} EARFCN={em.earfcn} "
+           f"@ {em.center_hz/1e6:.1f} MHz\n")
+    t = cfg.waypoints[0].t_offset_s
+    t_end = cfg.waypoints[-1].t_offset_s
+    frame = 0
+    subframe = 0
+    while t <= t_end:
+        # A simulated-clock marker on every tick. Parser ignores comment
+        # lines; the demo driver picks these up to advance its simulated
+        # mono_ns clock so GPS↔UE timestamp joins line up.
+        yield f"# TICK t={t:.6f}\n"
+        drone = _interp_waypoint(cfg.waypoints, t)
+        if drone is None:
+            t += cfg.ltesniffer_period_s
+            subframe = (subframe + 1) % 10
+            if subframe == 0:
+                frame = (frame + 1) % 1024
+            continue
+
+        dl_rsrp = _rsrp_dbm(em, drone, rng, cfg.shadow_fading_db)
+        # Cell unreachable from the drone in this position — no PDCCH decode.
+        if dl_rsrp < cfg.detect_threshold_rsrp_dbm:
+            t += cfg.ltesniffer_period_s
+            subframe = (subframe + 1) % 10
+            if subframe == 0:
+                frame = (frame + 1) % 1024
+            continue
+
+        for ue in ues:
+            # Bernoulli scheduling per tick.
+            p_grant = ue.activity_rate_hz * cfg.ltesniffer_period_s
+            if rng.random() >= p_grant:
+                continue
+            ue_pos = _ue_position(ue, t)
+            is_ul = rng.random() < ue.ul_share
+            if is_ul:
+                rssi = _ul_rssi_dbm(ue, ue_pos, drone, em.center_hz, rng,
+                                    cfg.shadow_fading_db)
+                if rssi < cfg.ul_detect_threshold_dbm:
+                    continue
+                mcs = rng.randint(2, 24)
+                n_prb = rng.choice([1, 2, 4, 8, 16])
+                tbs = 50 + mcs * n_prb * 8
+                yield (
+                    f"DECODED frame={frame} subframe={subframe} "
+                    f"pci={em.pci} c_rnti={ue.c_rnti:#06x} "
+                    f"format=0 direction=UL "
+                    f"mcs={mcs} prb={n_prb} tbs={tbs} "
+                    f"ul_rssi_dbm={rssi:.2f}\n"
+                )
+            else:
+                mcs = rng.randint(4, 27)
+                n_prb = rng.choice([2, 4, 8, 16, 25, 50])
+                tbs = 80 + mcs * n_prb * 10
+                yield (
+                    f"DECODED frame={frame} subframe={subframe} "
+                    f"pci={em.pci} c_rnti={ue.c_rnti:#06x} "
+                    f"format=1A direction=DL "
+                    f"mcs={mcs} prb={n_prb} tbs={tbs} "
+                    f"dl_rsrp_dbm={dl_rsrp:.2f}\n"
+                )
+
+        t += cfg.ltesniffer_period_s
+        subframe = (subframe + 1) % 10
+        if subframe == 0:
+            frame = (frame + 1) % 1024
 
 
 def gpsd_lines(cfg: SimulationConfig,

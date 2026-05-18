@@ -1,21 +1,19 @@
-"""End-to-end pipeline test.
+"""End-to-end UE pipeline test.
 
 Drives the simulator through every production stage:
-    simulate → CellSearch parser → JSONL
-    simulate → gpsd parser       → JSONL
-    geotag joiner                → geotagged JSONL
-    localizer (centroid + WLS)   → estimated emitter location
+    simulate → LTESniffer parser → ue-*.jsonl
+    simulate → gpsd parser       → gps-*.jsonl
+    geotag joiner                → geotagged-*.jsonl
+    localizer (per-RNTI)         → estimated UE positions
 
-Asserts that the recovered emitter position is within tolerance of the
-synthetic ground truth.
+Asserts that the recovered position of each stationary UE is within
+tolerance of the synthetic ground truth.
 """
 
 from __future__ import annotations
 
-import os
 import tempfile
 
-import pytest
 from pyproj import Geod
 
 from sniffer import demo
@@ -29,45 +27,34 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return d
 
 
-def test_e2e_box_pipeline_localizes_within_50m():
+def test_e2e_ue_pipeline_localizes_stationary_ues():
+    """Two of the three synthetic UEs are stationary; the third walks
+    across the cell. We only assert tight bounds for the stationary pair —
+    the mobile UE is expected to bias by ~200 m, the known limit of
+    single-RX passive positioning.
+    """
     with tempfile.TemporaryDirectory() as td:
-        result = demo.run(out_dir=td, mission_id="t-box", scenario="box")
-        em = result["emitter"]
-        # The pipeline must produce records at each stage.
-        assert result["cellsearch_records"] > 0
+        result = demo.run(out_dir=td, mission_id="t-ues", scenario="box")
+        assert result["ue_records"] > 0
         assert result["gpsd_records"] > 0
         assert result["geotagged_records"] > 0
-        # The output JSONL must exist and be non-empty.
-        assert os.path.getsize(result["geotagged_path"]) > 0
 
-        # Localizer reads the geotagged JSONL.
-        centroid_results = locate_file(result["geotagged_path"], "centroid")
-        wls_results = locate_file(result["geotagged_path"], "wls")
-        assert len(centroid_results) == 1
-        assert len(wls_results) == 1
+        results = locate_file(result["geotagged_path"], "centroid")
+        assert len(results) == 3
+        by_rnti = {r.c_rnti: r for r in results}
+        truth_by_rnti = {ue.c_rnti: ue for ue in result["ues"]}
 
-        err_centroid = _haversine_m(
-            em.lat, em.lon, centroid_results[0].lat, centroid_results[0].lon
-        )
-        err_wls = _haversine_m(
-            em.lat, em.lon, wls_results[0].lat, wls_results[0].lon
-        )
-        # Box trajectory surrounds the emitter — both methods should be tight.
-        assert err_centroid < 80.0, f"centroid {err_centroid:.1f}m too large"
-        assert err_wls < 60.0, f"WLS {err_wls:.1f}m too large"
+        for rnti in (0x4ad2, 0x73a1):  # stationary UEs
+            est = by_rnti[rnti]
+            truth = truth_by_rnti[rnti]
+            err = _haversine_m(truth.lat, truth.lon, est.lat, est.lon)
+            assert err < 100.0, (
+                f"stationary UE {rnti:#06x} error {err:.1f} m too large"
+            )
 
-
-def test_e2e_line_pipeline_runs_and_is_in_the_right_neighborhood():
-    """Line trajectory is poorly conditioned — we only check the pipeline
-    doesn't crash and the centroid lands on the correct side of the world."""
-    with tempfile.TemporaryDirectory() as td:
-        result = demo.run(out_dir=td, mission_id="t-line", scenario="line")
-        em = result["emitter"]
-        centroid_results = locate_file(result["geotagged_path"], "centroid")
-        assert len(centroid_results) == 1
-        err = _haversine_m(
-            em.lat, em.lon, centroid_results[0].lat, centroid_results[0].lon
-        )
-        # Line passes 200 m offset → centroid will be biased toward the line.
-        # We expect ~200 m error here; just confirm we're not wildly diverging.
+        # Mobile UE: confirm the pipeline produced a result on the correct
+        # side of the world (< 500 m), without asserting accuracy.
+        est = by_rnti[0x91ff]
+        truth = truth_by_rnti[0x91ff]
+        err = _haversine_m(truth.lat, truth.lon, est.lat, est.lon)
         assert err < 500.0

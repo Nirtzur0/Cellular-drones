@@ -34,8 +34,8 @@ class Attitude:
 
 @dataclass
 class RadioConfig:
-    backend: str  # lte-cell-scanner | falcon | ltesniffer | srsran
-    device: str  # e.g. hackrf-0000...
+    backend: str  # ltesniffer | srsran | sim
+    device: str  # e.g. usrp-b210-0000...
     earfcn: Optional[int] = None
     center_hz: Optional[float] = None
     bandwidth_hz: Optional[float] = None
@@ -45,37 +45,45 @@ class RadioConfig:
 
 
 @dataclass
-class CellInfo:
+class UeEvent:
+    """One PDCCH-decoded event for a single UE.
+
+    A UE is identified by its C-RNTI within the cell (PCI). The same physical
+    handset rotates C-RNTI on every RRC reconnection, so per-RNTI "tracks"
+    are connection-scoped, not subscriber-scoped.
+    """
+
     pci: int
-    n_id_1: Optional[int] = None
-    n_id_2: Optional[int] = None
-    mode: str = "fdd"  # fdd | tdd
-    cp: str = "normal"  # normal | extended
-    n_ports: Optional[int] = None
-    rsrp_dbm: Optional[float] = None
-    rsrq_db: Optional[float] = None
-    snr_db: Optional[float] = None
-    frame_offset_samples: Optional[int] = None
-    mib: dict[str, Any] = field(default_factory=dict)
-    sib1: dict[str, Any] = field(default_factory=dict)
+    c_rnti: int
+    direction: str = "dl"          # dl | ul
+    dci_format: str = ""           # e.g. "1A", "0", "1", "1B"
+    mcs: Optional[int] = None
+    n_prb: Optional[int] = None
+    harq_id: Optional[int] = None
+    tbs_bytes: Optional[int] = None
+    # Energy measured by our passive receiver:
+    #   ul_rssi_dbm  → for UL grants, this is the UE's transmission at our RX
+    #   dl_rsrp_dbm  → for DL grants, this is the eNB's transmission (same for all UEs on cell)
+    ul_rssi_dbm: Optional[float] = None
+    dl_rsrp_dbm: Optional[float] = None
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class CellSighting:
-    """One row of the JSONL log."""
+class UeSighting:
+    """One row of the JSONL log for a C-RNTI sighting."""
 
     mission_id: str
     capture_id: str
     ts_mono_ns: int
     ts_utc: str
     radio: RadioConfig
-    cell: CellInfo
+    ue: UeEvent
     gps: Optional[GpsFix] = None
     attitude: Optional[Attitude] = None
-    rnti: Optional[list[dict[str, Any]]] = None  # populated on USRP only
     notes: str = ""
     schema_version: int = SCHEMA_VERSION
-    kind: str = "cell_sighting"
+    kind: str = "ue_sighting"
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))

@@ -1,13 +1,17 @@
-"""RSSI-based emitter localization from a single moving receiver.
+"""RSSI-based UE localization from a single moving receiver.
 
 Implements the methods described in docs/localization.md. Coordinate
 math is done in a local ENU frame anchored at the trajectory centroid;
 results are converted back to WGS84 at the end.
 
+Only UL grants contribute to a UE's position estimate — DL grants come
+from the eNB so they trilaterate the cell, not the UE. The PDCCH-decode
+pipeline still records DL grants (for an activity timeline / DCI stats),
+but they never enter this module.
+
 Methods:
-  weighted_centroid  — robust day-1 baseline.
-  path_loss_wls      — weighted least squares against a log-distance model.
-  synthetic_aperture_aoa — stub; needs CSI.
+  weighted_centroid_ue  — robust baseline.
+  path_loss_wls_ue      — weighted least squares against a log-distance model.
 
 CLI:
   python -m sniffer.localize <geotagged-*.jsonl> [--method centroid|wls]
@@ -21,6 +25,7 @@ import json
 import math
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 from pyproj import Geod
@@ -59,6 +64,7 @@ def _enu_to_ll(x, y, z, lat0, lon0, alt0=0.0):
 @dataclass
 class LocalizationResult:
     pci: int
+    c_rnti: int
     n_samples: int
     method: str
     lat: float
@@ -70,80 +76,80 @@ class LocalizationResult:
     notes: str = ""
 
 
-def _rsrp_to_linear(rsrp_dbm: float) -> float:
-    return 10 ** (rsrp_dbm / 10.0)
+def _linear(power_dbm: float) -> float:
+    return 10 ** (power_dbm / 10.0)
 
 
-def _group_by_pci(records: list[dict]) -> dict[int, list[dict]]:
-    by_pci: dict[int, list[dict]] = defaultdict(list)
+def _ue_power(r: dict) -> Optional[float]:
+    """Per-UE positioning consumes only UL grants — DL grants share the
+    eNB's transmission across every UE on the cell."""
+    ue = r.get("ue") or {}
+    if ue.get("direction", "").lower() != "ul":
+        return None
+    return ue.get("ul_rssi_dbm")
+
+
+def _group_by_ue(records: list[dict]) -> dict[tuple[int, int], list[dict]]:
+    out: dict[tuple[int, int], list[dict]] = defaultdict(list)
     for r in records:
-        if r.get("kind") != "cell_sighting":
+        if r.get("kind") != "ue_sighting":
             continue
         if r.get("gps") is None:
             continue
-        cell = r["cell"]
-        if cell.get("rsrp_dbm") is None:
+        if _ue_power(r) is None:
             continue
-        by_pci[int(cell["pci"])].append(r)
-    return by_pci
+        ue = r["ue"]
+        out[(int(ue["pci"]), int(ue["c_rnti"]))].append(r)
+    return out
 
 
-def weighted_centroid(records: list[dict], k: float = 2.0) -> LocalizationResult | None:
+def _weighted_centroid_core(records: list[dict],
+                            power_fn: Callable[[dict], float],
+                            k: float) -> Optional[dict]:
     if len(records) < 2:
         return None
     lats = np.array([r["gps"]["lat"] for r in records])
     lons = np.array([r["gps"]["lon"] for r in records])
     alts = np.array([r["gps"]["alt_m"] for r in records])
-    rsrp = np.array([r["cell"]["rsrp_dbm"] for r in records])
-    weights = np.array([_rsrp_to_linear(v) ** (k / 2.0) for v in rsrp])
+    power = np.array([power_fn(r) for r in records])
+    weights = np.array([_linear(v) ** (k / 2.0) for v in power])
     weights /= weights.sum()
     lat_hat = float(np.sum(weights * lats))
     lon_hat = float(np.sum(weights * lons))
     alt_var = float(np.var(alts))
     altitude_estimated = math.sqrt(alt_var) >= MIN_ALT_STDDEV_M
     alt_hat = float(np.sum(weights * alts)) if altitude_estimated else None
-    # crude covariance from sample dispersion (m^2) in local ENU
     xs, ys, _ = _ll_to_enu(lats, lons, alts, lat_hat, lon_hat)
     var_xy = float(np.var(xs) + np.var(ys))
-    cep95 = 2.45 * math.sqrt(var_xy / len(records))  # ~95% CEP for 2D normal
-    return LocalizationResult(
-        pci=int(records[0]["cell"]["pci"]),
+    cep95 = 2.45 * math.sqrt(var_xy / len(records))
+    notes = "" if altitude_estimated else (
+        f"altitude not estimated: trajectory alt stddev "
+        f"{math.sqrt(alt_var):.1f}m < {MIN_ALT_STDDEV_M}m"
+    )
+    return dict(
         n_samples=len(records),
         method="weighted_centroid",
-        lat=lat_hat,
-        lon=lon_hat,
-        alt_m=alt_hat,
-        cov_xy_m2=var_xy,
-        cep95_m=cep95,
-        altitude_estimated=altitude_estimated,
-        notes="" if altitude_estimated else (
-            f"altitude not estimated: trajectory alt stddev "
-            f"{math.sqrt(alt_var):.1f}m < {MIN_ALT_STDDEV_M}m"
-        ),
+        lat=lat_hat, lon=lon_hat, alt_m=alt_hat,
+        cov_xy_m2=var_xy, cep95_m=cep95,
+        altitude_estimated=altitude_estimated, notes=notes,
     )
 
 
-def path_loss_wls(records: list[dict], n_path_loss: float = 3.0,
-                  d0_m: float = 1.0) -> LocalizationResult | None:
-    """Weighted least squares against log-distance path loss.
-
-    Solves for emitter (x_e, y_e, z_e) given measurements (x_i, y_i, z_i, RSRP_i)
-    by linearizing the path-loss equation around an initial guess from the
-    weighted centroid and iterating Gauss-Newton a few times.
-    """
-    init = weighted_centroid(records)
+def _path_loss_wls_core(records: list[dict],
+                        power_fn: Callable[[dict], float],
+                        n_path_loss: float) -> Optional[dict]:
+    init = _weighted_centroid_core(records, power_fn, k=2.0)
     if init is None:
         return None
     lons = np.array([r["gps"]["lon"] for r in records])
     lats = np.array([r["gps"]["lat"] for r in records])
     alts = np.array([r["gps"]["alt_m"] for r in records])
-    xs, ys, zs = _ll_to_enu(lats, lons, alts, init.lat, init.lon)
+    xs, ys, zs = _ll_to_enu(lats, lons, alts, init["lat"], init["lon"])
     xs = np.asarray(xs); ys = np.asarray(ys); zs = np.asarray(zs)
-    rsrp = np.array([r["cell"]["rsrp_dbm"] for r in records])
-    # Normalize: define path loss relative to first sample to drop P_tx.
-    idx0 = int(np.argmax(rsrp))  # anchor on strongest sample
-    dl = rsrp[idx0] - rsrp  # positive for samples weaker than anchor
-    estimate_z = init.altitude_estimated
+    power = np.array([power_fn(r) for r in records])
+    idx0 = int(np.argmax(power))
+    dl = power[idx0] - power
+    estimate_z = init["altitude_estimated"]
     z_fixed = float(np.mean(zs))
 
     def residuals(params):
@@ -158,8 +164,6 @@ def path_loss_wls(records: list[dict], n_path_loss: float = 3.0,
         predicted = 10.0 * n_path_loss * np.log10(d_ / d_a)
         return dl - predicted
 
-    # Trust-region bounds: keep the search within ~5 km of the trajectory
-    # centroid (the local ENU origin), and altitude within reasonable AGL.
     x0 = [0.0, 0.0] + ([z_fixed] if estimate_z else [])
     if estimate_z:
         bounds = ([-5000.0, -5000.0, -200.0], [5000.0, 5000.0, 1000.0])
@@ -178,44 +182,59 @@ def path_loss_wls(records: list[dict], n_path_loss: float = 3.0,
         return init
     p = np.array([result.x[0], result.x[1],
                   result.x[2] if estimate_z else z_fixed])
-    lat_e, lon_e, alt_e = _enu_to_ll(p[0], p[1], p[2], init.lat, init.lon)
-    # Residual-based covariance proxy
+    lat_e, lon_e, alt_e = _enu_to_ll(p[0], p[1], p[2], init["lat"], init["lon"])
     final_res = residuals(result.x)
     cov_xy = float(np.var(final_res)) / max(1, len(records) - 2)
     cep95 = 2.45 * math.sqrt(cov_xy)
-    return LocalizationResult(
-        pci=int(records[0]["cell"]["pci"]),
+    return dict(
         n_samples=len(records),
         method="path_loss_wls",
-        lat=float(lat_e),
-        lon=float(lon_e),
+        lat=float(lat_e), lon=float(lon_e),
         alt_m=float(alt_e) if estimate_z else None,
-        cov_xy_m2=cov_xy,
-        cep95_m=cep95,
-        altitude_estimated=estimate_z,
+        cov_xy_m2=cov_xy, cep95_m=cep95,
+        altitude_estimated=estimate_z, notes="",
     )
 
 
-def synthetic_aperture_aoa(records: list[dict]):
-    """Placeholder. Requires CSI from LTE-Cell-Scanner-CSI fork.
-
-    See docs/localization.md §4.
+def weighted_centroid_ue(records: list[dict],
+                         k: float = 2.0) -> LocalizationResult | None:
+    """Per-UE weighted centroid. Records must all share one (pci, c_rnti)
+    and at least two must be UL grants with non-null `ul_rssi_dbm`.
     """
-    raise NotImplementedError(
-        "synthetic_aperture_aoa needs CSI samples; enable the CSI capture "
-        "fork and revisit when records carry per-subcarrier phase data."
+    ul = [r for r in records if _ue_power(r) is not None]
+    core = _weighted_centroid_core(ul, _ue_power, k=k)
+    if core is None:
+        return None
+    ue0 = ul[0]["ue"]
+    return LocalizationResult(
+        pci=int(ue0["pci"]),
+        c_rnti=int(ue0["c_rnti"]),
+        **core,
+    )
+
+
+def path_loss_wls_ue(records: list[dict],
+                     n_path_loss: float = 3.2) -> LocalizationResult | None:
+    ul = [r for r in records if _ue_power(r) is not None]
+    core = _path_loss_wls_core(ul, _ue_power, n_path_loss=n_path_loss)
+    if core is None:
+        return None
+    ue0 = ul[0]["ue"]
+    return LocalizationResult(
+        pci=int(ue0["pci"]),
+        c_rnti=int(ue0["c_rnti"]),
+        **core,
     )
 
 
 def locate_file(path: str, method: str) -> list[LocalizationResult]:
     records = list(read_jsonl(path))
-    by_pci = _group_by_pci(records)
     results: list[LocalizationResult] = []
-    for pci, recs in sorted(by_pci.items()):
+    for _key, recs in sorted(_group_by_ue(records).items()):
         if method == "centroid":
-            r = weighted_centroid(recs)
+            r = weighted_centroid_ue(recs)
         elif method == "wls":
-            r = path_loss_wls(recs)
+            r = path_loss_wls_ue(recs)
         else:
             raise ValueError(f"unknown method {method}")
         if r is not None:
@@ -229,8 +248,7 @@ def main() -> int:
     p.add_argument("--method", choices=("centroid", "wls"), default="centroid")
     args = p.parse_args()
     for path in sorted(glob.glob(args.input_glob)):
-        results = locate_file(path, args.method)
-        for r in results:
+        for r in locate_file(path, args.method):
             print(json.dumps(r.__dict__, separators=(",", ":")))
     return 0
 
