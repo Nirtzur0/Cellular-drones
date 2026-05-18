@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import Callable
 
 from sniffer.schema import GeotagRecord, GpsFix, mono_ns
 
@@ -26,7 +27,8 @@ def _fix_label(tpv: dict) -> str:
     return _MODE_MAP.get(int(tpv.get("mode", 0)), "none")
 
 
-def parse_stream(input_stream, output_stream, mission_id: str) -> int:
+def parse_stream(input_stream, output_stream, mission_id: str,
+                 clock_ns: Callable[[], int] = mono_ns) -> int:
     n = 0
     for raw in input_stream:
         raw = raw.strip()
@@ -42,7 +44,7 @@ def parse_stream(input_stream, output_stream, mission_id: str) -> int:
             continue
         rec = GeotagRecord(
             mission_id=mission_id,
-            ts_mono_ns=mono_ns(),
+            ts_mono_ns=clock_ns(),
             ts_utc=msg.get("time", ""),
             gps=GpsFix(
                 lat=float(msg["lat"]),

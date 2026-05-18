@@ -23,13 +23,32 @@ A documented upgrade path swaps in a USRP B210 to unlock PDCCH/RNTI decoding.
 - [`docs/hardware-tradeoffs.md`](docs/hardware-tradeoffs.md) — why HackRF caps at cell discovery, and what changes with USRP.
 - [`docs/localization.md`](docs/localization.md) — 3D positioning from a moving drone (RSSI methods today, TDOA later).
 
-## Quick start (macOS + HackRF)
+## Quick start
+
+### Hardware-free demo (use this first to validate the pipeline)
 
 ```bash
-./scripts/install-macos.sh                  # Homebrew install of hackrf, lte-cell-scanner, gpsd, python deps
-./scripts/cell-scan.sh 1840e6 1845e6        # scan LTE band 3 DL block, write JSONL to data/
-python -m sniffer.geotag data/scan-*.jsonl  # merge with NMEA GPS log
-python -m sniffer.localize data/geotagged-*.jsonl  # weighted-centroid + RSSI gradient localization
+pip install -r requirements.txt
+pip install -e .
+python -m sniffer.demo --out-dir data/demo --scenario box --plot data/demo/box.png
+```
+
+This runs a synthetic emitter + 1535-sample box drone trajectory through every
+pipeline stage (CellSearch parser → gpsd parser → geotag joiner → localizer
+→ PNG report). On a clean checkout, centroid localization recovers the
+emitter to within ~1 m horizontal and WLS to within ~50 m.
+
+`--scenario line` exercises a single straight pass; the plot makes the
+geometric limitation (no cross-track resolution from one pass) obvious.
+
+### Real radio on macOS + HackRF
+
+```bash
+./scripts/install-macos.sh                              # Homebrew install + LTE-Cell-Scanner from source
+./scripts/gps-logger.sh &                               # tail gpsd → data/gps-<mission>.jsonl
+./scripts/cell-scan.sh 1840e6 1845e6                    # scan LTE band 3 DL block → data/scan-<mission>.jsonl
+python -m sniffer.geotag 'data/scan-*.jsonl'            # merge with GPS, → data/geotagged-<mission>.jsonl
+python -m sniffer.report 'data/geotagged-*.jsonl' --plot data/report.png
 ```
 
 ## Repo layout

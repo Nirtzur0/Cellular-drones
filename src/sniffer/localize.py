@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from pyproj import Geod
+from scipy.optimize import least_squares
 
 from sniffer.schema import read_jsonl
 
@@ -143,50 +144,44 @@ def path_loss_wls(records: list[dict], n_path_loss: float = 3.0,
     idx0 = int(np.argmax(rsrp))  # anchor on strongest sample
     dl = rsrp[idx0] - rsrp  # positive for samples weaker than anchor
     estimate_z = init.altitude_estimated
-    # Start from the centroid in ENU, not the origin (which IS the centroid
-    # in our local frame but the iteration is more stable with a small kick
-    # away from a singular point in symmetric geometries).
-    p = np.array([1.0, 1.0, 0.0 if estimate_z else float(np.mean(zs))])
-    lam = 1e-3  # Levenberg-Marquardt damping
-    last_norm = math.inf
-    for _ in range(30):
-        dx = xs - p[0]; dy = ys - p[1]; dz = zs - p[2]
-        d = np.sqrt(dx * dx + dy * dy + dz * dz) + 1e-3
-        d_anchor = math.sqrt(dx[idx0] ** 2 + dy[idx0] ** 2 + dz[idx0] ** 2) + 1e-3
-        predicted = 10 * n_path_loss * np.log10(d / d_anchor)
-        residual = dl - predicted
-        # d(predicted_i)/dp_x = c * (-dx_i/d_i^2 + dx_anchor/d_anchor^2)
-        c = 10.0 * n_path_loss / math.log(10.0)
-        Jx = c * (dx[idx0] / (d_anchor ** 2) - dx / (d * d))
-        Jy = c * (dy[idx0] / (d_anchor ** 2) - dy / (d * d))
-        Jz = c * (dz[idx0] / (d_anchor ** 2) - dz / (d * d))
-        J = np.column_stack([Jx, Jy, Jz]) if estimate_z else np.column_stack([Jx, Jy])
-        # Levenberg-Marquardt normal equations: (J^T J + λI) Δ = J^T r
-        JTJ = J.T @ J
-        damping = lam * np.diag(np.diag(JTJ) + 1.0)
-        try:
-            step = np.linalg.solve(JTJ + damping, J.T @ residual)
-        except np.linalg.LinAlgError:
-            break
-        if not np.all(np.isfinite(step)):
-            break
+    z_fixed = float(np.mean(zs))
+
+    def residuals(params):
         if estimate_z:
-            p[:3] += step
+            px, py, pz = params
         else:
-            p[:2] += step
-        rnorm = float(np.linalg.norm(residual))
-        if rnorm < last_norm:
-            lam *= 0.5
-        else:
-            lam *= 2.0
-        last_norm = rnorm
-        if np.linalg.norm(step) < 1e-3:
-            break
-    if not np.all(np.isfinite(p)):
-        return init  # fall back to centroid result
+            px, py = params
+            pz = z_fixed
+        dx_ = xs - px; dy_ = ys - py; dz_ = zs - pz
+        d_ = np.sqrt(dx_ * dx_ + dy_ * dy_ + dz_ * dz_) + 1e-3
+        d_a = math.sqrt(dx_[idx0] ** 2 + dy_[idx0] ** 2 + dz_[idx0] ** 2) + 1e-3
+        predicted = 10.0 * n_path_loss * np.log10(d_ / d_a)
+        return dl - predicted
+
+    # Trust-region bounds: keep the search within ~5 km of the trajectory
+    # centroid (the local ENU origin), and altitude within reasonable AGL.
+    x0 = [0.0, 0.0] + ([z_fixed] if estimate_z else [])
+    if estimate_z:
+        bounds = ([-5000.0, -5000.0, -200.0], [5000.0, 5000.0, 1000.0])
+    else:
+        bounds = ([-5000.0, -5000.0], [5000.0, 5000.0])
+
+    try:
+        result = least_squares(
+            residuals, x0=x0, bounds=bounds,
+            method="trf", loss="huber", f_scale=3.0, max_nfev=200,
+        )
+    except Exception:
+        return init
+
+    if not np.all(np.isfinite(result.x)):
+        return init
+    p = np.array([result.x[0], result.x[1],
+                  result.x[2] if estimate_z else z_fixed])
     lat_e, lon_e, alt_e = _enu_to_ll(p[0], p[1], p[2], init.lat, init.lon)
     # Residual-based covariance proxy
-    cov_xy = float(np.var(residual)) / max(1, len(records) - 2)
+    final_res = residuals(result.x)
+    cov_xy = float(np.var(final_res)) / max(1, len(records) - 2)
     cep95 = 2.45 * math.sqrt(cov_xy)
     return LocalizationResult(
         pci=int(records[0]["cell"]["pci"]),

@@ -22,7 +22,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 from sniffer.schema import (
     CellInfo,
@@ -47,7 +47,7 @@ def _as_int(value: str) -> Optional[int]:
     return int(f) if f is not None else None
 
 
-def _flush(buf: dict, args) -> Optional[CellSighting]:
+def _flush(buf: dict, args, clock_ns: Callable[[], int]) -> Optional[CellSighting]:
     if "pci" not in buf:
         return None
     radio = RadioConfig(
@@ -74,7 +74,7 @@ def _flush(buf: dict, args) -> Optional[CellSighting]:
     return CellSighting(
         mission_id=args.mission_id,
         capture_id=args.device,
-        ts_mono_ns=mono_ns(),
+        ts_mono_ns=clock_ns(),
         ts_utc=utc_iso(),
         radio=radio,
         cell=cell,
@@ -98,8 +98,12 @@ _FIELD_MAP = {
 _INT_FIELDS = {"n_id_1", "n_id_2", "pci", "n_ports", "frame_offset_samples"}
 
 
-def parse_stream(input_stream, args, output_stream) -> int:
+def parse_stream(input_stream, args, output_stream,
+                 clock_ns: Callable[[], int] = mono_ns) -> int:
     """Read CellSearch output line by line, write JSONL records.
+
+    `clock_ns` is injectable so deterministic tests can drive a simulated
+    timeline; defaults to `time.monotonic_ns`.
 
     Returns the number of records emitted.
     """
@@ -110,7 +114,7 @@ def parse_stream(input_stream, args, output_stream) -> int:
         line = raw.rstrip("\n")
         if _BLOCK_START.search(line):
             if in_block:
-                rec = _flush(buf, args)
+                rec = _flush(buf, args, clock_ns)
                 if rec is not None:
                     output_stream.write(rec.to_jsonl() + "\n")
                     output_stream.flush()
@@ -121,7 +125,7 @@ def parse_stream(input_stream, args, output_stream) -> int:
         if not in_block:
             continue
         if not line.strip():
-            rec = _flush(buf, args)
+            rec = _flush(buf, args, clock_ns)
             if rec is not None:
                 output_stream.write(rec.to_jsonl() + "\n")
                 output_stream.flush()
@@ -145,7 +149,7 @@ def parse_stream(input_stream, args, output_stream) -> int:
             parsed = _as_float(value)
         if parsed is not None:
             buf[slot] = parsed
-    rec = _flush(buf, args)
+    rec = _flush(buf, args, clock_ns)
     if rec is not None:
         output_stream.write(rec.to_jsonl() + "\n")
         output_stream.flush()
