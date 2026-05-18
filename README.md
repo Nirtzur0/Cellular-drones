@@ -51,6 +51,22 @@ python -m sniffer.geotag 'data/scan-*.jsonl'            # merge with GPS, → da
 python -m sniffer.report 'data/geotagged-*.jsonl' --plot data/report.png
 ```
 
+### Live dashboard (browser)
+
+Realtime view of detections as they come off the HackRF: PCI, carrier
+frequency, RSRP/RSRQ/SNR, sighting count, RSRP sparkline. Stdlib HTTP +
+Server-Sent Events — no extra deps.
+
+```bash
+./scripts/live-dashboard.sh --simulate                  # no radio, fake cells (UI sanity check)
+./scripts/live-dashboard.sh                             # defaults: 1840–1845 MHz, step 100 kHz
+./scripts/live-dashboard.sh 1840e6 1845e6 100e3         # custom band
+```
+
+Then open <http://127.0.0.1:8000/>. The same JSONL captures stream to
+`data/scan-<mission>.jsonl` so the post-flight pipeline still works
+unchanged.
+
 ## Repo layout
 
 ```
