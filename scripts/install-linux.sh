@@ -76,11 +76,10 @@ Done. Quick sanity check:
 
   source $PY_VENV/bin/activate
   export PATH="$SRC_DIR/LTESniffer/build/src:\$PATH"
-  python3 -m sniffer.demo --out-dir data/demo --plot data/demo/ues.png
+  sniffer demo --plot data/demo/ues.png
 
 To run against real hardware (USRP B210 + cell on EARFCN 1850 / PCI 271):
 
-  ./scripts/ue-sniff.sh 1850 271 --rx-gain 50
-  ./scripts/live-dashboard.sh           # or python3 -m sniffer.live --ltesniffer-cmd "..."
+  sniffer live --earfcn 1850 --pci 271 --rx-gain 50
 
 EOF

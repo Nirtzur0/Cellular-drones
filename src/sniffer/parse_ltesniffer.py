@@ -18,8 +18,9 @@ Notes:
   can do its own dissection without re-parsing stdout.
 
 This module is deliberately format-tolerant: real LTESniffer text output
-drifts across versions, so the wrapper script normalises into this form
-and we parse the normalised form here. See `scripts/ue-sniff.sh`.
+drifts across versions, so `sniffer.normalize_ltesniffer.normalize_stream`
+canonicalises it before we parse here. The `sniffer live --earfcn ...`
+CLI wires that pipe up in-process.
 """
 
 from __future__ import annotations

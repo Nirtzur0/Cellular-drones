@@ -39,7 +39,7 @@ def test_e2e_ue_pipeline_localizes_stationary_ues():
         assert result["gpsd_records"] > 0
         assert result["geotagged_records"] > 0
 
-        results = locate_file(result["geotagged_path"], "centroid")
+        results = locate_file(result["geotagged_path"])
         assert len(results) == 3
         by_rnti = {r.c_rnti: r for r in results}
         truth_by_rnti = {ue.c_rnti: ue for ue in result["ues"]}

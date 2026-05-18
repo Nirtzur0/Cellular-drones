@@ -11,8 +11,8 @@ targets LTESniffer on a USRP B210 (Linux).
 | Capability                                    | Status                                |
 | --------------------------------------------- | ------------------------------------- |
 | PDCCH decode + **C-RNTI list per cell**       | yes (USRP B210 + LTESniffer)          |
-| Per-UE positioning, stationary UEs            | yes (UL grants, weighted centroid/WLS)|
-| Per-UE positioning, mobile UEs                | biased — needs multi-static TDOA      |
+| Per-UE positioning, stationary UEs            | yes (UL grants, RSSI weighted centroid)|
+| Per-UE positioning, mobile UEs                | not supported — single-RX math biases |
 | Subscriber identity (IMSI / SUPI / phone #)   | no — passive LTE never exposes it     |
 | 5G NR UE sniffing                             | no — LTESniffer is LTE-only           |
 
@@ -21,34 +21,37 @@ targets LTESniffer on a USRP B210 (Linux).
 - [`docs/ue-sniffing.md`](docs/ue-sniffing.md) — the pipeline, what you
   get, what you don't.
 - [`docs/design.md`](docs/design.md) — architecture and rationale.
-- [`docs/localization.md`](docs/localization.md) — RSSI methods today,
-  TDOA later.
+- [`docs/localization.md`](docs/localization.md) — how the RSSI
+  weighted-centroid estimator works and what it can / cannot do.
 
 ## Quick start
-
-### Hardware-free demo (validates the pipeline)
 
 ```bash
 pip install -r requirements.txt
 pip install -e .
-
-python3 -m sniffer.demo --out-dir data/demo --plot data/demo/ues.png
-python3 -m sniffer.live --simulate
-# open http://127.0.0.1:8000/
+sniffer --help
 ```
 
-The demo stages three synthetic UEs around an eNB (two stationary, one
-walking across the cell). Stationary UEs recover to ~30 m of ground
-truth; the mobile UE shows the expected ~200 m bias — the simulator
-stages this on purpose to expose the limit of single-RX positioning.
+Everything goes through one CLI. Pick a subcommand.
+
+### Hardware-free demo (validates the pipeline)
+
+```bash
+sniffer demo --plot data/demo/ues.png        # batch run + plot
+sniffer live --simulate                       # realtime UI at http://127.0.0.1:8000/
+```
+
+The simulator stages three synthetic UEs around an eNB (two stationary,
+one walking across the cell). Stationary UEs recover to ~30 m of ground
+truth; the mobile UE shows the expected ~200 m bias — staged on
+purpose to expose the limit of single-RX positioning.
 
 ### Real radio (Linux + USRP B210)
 
 ```bash
-./scripts/install-linux.sh                          # one-time: srsRAN + LTESniffer + venv
-./scripts/gps-logger.sh &                           # GPS stream → data/gps-<mission>.jsonl
-./scripts/ue-sniff.sh 1850 271 --rx-gain 50 &       # LTESniffer DL-only on EARFCN 1850 / PCI 271
-./scripts/live-dashboard.sh --ue 1850 271           # browser UI
+sniffer install                                       # one-time: srsRAN + LTESniffer + venv
+sniffer gps-log &                                     # GPS stream -> data/gps-<mission>.jsonl
+sniffer live --earfcn 1850 --pci 271 --rx-gain 50     # spawns LTESniffer + UI
 # open http://127.0.0.1:8000/
 ```
 
@@ -56,22 +59,29 @@ Pick the target EARFCN + PCI for the operator you care about (CellMapper
 / OpenCellID are good starting points; `srsRAN_cell_search` works on the
 USRP itself if you don't want to rely on external databases).
 
+### Offline reprocessing
+
+```bash
+sniffer report 'data/geotagged-*.jsonl' --plot data/run.png
+```
+
 ## Repo layout
 
 ```
 docs/             design docs (start with ue-sniffing.md)
-scripts/          install + capture wrappers (LTESniffer, gpsd)
+scripts/          install-linux.sh (apt + srsRAN + LTESniffer build)
 src/sniffer/
+  cli.py                 unified CLI entrypoint (`sniffer ...`)
   schema.py              UeSighting record types
   simulate.py            synthetic LTESniffer + gpsd streams
-  parse_ltesniffer.py    DECODED key=value lines → ue_sighting JSONL
-  normalize_ltesniffer.py permissive translator from LTESniffer text → DECODED
-  parse_gpsd.py          gpspipe JSON → geotag records
+  parse_ltesniffer.py    DECODED key=value lines -> ue_sighting JSONL
+  normalize_ltesniffer.py permissive translator from LTESniffer text -> DECODED
+  parse_gpsd.py          gpspipe JSON -> geotag records
   geotag.py              join UE sightings with the nearest GPS fix
-  localize.py            weighted centroid + WLS, per-(PCI, C-RNTI)
+  localize.py            RSSI weighted centroid, per-(PCI, C-RNTI)
   live.py                realtime browser dashboard
   report.py              per-mission text summary + matplotlib plot
-  demo.py                end-to-end: simulator → pipeline → plot
+  demo.py                end-to-end: simulator -> pipeline -> plot
 data/             JSONL captures (gitignored)
 tests/            unit + e2e tests
 ```

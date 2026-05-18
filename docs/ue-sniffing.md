@@ -9,9 +9,8 @@ passive receiver.
 - **Identity**: per-UE C-RNTI captured from PDCCH blind decode, per cell
   (PCI). DCI format, MCS, PRB allocation, TBS — everything LTESniffer
   emits. C-RNTI is a temporary, per-connection ID; see *Caveats* below.
-- **Position**: per-(PCI, C-RNTI) location estimate using the same
-  weighted-centroid / WLS engine the cell-discovery flow uses, fed by
-  UL grants only.
+- **Position**: per-(PCI, C-RNTI) location estimate from an RSSI
+  weighted-centroid estimator, fed by UL grants only.
 
 ## What you do *not* get
 
@@ -22,15 +21,15 @@ passive receiver.
   and is gated by jurisdictional authorization.
 - **5G UE identity**. The standard encrypts IMSI as SUCI before
   transmission. LTESniffer is LTE-only.
-- **Sub-10 m positioning of mobile UEs from a single radio**. The
-  synthetic-aperture math only converges on stationary emitters.
-  Mobile UEs require multi-static TDOA with multiple synchronized
-  receivers — see *Limits* below.
+- **Mobile-UE positioning from a single radio**. The
+  weighted-centroid math only converges on stationary emitters. See
+  *Limits* below.
 
 ## Pipeline
 
 ```
-USRP B210 (UHD) ──► LTESniffer ──► ue-sniff.sh ──► JSONL (ue_sighting)
+USRP B210 (UHD) ──► LTESniffer ──► normalize_stream ──► JSONL (ue_sighting)
+                              (in-process, inside `sniffer live`)
                                        │                  │
 GPS module ──► gpsd ──► gpspipe ──► gps-*.jsonl ──┐       │
                                                   │       │
@@ -44,12 +43,12 @@ GPS module ──► gpsd ──► gpspipe ──► gps-*.jsonl ──┐     
   sniffer.localize (per-RNTI)        sniffer.live (browser dashboard)
                 │                                   │
                 ▼                                   ▼
-  sniffer.report → PNG plot            http://127.0.0.1:8000/
+  sniffer report → PNG plot            http://127.0.0.1:8000/
 ```
 
 The same pipeline runs end-to-end against the simulator without any
-hardware (`python3 -m sniffer.demo`); the real-radio path swaps the
-simulator stream for LTESniffer's stdout.
+hardware (`sniffer demo`); the real-radio path swaps the simulator
+stream for LTESniffer's stdout.
 
 ## Quick start
 
@@ -59,8 +58,8 @@ simulator stream for LTESniffer's stdout.
 pip install -r requirements.txt
 pip install -e .
 
-python3 -m sniffer.demo --out-dir data/demo --plot data/demo/ues.png
-python3 -m sniffer.live --simulate
+sniffer demo --plot data/demo/ues.png
+sniffer live --simulate
 # open http://127.0.0.1:8000/
 ```
 
@@ -79,10 +78,10 @@ demonstrating the limit of single-RX positioning for moving targets.
 ### Real radio (Linux + USRP B210)
 
 ```bash
-./scripts/install-linux.sh                          # one-time
-./scripts/gps-logger.sh &                           # GPS stream
-./scripts/ue-sniff.sh 1850 271 --rx-gain 50 &       # LTESniffer on PCI 271
-./scripts/live-dashboard.sh --ue 1850 271           # browser UI
+sniffer install                                       # one-time
+sniffer gps-log &                                     # GPS stream (optional)
+sniffer live --earfcn 1850 --pci 271 --rx-gain 50     # spawns LTESniffer + UI
+# open http://127.0.0.1:8000/
 ```
 
 Pick the target EARFCN + PCI from CellMapper / OpenCellID, or run
@@ -144,21 +143,20 @@ distributions). That's research territory, not in this codebase.
 
 ### Mobile UE positioning is biased
 
-Weighted-centroid and WLS assume a static emitter; the math integrates
+The weighted centroid assumes a static emitter; the math integrates
 RSSI over the drone's trajectory. If the UE moves during the
 integration window the estimate biases toward the centroid of the UE's
 own motion, not its current position. The simulator's mobile UE shows
 this directly: ~200 m bias for a UE walking 200 m over the mission.
 
-The fix is multi-static TDOA: 3+ GPSDO-disciplined receivers, sample-
-aligned IQ, ToA differences between the same UL burst arriving at each
-receiver. The drone becomes one of those receivers; the others sit on
-the ground at known positions. None of this is in the codebase today.
+There is no software fix to a single-RX passive sniffer. Real
+positioning of mobile UEs would need multi-static TDOA across
+synchronized receivers, which is not in the codebase.
 
 ### UL grants are intermittent
 
 The localizer needs ≥ 2 UL grants with GPS attached before it produces
-an estimate, and ≥ 6 before WLS kicks in. A UE that's mostly DL-bound
+an estimate. A UE that's mostly DL-bound
 (streaming, browsing) might not give you enough UL volume in a short
 window. Watch the *UL / DL grants* column in the dashboard — if it's
 heavily skewed to DL, the UE is "heard but unlocalisable."
@@ -168,13 +166,14 @@ heavily skewed to DL, the UE is "heard but unlocalisable."
 Real LTESniffer text drifts across versions. Rather than hard-code one
 format, the pipeline uses a two-stage normaliser:
 
-1. `scripts/ue-sniff.sh` pipes LTESniffer's stdout through
-   `python3 -m sniffer.normalize_ltesniffer`, which uses permissive
-   regexes to recognise `KEY=value` and `KEY: value` fields in any
-   order, normalises field names (`rnti` → `c_rnti`, `RBs` → `prb`,
-   etc.), and emits canonical `DECODED key=value` lines.
-2. `python3 -m sniffer.parse_ltesniffer` reads those canonical lines
-   and emits schema-conformant JSONL.
+1. `sniffer live --earfcn N --pci P` spawns LTESniffer and pipes its
+   stdout through `normalize_stream` (from
+   `sniffer.normalize_ltesniffer`) in-process. The normaliser uses
+   permissive regexes to recognise `KEY=value` and `KEY: value` fields
+   in any order, normalises field names (`rnti` → `c_rnti`, `RBs` →
+   `prb`, etc.), and emits canonical `DECODED key=value` lines.
+2. `sniffer.parse_ltesniffer.parse_stream` reads those canonical lines
+   and emits schema-conformant `ue_sighting` records.
 
 If your LTESniffer build emits a format the normaliser doesn't handle,
 add the field to `_FIELD_MAP` in `src/sniffer/normalize_ltesniffer.py`.

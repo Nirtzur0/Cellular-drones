@@ -101,7 +101,7 @@ def box_trajectory(emitter: Emitter, half_size_m: float = 150.0,
                    ) -> list[Waypoint]:
     """A 4-sided box at multiple altitudes around the emitter.
 
-    Geometrically well-conditioned for both centroid and WLS localization.
+    Geometrically well-conditioned for centroid localization.
     """
     waypoints: list[Waypoint] = []
     t = 0.0

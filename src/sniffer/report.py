@@ -11,7 +11,7 @@ import glob
 import os
 from collections import defaultdict
 
-from sniffer.localize import path_loss_wls_ue, weighted_centroid_ue
+from sniffer.localize import weighted_centroid_ue
 from sniffer.schema import read_jsonl
 
 
@@ -64,22 +64,17 @@ def text_summary(path: str, default_ues=None) -> str:
             ul_vals = [r["ue"]["ul_rssi_dbm"] for r in ul]
             lines.append(f"  UL RSSI min={min(ul_vals):.1f} max={max(ul_vals):.1f} dBm")
             cent = weighted_centroid_ue(recs)
-            wls = path_loss_wls_ue(recs)
             if cent is not None:
                 alt = f"{cent.alt_m:.1f}" if cent.alt_m is not None else "—"
-                lines.append(f"  centroid: lat={cent.lat:.6f} lon={cent.lon:.6f} "
+                lines.append(f"  position: lat={cent.lat:.6f} lon={cent.lon:.6f} "
                              f"alt={alt}m cep95={cent.cep95_m:.1f}m")
-            if wls is not None:
-                alt = f"{wls.alt_m:.1f}" if wls.alt_m is not None else "—"
-                lines.append(f"  WLS:      lat={wls.lat:.6f} lon={wls.lon:.6f} "
-                             f"alt={alt}m cep95={wls.cep95_m:.1f}m")
             if rnti in truth_by_rnti and cent is not None:
                 from pyproj import Geod
                 _, _, err = Geod(ellps="WGS84").inv(
                     truth_by_rnti[rnti].lon, truth_by_rnti[rnti].lat,
                     cent.lon, cent.lat)
                 tag = " (mobile UE — bias expected)" if truth_by_rnti[rnti].waypoints else ""
-                lines.append(f"  error vs truth (centroid): {err:.1f} m{tag}")
+                lines.append(f"  error vs truth: {err:.1f} m{tag}")
         else:
             lines.append("  (no UL grants — DL-only grants cannot localize a UE)")
     return "\n".join(lines)
@@ -121,13 +116,9 @@ def make_plot(path: str, out_png: str, truth_ues=None,
                         label=f"C-RNTI {rnti:#06x} (n={len(ul)} UL)",
                         alpha=0.85)
         cent = weighted_centroid_ue(recs)
-        wls = path_loss_wls_ue(recs)
         if cent is not None:
             ax.plot(cent.lon, cent.lat, marker="x", color=color,
                     markersize=14, mew=2.4)
-        if wls is not None:
-            ax.plot(wls.lon, wls.lat, marker="+", color=color,
-                    markersize=18, mew=2.4)
         if rnti in truth_by_rnti:
             t = truth_by_rnti[rnti]
             if t.waypoints:

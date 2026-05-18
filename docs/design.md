@@ -1,8 +1,8 @@
 # Framework design
 
 End-to-end design for a drone-mounted passive LTE UE sniffer built around
-existing open-source stacks. Aimed at LTESniffer on USRP B210, with a
-documented path to multi-static TDOA for mobile-UE positioning.
+existing open-source stacks. Aimed at LTESniffer on USRP B210; positions
+stationary UEs only (single-RX, single-receiver RSSI weighted centroid).
 
 ## 1. Goals
 
@@ -10,8 +10,7 @@ documented path to multi-static TDOA for mobile-UE positioning.
 2. **Geo-tag** every decoded DCI with platform position, attitude, and a
    monotonic timestamp suitable for downstream TDOA-style analysis.
 3. **Position UEs** in 3D using the drone trajectory as a synthetic aperture
-   on the UE's UL grants (per-RNTI weighted RSS today, multi-static TDOA
-   later).
+   on the UE's UL grants (per-RNTI weighted RSS, stationary UEs only).
 4. **Stay swappable**: a single measurement schema across radio backends
    so a simulator run and a B210 mission produce the same downstream
    artifacts.
@@ -30,7 +29,7 @@ Decisions are anchored to maintained projects rather than rewrites.
 There is **no** in-tree HackRF / cell-discovery surface — the prior
 `LTE-Cell-Scanner` path was removed in v0.2 along with the macOS bits.
 Pick the target EARFCN + PCI out-of-band (CellMapper, OpenCellID, or
-`srsRAN_cell_search`) and feed that into `ue-sniff.sh`.
+`srsRAN_cell_search`) and feed it to `sniffer live --earfcn N --pci P`.
 
 ## 3. Architecture
 
@@ -60,9 +59,10 @@ Pick the target EARFCN + PCI out-of-band (CellMapper, OpenCellID, or
 
 ### Components
 
-- **LTESniffer (`scripts/ue-sniff.sh`)** — runs the binary, normalises its
-  text into the canonical `DECODED key=value` form, and pipes through the
-  Python parser to write JSONL.
+- **LTESniffer (driven by `sniffer live`)** — `cli.py` builds the
+  binary's argv from `--earfcn/--pci/--rx-gain`, spawns it as a
+  subprocess inside `live.py`, pipes stdout through `normalize_stream`
+  in-process, and feeds the result to the Python parser writing JSONL.
 - **normalize_ltesniffer** — permissive field-renaming step. LTESniffer's
   text output drifts between versions; this layer keeps the downstream
   schema stable.
@@ -72,8 +72,8 @@ Pick the target EARFCN + PCI out-of-band (CellMapper, OpenCellID, or
 - **gpsd / parse_gpsd** — one `geotag` record per fix at ~10 Hz.
 - **geotag.join** — single-pass O(n+m) merge on monotonic time, ±500 ms
   window. UE sightings older than the GPS fix window are dropped.
-- **localize** — per-(PCI, C-RNTI) weighted centroid + log-distance WLS,
-  both computed in a local ENU frame.
+- **localize** — per-(PCI, C-RNTI) RSSI weighted centroid, computed
+  in a local ENU frame. Single estimator, no fallback path.
 - **live** — stdlib HTTP server + SSE; pushes per-UE updates to the
   browser dashboard as DCIs come in.
 - **report** — text summary + matplotlib PNG of the per-UE positions
@@ -111,10 +111,10 @@ message and the position estimate stays null.
 
 ## 6. Known limits
 
-- **Mobile UEs bias the estimate.** Weighted-centroid / WLS assume a
-  static emitter; a UE that moves during the integration window biases
-  the estimate toward the centroid of its own motion. Real fix: multi-
-  static TDOA. Not in the codebase.
+- **Mobile UEs bias the estimate.** The weighted-centroid math
+  assumes a static emitter; a UE that moves during the integration
+  window biases the estimate toward the centroid of its own motion.
+  No software fix exists for a single-RX passive sniffer.
 - **C-RNTI rotates.** Connection-scoped IDs reset on RRC release.
   Per-RNTI tracks here are connection-scoped, not subscriber-scoped.
 - **No 5G NR.** LTESniffer is LTE-only. SUCI on 5G would close the

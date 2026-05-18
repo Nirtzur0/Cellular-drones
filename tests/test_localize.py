@@ -3,7 +3,7 @@ import random
 
 from pyproj import Geod
 
-from sniffer.localize import path_loss_wls_ue, weighted_centroid_ue
+from sniffer.localize import weighted_centroid_ue
 
 GEOD = Geod(ellps="WGS84")
 
@@ -60,44 +60,6 @@ def test_weighted_centroid_ue_recovers_within_50m():
     assert err < 50.0, f"centroid error {err:.1f}m too large"
 
 
-def _box_trajectory(true_lat, true_lon, true_alt, half_size_m=150.0,
-                    n_per_side=15, altitudes=(15.0, 30.0, 60.0),
-                    n=3.0, sigma_db=0.5, seed=1):
-    """Box pattern around the UE at multiple altitudes — surrounds the
-    target so the WLS Jacobian is well-conditioned in all 3 axes."""
-    rng = random.Random(seed)
-    records = []
-    for z in altitudes:
-        for side_idx in range(4):
-            for i in range(n_per_side):
-                t = -half_size_m + 2 * half_size_m * i / max(1, n_per_side - 1)
-                if side_idx == 0:    # north edge
-                    dx, dy = t,  half_size_m
-                elif side_idx == 1:  # east edge
-                    dx, dy =  half_size_m, -t
-                elif side_idx == 2:  # south edge
-                    dx, dy = -t, -half_size_m
-                else:                # west edge
-                    dx, dy = -half_size_m,  t
-                lat = true_lat + (dy / 111_320.0)
-                lon = true_lon + (dx / (111_320.0 * math.cos(math.radians(true_lat))))
-                rsrp = _free_space_rsrp(true_lat, true_lon, true_alt,
-                                        lat, lon, z, n=n)
-                rsrp += rng.gauss(0.0, sigma_db)
-                records.append(_sample(lat, lon, z, rsrp))
-    return records
-
-
-def test_path_loss_wls_ue_recovers_under_good_geometry():
-    true_lat, true_lon, true_alt = 32.0853, 34.7818, 25.0
-    records = _box_trajectory(true_lat, true_lon, true_alt)
-    w = path_loss_wls_ue(records, n_path_loss=3.0)
-    assert w is not None
-    assert math.isfinite(w.lat) and math.isfinite(w.lon)
-    _, _, err_w = GEOD.inv(true_lon, true_lat, w.lon, w.lat)
-    assert err_w < 50.0, f"WLS error {err_w:.1f}m too large"
-
-
 def test_altitude_refused_when_trajectory_is_flat():
     true_lat, true_lon = 32.0853, 34.7818
     records = _trajectory_around(true_lat, true_lon, 30.0,
@@ -117,4 +79,3 @@ def test_dl_only_records_yield_no_estimate():
         r["ue"]["direction"] = "dl"
         r["ue"]["dl_rsrp_dbm"] = r["ue"].pop("ul_rssi_dbm")
     assert weighted_centroid_ue(records) is None
-    assert path_loss_wls_ue(records) is None

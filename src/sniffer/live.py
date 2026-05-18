@@ -17,7 +17,6 @@ import argparse
 import bisect
 import io
 import json
-import math
 import os
 import queue
 import random
@@ -31,7 +30,8 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-from sniffer.localize import path_loss_wls_ue, weighted_centroid_ue
+from sniffer.localize import weighted_centroid_ue
+from sniffer.normalize_ltesniffer import normalize_stream
 from sniffer.parse_gpsd import parse_stream as parse_gpsd_stream
 from sniffer.parse_ltesniffer import parse_stream as parse_ltesniffer_stream
 from sniffer.schema import (
@@ -58,7 +58,6 @@ GPS_BUFFER_MAX = 4000          # ~10 min at 10 Hz
 GEOTAG_MAX_AGE_MS = 500        # drop sightings >500 ms from nearest fix
 UE_HISTORY_MAX = 400           # per-UE UL-grant history retained for positioning
 RSSI_HISTORY_MAX = 120         # rolling sparkline points
-WLS_EVERY = 12                 # recompute path_loss_wls every N sightings
 
 
 # --------------------------------------------------------------------------
@@ -147,7 +146,6 @@ class State:
                     "ul_rssi_history": deque(maxlen=RSSI_HISTORY_MAX),
                     "geo_history": deque(maxlen=UE_HISTORY_MAX),
                     "est_position": None,
-                    "_since_wls": 0,
                 }
                 self._ues[key] = entry
 
@@ -183,7 +181,6 @@ class State:
                                "direction": "ul",
                                "ul_rssi_dbm": ue.ul_rssi_dbm},
                     })
-                    entry["_since_wls"] += 1
                     _recompute_ue_position(entry)
 
             payload = _entry_to_dict_ue(entry)
@@ -246,7 +243,7 @@ class State:
 
 def _entry_to_dict_ue(entry: dict[str, Any]) -> dict[str, Any]:
     out = {k: v for k, v in entry.items()
-           if k not in ("ul_rssi_history", "geo_history", "_since_wls")}
+           if k not in ("ul_rssi_history", "geo_history")}
     out["ul_rssi_history"] = list(entry["ul_rssi_history"])
     out["n_geo_samples"] = len(entry["geo_history"])
     trail = list(entry["geo_history"])[-40:]
@@ -262,28 +259,13 @@ def _recompute_ue_position(entry: dict[str, Any]) -> None:
     centroid = weighted_centroid_ue(records)
     if centroid is None:
         return
-    est = {
+    entry["est_position"] = {
         "lat": centroid.lat, "lon": centroid.lon,
         "alt_m": centroid.alt_m, "cep95_m": centroid.cep95_m,
         "method": "weighted_centroid",
         "n_samples": centroid.n_samples,
         "altitude_estimated": centroid.altitude_estimated,
     }
-    if entry["_since_wls"] >= WLS_EVERY and len(records) >= 6:
-        try:
-            wls = path_loss_wls_ue(records)
-        except Exception:
-            wls = None
-        if wls is not None and math.isfinite(wls.cep95_m):
-            est = {
-                "lat": wls.lat, "lon": wls.lon,
-                "alt_m": wls.alt_m, "cep95_m": wls.cep95_m,
-                "method": "path_loss_wls",
-                "n_samples": wls.n_samples,
-                "altitude_estimated": wls.altitude_estimated,
-            }
-        entry["_since_wls"] = 0
-    entry["est_position"] = est
 
 
 # --------------------------------------------------------------------------
@@ -394,15 +376,17 @@ class _ParseArgs:
 def run_ltesniffer_loop(state: State, *, ltesniffer_cmd: list[str],
                         mission_id: str, out_dir: str,
                         center_hz: Optional[float], rx_gain_db: float,
-                        stop: threading.Event) -> None:
+                        stop: threading.Event,
+                        normalize: bool = False) -> None:
     """Spawn LTESniffer, stream its DECODED stdout through parse_ltesniffer.
 
     The user provides a fully-formed argv via `--ltesniffer-cmd`: this gives
     them control over which binary, mode, frequency, gain, etc. The process
     is restarted on exit until `stop` is set.
 
-    Binaries that don't natively emit `DECODED key=value` lines should be
-    wrapped by `scripts/ue-sniff.sh` (which pipes through the normaliser).
+    Set `normalize=True` when the binary emits human-readable text rather
+    than canonical `DECODED key=value` lines: raw stdout is piped through
+    `normalize_stream` in-process before parsing.
     """
     if not ltesniffer_cmd:
         state.set_status("error", message="no --ltesniffer-cmd provided")
@@ -434,7 +418,9 @@ def run_ltesniffer_loop(state: State, *, ltesniffer_cmd: list[str],
             with open(out_path, "a", encoding="utf-8") as jsonl_fh:
                 sink = _UeSightingSink(state, jsonl_out=jsonl_fh)
                 assert proc.stdout is not None
-                parse_ltesniffer_stream(proc.stdout, parse_args, sink)
+                stream = (normalize_stream(proc.stdout) if normalize
+                          else proc.stdout)
+                parse_ltesniffer_stream(stream, parse_args, sink)
         except Exception as exc:  # noqa: BLE001
             state.set_status("error", message=f"ltesniffer parse failed: {exc}")
         finally:
@@ -944,6 +930,10 @@ def main() -> int:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--simulate", action="store_true",
                    help="generate fake UEs + GPS (no hardware needed)")
+    p.add_argument("--normalize-ltesniffer", action="store_true",
+                   help="pipe LTESniffer stdout through normalize_stream "
+                        "(use when the binary emits human-readable lines, "
+                        "not canonical DECODED key=value)")
     args = p.parse_args()
 
     state = State()
@@ -965,7 +955,7 @@ def main() -> int:
                     state=state, ltesniffer_cmd=cmd,
                     mission_id=args.mission_id, out_dir=args.out_dir,
                     center_hz=args.center_hz, rx_gain_db=args.rx_gain_db,
-                    stop=stop,
+                    stop=stop, normalize=args.normalize_ltesniffer,
                 ),
                 daemon=True,
             ))
