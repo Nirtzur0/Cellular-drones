@@ -163,7 +163,13 @@ def _snr_db(rsrp_dbm: float, rng: random.Random) -> float:
 
 
 def cellsearch_lines(cfg: SimulationConfig) -> Iterator[str]:
-    """Yield text lines as if from `CellSearch` stdout."""
+    """Yield text lines as if from the LTE-Cell-Scanner JiaoXianjun fork.
+
+    Mirrors both output blocks the real binary produces:
+      • realtime per-detection block (cell ID / PSS ID / RX power / residual
+        frequency offset / k_factor)
+      • end-of-scan summary table (DPX CID A fc freq-offset RXPWR C nRB ...)
+    """
     rng = random.Random(cfg.seed + 1)
     em = cfg.emitter
     if not cfg.waypoints:
@@ -172,7 +178,9 @@ def cellsearch_lines(cfg: SimulationConfig) -> Iterator[str]:
     yield f"Scanning EARFCN {em.earfcn} ({em.center_hz / 1e6:.1f} MHz)\n"
     t = cfg.waypoints[0].t_offset_s
     t_end = cfg.waypoints[-1].t_offset_s
-    sample_idx = 0
+    detections = 0
+    last_rxpwr: float | None = None
+    last_freq_off: float | None = None
     while t <= t_end:
         w = _interp_waypoint(cfg.waypoints, t)
         if w is None:
@@ -180,22 +188,33 @@ def cellsearch_lines(cfg: SimulationConfig) -> Iterator[str]:
             continue
         rsrp = _rsrp_dbm(em, w, rng, cfg.shadow_fading_db)
         if rsrp >= cfg.detect_threshold_rsrp_dbm:
-            rsrq = _rsrq_db(rsrp)
-            snr = _snr_db(rsrp, rng)
-            frame_off = int(rng.uniform(0, 30720))
-            yield "Found LTE cell:\n"
-            yield f"  Carrier frequency: {em.center_hz:.0f}\n"
-            yield f"  n_id_1: {em.n_id_1}\n"
-            yield f"  n_id_2: {em.n_id_2}\n"
-            yield f"  PCI: {em.pci}\n"
-            yield f"  RSRP: {rsrp:.2f} dBm\n"
-            yield f"  RSRQ: {rsrq:.2f} dB\n"
-            yield f"  SNR: {snr:.2f} dB\n"
-            yield f"  Frame offset samples: {frame_off}\n"
-            yield f"  CP: normal\n"
+            freq_off_hz = rng.gauss(0.0, 250.0)
+            k_factor = 1.0 + rng.gauss(0.0, 1.5e-7)
+            yield (f"Detected a FDD cell! At freqeuncy {em.center_hz/1e6:.1f}MHz, "
+                   f"try {detections}\n")
+            yield f"  cell ID: {em.pci}\n"
+            yield f"   PSS ID: {em.n_id_2}\n"
+            yield f"  RX power level: {rsrp:.2f} dB\n"
+            yield f"  residual frequency offset: {freq_off_hz:.1f} Hz\n"
+            yield f"                   k_factor: {k_factor:.8f}\n"
             yield "\n"
+            detections += 1
+            last_rxpwr = rsrp
+            last_freq_off = freq_off_hz
         t += cfg.sample_period_s
-        sample_idx += 1
+
+    # End-of-scan summary table with the richer identity fields.
+    if detections > 0 and last_rxpwr is not None:
+        n_ports = 2
+        n_rb_dl = 50  # 10 MHz cell
+        crystal = 0.99999987
+        yield "Detected the following cells:\n"
+        yield "DPX:TDD/FDD; A: #antenna ports; CP: normal/extended; PR: PHICH resource\n"
+        yield "DPX CID A      fc   freq-offset RXPWR C nRB P  PR CrystalCorrectionFactor\n"
+        yield (f"FDD {em.pci}  {n_ports}  {em.center_hz/1e6:.1f}M   "
+               f"{last_freq_off or 0:.1f}Hz   {last_rxpwr:.2f} N  {n_rb_dl} N 1/6 "
+               f"{crystal:.8f}\n")
+        yield "\n"
 
 
 def _utc_iso(mission_start_unix: float, t_offset: float) -> str:

@@ -57,6 +57,7 @@ def _drive_cellsearch(cfg: simulate.SimulationConfig, out_path: str) -> int:
         mission_id=cfg.mission_id,
         backend="lte-cell-scanner",
         device="hackrf-sim-0",
+        rx_gain_db=40.0,
     )
 
     # Re-yield lines, mutating sim_clock_ns at sample boundaries so each
@@ -66,16 +67,14 @@ def _drive_cellsearch(cfg: simulate.SimulationConfig, out_path: str) -> int:
 
     def clocked_stream():
         sample_idx = 0
-        in_block = False
         for line in lines_iter:
-            if "Found LTE cell" in line:
-                in_block = True
-                # the parser flushes either at the next "Found LTE cell"
-                # OR at a blank line — so we set the clock at block start.
+            # New parser emits records on the "Detected a FDD/TDD cell!" line
+            # (realtime block) or the summary-table row. Bump the simulated
+            # clock at the start of each realtime block so every sighting
+            # carries the right timestamp for the GPS join.
+            if line.startswith("Detected a "):
                 sim_clock_ns["value"] = t_offset_start_ns + sample_idx * sample_period_ns
                 sample_idx += 1
-            elif in_block and not line.strip():
-                in_block = False
             yield line
 
     with open(out_path, "w", encoding="utf-8") as fh:
