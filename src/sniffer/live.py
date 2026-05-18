@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
 from sniffer.localize import weighted_centroid_ue
+from sniffer.motion import classify_motion
 from sniffer.normalize_ltesniffer import normalize_stream
 from sniffer.parse_gpsd import parse_stream as parse_gpsd_stream
 from sniffer.parse_ltesniffer import parse_stream as parse_ltesniffer_stream
@@ -58,6 +59,7 @@ GPS_BUFFER_MAX = 4000          # ~10 min at 10 Hz
 GEOTAG_MAX_AGE_MS = 500        # drop sightings >500 ms from nearest fix
 UE_HISTORY_MAX = 400           # per-UE UL-grant history retained for positioning
 RSSI_HISTORY_MAX = 120         # rolling sparkline points
+GPS_TRAIL_MAX = 600            # drone trail points sent in /state snapshot
 
 
 # --------------------------------------------------------------------------
@@ -146,6 +148,7 @@ class State:
                     "ul_rssi_history": deque(maxlen=RSSI_HISTORY_MAX),
                     "geo_history": deque(maxlen=UE_HISTORY_MAX),
                     "est_position": None,
+                    "motion": None,
                 }
                 self._ues[key] = entry
 
@@ -205,13 +208,108 @@ class State:
                     -(u.get("ul_rssi_dbm") or -1e9),
                 )
             )
+            trail_slice = self._gps[-GPS_TRAIL_MAX:]
+            gps_trail = [{"lat": r["gps"]["lat"], "lon": r["gps"]["lon"]}
+                         for r in trail_slice]
+            t_min = self._gps_ts_keys[0] if self._gps_ts_keys else None
+            t_max = self._gps_ts_keys[-1] if self._gps_ts_keys else None
             return {
                 "type": "snapshot",
                 "ues": ues,
                 "status": dict(self._scan_status),
                 "latest_gps": self._latest_gps,
+                "gps_trail": gps_trail,
                 "total_ue_sightings": self._total_ue_sightings,
                 "uptime_s": (mono_ns() - self._started_mono_ns) / 1e9,
+                "time_bounds": {"t_min_ns": t_min, "t_max_ns": t_max,
+                                "started_ns": self._started_mono_ns},
+            }
+
+    def time_bounds(self) -> dict[str, Any]:
+        """Earliest/latest ts_mono_ns we can replay to."""
+        with self._lock:
+            t_min = self._gps_ts_keys[0] if self._gps_ts_keys else None
+            t_max = self._gps_ts_keys[-1] if self._gps_ts_keys else None
+            return {"t_min_ns": t_min, "t_max_ns": t_max,
+                    "started_ns": self._started_mono_ns,
+                    "now_ns": mono_ns()}
+
+    def snapshot_at(self, at_ts_mono_ns: int) -> dict[str, Any]:
+        """Reconstruct a snapshot as it would have looked at `at_ts_mono_ns`.
+
+        Drone trail and per-UE est_position are recomputed from the
+        stored history. UE counts/timestamps reflect what was visible up
+        to `at_ts_mono_ns`; live cumulative fields the history doesn't
+        carry (DL grants, MCS, PRB) are zeroed/None.
+        """
+        with self._lock:
+            idx = bisect.bisect_right(self._gps_ts_keys, at_ts_mono_ns)
+            gps_slice = self._gps[:idx]
+            latest_gps = gps_slice[-1] if gps_slice else None
+            trail = gps_slice[-GPS_TRAIL_MAX:]
+            gps_trail = [{"lat": r["gps"]["lat"], "lon": r["gps"]["lon"]}
+                         for r in trail]
+            ues_out: list[dict[str, Any]] = []
+            for entry in self._ues.values():
+                past = [g for g in entry["geo_history"]
+                        if g["ts_mono_ns"] <= at_ts_mono_ns]
+                if not past:
+                    continue
+                last_g = past[-1]
+                cent = weighted_centroid_ue(past)
+                est_pos = None
+                motion = None
+                if cent is not None:
+                    est_pos = {
+                        "lat": cent.lat, "lon": cent.lon,
+                        "alt_m": cent.alt_m, "cep95_m": cent.cep95_m,
+                        "method": "weighted_centroid",
+                        "n_samples": cent.n_samples,
+                        "altitude_estimated": cent.altitude_estimated,
+                    }
+                    m = classify_motion(past, cent.lat, cent.lon)
+                    motion = {"label": m.label, "corr": m.corr,
+                              "n_samples": m.n_samples, "note": m.note}
+                ues_out.append({
+                    "key": entry["key"],
+                    "pci": entry["pci"],
+                    "c_rnti": entry["c_rnti"],
+                    "c_rnti_hex": entry["c_rnti_hex"],
+                    "center_hz": entry["center_hz"],
+                    "first_seen": entry["first_seen"],
+                    "last_seen": last_g.get("ts_utc", entry["first_seen"]),
+                    "count": len(past),
+                    "ul_count": len(past),
+                    "dl_count": 0,
+                    "dci_formats": entry.get("dci_formats", []),
+                    "mcs": None, "n_prb": None, "tbs_bytes": None,
+                    "ul_rssi_dbm": last_g["ue"].get("ul_rssi_dbm"),
+                    "dl_rsrp_dbm": None,
+                    "ul_rssi_history": [],
+                    "n_geo_samples": len(past),
+                    "trail": [{"lat": g["gps"]["lat"],
+                               "lon": g["gps"]["lon"],
+                               "ul_rssi_dbm": g["ue"]["ul_rssi_dbm"]}
+                              for g in past[-40:]],
+                    "est_position": est_pos,
+                    "motion": motion,
+                })
+            ues_out.sort(
+                key=lambda u: (u.get("est_position") is None,
+                               -(u.get("ul_count") or 0)),
+            )
+            return {
+                "type": "snapshot",
+                "replay": True,
+                "at_ts_mono_ns": at_ts_mono_ns,
+                "ues": ues_out,
+                "status": {**self._scan_status,
+                           "replay": True,
+                           "at_ts_mono_ns": at_ts_mono_ns},
+                "latest_gps": latest_gps,
+                "gps_trail": gps_trail,
+                "total_ue_sightings": sum(u["ul_count"] for u in ues_out),
+                "uptime_s": max(0.0, (at_ts_mono_ns - self._started_mono_ns) / 1e9),
             }
 
     # --- fan-out ----------------------------------------------------------
@@ -265,6 +363,13 @@ def _recompute_ue_position(entry: dict[str, Any]) -> None:
         "method": "weighted_centroid",
         "n_samples": centroid.n_samples,
         "altitude_estimated": centroid.altitude_estimated,
+    }
+    motion = classify_motion(records, centroid.lat, centroid.lon)
+    entry["motion"] = {
+        "label": motion.label,
+        "corr": motion.corr,
+        "n_samples": motion.n_samples,
+        "note": motion.note,
     }
 
 
@@ -560,119 +665,563 @@ def run_simulator(state: State, *, mission_id: str,
 
 _INDEX_HTML = """<!doctype html>
 <html lang="en"><head>
-<meta charset="utf-8"><title>Cellular drones · live · UEs</title>
+<meta charset="utf-8"><title>UE tracker · cellular drones</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      crossorigin=""/>
 <style>
-:root { color-scheme: dark; }
+:root {
+  color-scheme: dark;
+  --bg: #07090c;
+  --panel: #0f131a;
+  --panel-2: #141923;
+  --line: #1d232d;
+  --line-2: #262d3a;
+  --dim: #8a93a0;
+  --dim-2: #5a6470;
+  --txt: #e6e8eb;
+  --accent: #d9d3ff;
+  --green: #7ad9a1;
+  --yellow: #f0c270;
+  --red: #f08580;
+  --blue: #7fb9d9;
+}
 * { box-sizing: border-box; }
-body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-       background:#0b0d10; color:#e6e8eb; }
-header { padding: 14px 20px; border-bottom: 1px solid #1f242a;
-         display:flex; align-items:center; justify-content:space-between; gap:18px;
-         flex-wrap: wrap; }
-header h1 { font-size: 16px; font-weight: 600; margin: 0; }
-.meta { font-size: 12px; color:#8a93a0; display:flex; gap:18px; flex-wrap: wrap; }
-.meta strong { color:#e6e8eb; font-weight:600; }
-.status-pill { padding:2px 10px; border-radius: 999px; font-size: 11px; border:1px solid #2a3038; }
-.status-sniffing { color:#7ad9a1; border-color:#1d4032; background:#11211a; }
-.status-simulating { color:#f0c270; border-color:#403118; background:#21190f; }
-.status-error { color:#f08580; border-color:#4a1f1f; background:#2a1414; }
-.status-idle { color:#8a93a0; }
-.gps-pill { font-size: 11px; padding: 2px 10px; border:1px solid #2a3038; border-radius:999px;
-            color:#8a93a0; font-family: ui-monospace, monospace; }
-.gps-pill.fix-3d, .gps-pill.fix-rtk_fix, .gps-pill.fix-rtk_float { color:#7ad9a1; border-color:#1d4032; }
-.gps-pill.fix-2d { color:#f0c270; border-color:#403118; }
-.gps-pill.fix-none, .gps-pill.fix-unknown { color:#8a93a0; }
-main { padding: 16px 20px; }
-.banner { background:#1a1610; border:1px solid #403118; color:#f0c270;
-          font-size: 12px; padding: 8px 12px; border-radius: 5px;
-          margin-bottom: 14px; }
-.banner strong { color:#f7d99c; }
-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #1a1f25; font-size: 13px; vertical-align: top; }
-th { font-weight: 600; color:#8a93a0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
-tr.fresh td { background: #1c1d2a; transition: background 1.4s ease; }
-.rsrp { font-weight: 600; }
-.rsrp-strong { color:#7ad9a1; }
-.rsrp-mid { color:#f0c270; }
-.rsrp-weak { color:#f08580; }
-.spark { width: 120px; height: 28px; vertical-align: middle; }
-.minimap { width: 110px; height: 84px; background:#13171c; border-radius:4px; vertical-align: middle; }
-.empty { padding: 36px 20px; text-align: center; color:#8a93a0; font-size: 13px;
-         border:1px dashed #2a3038; border-radius: 6px; }
-.log { margin-top: 24px; font-family: ui-monospace, monospace; font-size:11px;
-       color:#8a93a0; max-height: 160px; overflow-y: auto; padding: 8px 0;
-       border-top: 1px solid #1a1f25; }
-.log div { padding: 2px 0; }
-.log .ts { color:#525a66; margin-right: 8px; }
-.dim { color:#8a93a0; font-size: 11px; }
-.tag { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px;
-       background:#1a2230; color:#8aa0c0; margin-right:4px; }
-.tag.tag-ul { background:#11212b; color:#7fb9d9; }
-.tag.tag-dl { background:#1f1f2c; color:#9aa0d0; }
-.tag.tag-dci { background:#2a1f1f; color:#d99080; }
-.pos { font-family: ui-monospace, monospace; font-size:12px; }
-.pos .cep { color:#8a93a0; }
-.pos .method { display:block; font-size:10px; color:#8a93a0; }
-.no-pos { color:#525a66; font-size: 11px; font-style: italic; }
-.crnti { font-family: ui-monospace, monospace; font-weight:600; color:#d9d3ff; }
+html, body { margin: 0; height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+  background: radial-gradient(1100px 700px at 80% -10%, #11161f 0%, #07090c 60%) var(--bg);
+  color: var(--txt); -webkit-font-smoothing: antialiased; font-size: 13px;
+}
+body { display: flex; flex-direction: column; min-height: 100vh; }
+
+/* ---------------------------------------------------------- header */
+header {
+  flex: 0 0 auto;
+  padding: 11px 20px;
+  border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+  background: linear-gradient(180deg, rgba(20,25,35,0.55), rgba(15,19,26,0.3));
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand .led {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 0 4px rgba(122,217,161,0.14);
+}
+header h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: 0.01em; }
+header h1 span { color: var(--dim); font-weight: 400; margin-left: 6px; }
+.meta { font-size: 11px; color: var(--dim); display: flex; gap: 14px;
+        flex-wrap: wrap; align-items: center; }
+.stat { display: flex; gap: 6px; align-items: baseline; text-transform: uppercase;
+        letter-spacing: 0.08em; }
+.stat strong { color: var(--txt); font-weight: 600; font-size: 14px;
+               font-variant-numeric: tabular-nums; letter-spacing: 0; text-transform: none; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px;
+  font-size: 11px; border: 1px solid var(--line-2);
+  background: rgba(20, 25, 35, 0.5);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.pill .led { width: 6px; height: 6px; border-radius: 50%; background: var(--dim-2); }
+.pill.status-sniffing { color: var(--green); border-color:#1d4032; background:#0f1d18; }
+.pill.status-sniffing .led { background: var(--green); box-shadow: 0 0 0 3px rgba(122,217,161,0.18);
+                              animation: pulse 1.6s ease-in-out infinite; }
+.pill.status-simulating { color: var(--yellow); border-color:#403118; background:#1f1810; }
+.pill.status-simulating .led { background: var(--yellow); }
+.pill.status-error { color: var(--red); border-color:#4a1f1f; background:#241313; }
+.pill.status-error .led { background: var(--red); }
+.pill.status-idle { color: var(--dim); }
+.pill.gps-3d, .pill.gps-rtk_fix, .pill.gps-rtk_float { color: var(--green); border-color:#1d4032; }
+.pill.gps-3d .led, .pill.gps-rtk_fix .led, .pill.gps-rtk_float .led { background: var(--green); }
+.pill.gps-2d { color: var(--yellow); border-color:#403118; }
+.pill.gps-2d .led { background: var(--yellow); }
+.pill.gps-none, .pill.gps-unknown { color: var(--dim); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* ---------------------------------------------------------- banner */
+.banner {
+  margin: 10px 20px 0;
+  border: 1px solid var(--line-2);
+  background: linear-gradient(180deg, rgba(240,194,112,0.04), rgba(240,194,112,0.01));
+  color: var(--yellow);
+  font-size: 11.5px; padding: 7px 14px; border-radius: 7px;
+  display: flex; align-items: center; gap: 10px;
+}
+.banner strong { color: #f7d99c; }
+.banner .dim { color: var(--dim); }
+
+/* ---------------------------------------------------------- main grid */
+.workspace {
+  flex: 1 1 auto; min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(380px, 0.95fr);
+  gap: 14px;
+  padding: 12px 20px 16px;
+}
+@media (max-width: 1100px) {
+  .workspace { grid-template-columns: 1fr; }
+  .map-wrap { height: 46vh; min-height: 320px; }
+  .side { height: 60vh; min-height: 360px; }
+}
+
+/* ---------------------------------------------------------- map */
+.map-wrap {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0e1116;
+  min-height: 380px;
+}
+#map { position: absolute; inset: 0; }
+#map.unavailable { display: flex; align-items: center; justify-content: center;
+                   color: var(--dim); font-size: 12px; padding: 16px; }
+.map-overlay {
+  position: absolute; top: 12px; right: 12px; z-index: 500;
+  display: flex; flex-direction: column; gap: 4px;
+  font-family: ui-monospace, monospace; font-size: 11px;
+  color: var(--dim);
+  background: rgba(10, 13, 19, 0.78);
+  border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px;
+  pointer-events: none;
+  max-width: 220px;
+}
+.map-overlay strong { color: var(--txt); font-weight: 600; }
+.legend {
+  position: absolute; bottom: 12px; left: 12px; z-index: 500;
+  display: flex; flex-direction: column; gap: 4px;
+  font-family: ui-monospace, monospace; font-size: 11px;
+  background: rgba(10,13,19,0.78);
+  border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px;
+  max-height: 50%; overflow: auto;
+  min-width: 130px;
+}
+.legend .row { display: flex; align-items: center; gap: 8px; cursor: pointer;
+               color: var(--dim); padding: 1px 0; }
+.legend .row.active { color: var(--txt); }
+.legend .row:hover  { color: var(--txt); }
+.legend .row.has-pos::after { content: '●'; color: var(--green); margin-left: auto;
+                              font-size: 9px; }
+.legend .row.no-pos::after  { content: '○'; color: var(--dim-2); margin-left: auto;
+                              font-size: 9px; }
+.legend .sw { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.legend .label { color: var(--dim-2); font-size: 10px; text-transform: uppercase;
+                 letter-spacing: 0.06em; margin-bottom: 4px; }
+
+/* ---------------------------------------------------------- side cards */
+.side {
+  display: flex; flex-direction: column; min-height: 0;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: linear-gradient(180deg, var(--panel) 0%, #0c1017 100%);
+}
+.side-head {
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; border-bottom: 1px solid var(--line);
+  font-size: 11px; color: var(--dim); text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.side-head strong { color: var(--txt); font-weight: 600; font-size: 12px;
+                    letter-spacing: 0.04em; }
+.cards { flex: 1 1 auto; overflow-y: auto; padding: 10px; }
+.empty {
+  margin: 16px; padding: 28px 18px; text-align: center;
+  border: 1px dashed var(--line-2); border-radius: 8px;
+  color: var(--dim); font-size: 12px; line-height: 1.6;
+}
+.empty .hint { color: var(--dim-2); font-size: 11px; margin-top: 6px; }
+
+.card {
+  position: relative;
+  background: linear-gradient(180deg, var(--panel-2) 0%, var(--panel) 100%);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ue-color, var(--dim-2));
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.12s ease;
+}
+.card:hover { border-color: var(--line-2); }
+.card.selected {
+  border-color: var(--ue-color, var(--accent));
+  box-shadow: 0 0 0 1px var(--ue-color, var(--accent)) inset,
+              0 6px 22px -14px var(--ue-color, var(--accent));
+}
+.card.fresh { animation: flash 1.4s ease; }
+@keyframes flash {
+  0%   { background: linear-gradient(180deg, #1c2031, #16192a); }
+  100% { background: linear-gradient(180deg, var(--panel-2), var(--panel)); }
+}
+.card .head {
+  display: flex; justify-content: space-between; align-items: center; gap: 10px;
+  margin-bottom: 6px;
+}
+.identity { display: flex; align-items: center; gap: 8px; }
+.identity .sw {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--ue-color, var(--dim-2));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ue-color, transparent) 22%, transparent);
+}
+.crnti {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: 700; font-size: 18px; color: var(--txt);
+  letter-spacing: 0.01em;
+}
+.pci-tag {
+  font-size: 10px; padding: 2px 8px; border-radius: 4px;
+  background: rgba(127,185,217,0.12); color: var(--blue);
+  font-family: ui-monospace, monospace; font-weight: 500;
+  border: 1px solid rgba(127,185,217,0.22);
+}
+.seen { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.cell {
+  font-size: 10px; color: var(--dim-2); margin-top: 1px;
+  text-transform: uppercase; letter-spacing: 0.06em;
+}
+.metrics {
+  display: grid; grid-template-columns: 1fr auto; gap: 12px;
+  align-items: end; margin: 10px 0 2px;
+}
+.metric-rssi { display: flex; flex-direction: column; gap: 1px; }
+.metric-rssi .label {
+  font-size: 10px; color: var(--dim); text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.metric-rssi .value {
+  font-size: 22px; font-weight: 600; letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.metric-rssi .value .unit { font-size: 11px; color: var(--dim);
+                            margin-left: 4px; font-weight: 400; }
+.rsrp-strong { color: var(--green); }
+.rsrp-mid    { color: var(--yellow); }
+.rsrp-weak   { color: var(--red); }
+.rsrp-none   { color: var(--dim); font-size: 15px; }
+.spark { width: 130px; height: 36px; }
+.spark .fill { fill: var(--ue-color, var(--blue)); fill-opacity: 0.12; }
+.spark .line { stroke: var(--ue-color, var(--blue)); stroke-width: 1.6;
+               fill: none; stroke-linejoin: round; stroke-linecap: round; }
+
+.position {
+  margin-top: 10px;
+  background: rgba(10,13,19,0.55);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; color: var(--txt);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.position .row1 { display: flex; align-items: baseline; gap: 8px; }
+.position .latlon { font-weight: 600; }
+.position .cep { color: var(--dim); font-size: 11px; }
+.position .meta-row { color: var(--dim); font-size: 10.5px;
+                      letter-spacing: 0.02em; }
+.position.no-pos { color: var(--dim-2); font-style: italic;
+                   font-size: 11px; background: transparent; border-style: dashed; }
+.position.no-pos .latlon { color: var(--dim); font-weight: normal; }
+
+.foot {
+  margin-top: 8px;
+  display: flex; flex-wrap: wrap; gap: 6px;
+  font-size: 11px; color: var(--dim);
+  font-family: ui-monospace, monospace;
+}
+.chip {
+  display: inline-block; padding: 1px 7px; border-radius: 4px;
+  font-size: 10.5px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--line);
+}
+.chip.ul  { color: var(--blue); border-color: rgba(127,185,217,0.22); }
+.chip.dl  { color: #b4b8d9; border-color: rgba(180,184,217,0.18); }
+.chip.dci { color: #d9a280; border-color: rgba(217,162,128,0.22); }
+.chip.plain { color: var(--dim); }
+.chip.motion-stationary { color: var(--green); border-color: rgba(122,217,161,0.28);
+                          background: rgba(122,217,161,0.06); }
+.chip.motion-mobile     { color: var(--yellow); border-color: rgba(240,194,112,0.32);
+                          background: rgba(240,194,112,0.06); }
+.chip.motion-indeterminate { color: var(--dim); }
+
+/* ---------------------------------------------------------- scrubber */
+.scrubber {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 20px;
+  border-top: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(20,25,35,0.55), rgba(15,19,26,0.3));
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
+  color: var(--dim);
+}
+.scrubber.replay {
+  background: linear-gradient(180deg, rgba(240,194,112,0.06), rgba(15,19,26,0.3));
+  border-top-color: rgba(240,194,112,0.28);
+}
+.scrubber .live-btn {
+  font-family: inherit; font-size: 11px; padding: 4px 12px;
+  border-radius: 999px; border: 1px solid rgba(122,217,161,0.3);
+  background: rgba(20,25,35,0.5); color: var(--green); cursor: pointer;
+  letter-spacing: 0.06em; transition: background 0.15s, color 0.15s;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.scrubber.replay .live-btn { color: var(--yellow); border-color: rgba(240,194,112,0.4); }
+.scrubber .live-btn:hover { background: rgba(122,217,161,0.08); }
+.scrubber.replay .live-btn:hover { background: rgba(240,194,112,0.08); }
+.scrubber .live-btn .led {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+  box-shadow: 0 0 0 3px rgba(122,217,161,0.18);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.scrubber.replay .live-btn .led { background: var(--yellow); box-shadow: 0 0 0 3px rgba(240,194,112,0.18);
+                                  animation: none; }
+.scrubber input[type=range] {
+  flex: 1 1 auto; appearance: none; height: 4px; border-radius: 999px;
+  background: var(--line-2);
+  cursor: pointer; outline: none;
+}
+.scrubber input[type=range]::-webkit-slider-thumb {
+  appearance: none; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--txt); border: 2px solid var(--green); cursor: grab;
+}
+.scrubber.replay input[type=range]::-webkit-slider-thumb { border-color: var(--yellow); }
+.scrubber input[type=range]:active::-webkit-slider-thumb { cursor: grabbing; }
+.scrubber .lbl { text-transform: uppercase; letter-spacing: 0.08em;
+                 font-size: 10px; color: var(--dim-2); }
+.scrubber .time { color: var(--txt); font-variant-numeric: tabular-nums; min-width: 78px; }
+
+/* ---------------------------------------------------------- log */
+footer {
+  flex: 0 0 auto;
+  padding: 7px 20px;
+  border-top: 1px solid var(--line);
+  font-family: ui-monospace, monospace; font-size: 11px;
+  color: var(--dim);
+  max-height: 120px; overflow-y: auto;
+  background: rgba(10,13,19,0.4);
+}
+footer .row { padding: 1px 0; }
+footer .row .ts { color: var(--dim-2); margin-right: 8px; }
+footer .row b { color: var(--txt); font-weight: 600; }
 </style>
 </head><body>
 <header>
-  <h1>Cellular drones · live · UEs</h1>
+  <div class="brand">
+    <span class="led"></span>
+    <h1>Cellular drones <span>· passive UE sniffer</span></h1>
+  </div>
   <div class="meta">
-    <span>UEs <strong id="n-ues">0</strong></span>
-    <span>grants <strong id="n-ue-sightings">0</strong></span>
-    <span>uptime <strong id="uptime">0s</strong></span>
-    <span class="gps-pill fix-unknown" id="gps">GPS: —</span>
-    <span class="status-pill status-idle" id="status">idle</span>
+    <div class="stat">UEs <strong id="n-ues">0</strong></div>
+    <div class="stat">positioned <strong id="n-pos">0</strong></div>
+    <div class="stat">grants <strong id="n-ue-sightings">0</strong></div>
+    <div class="stat">uptime <strong id="uptime">0s</strong></div>
+    <span class="pill gps-unknown" id="gps"><span class="led"></span><span id="gps-text">GPS: —</span></span>
+    <span class="pill status-idle" id="status"><span class="led"></span><span id="status-text">idle</span></span>
   </div>
 </header>
-<main>
-  <div class="banner">
-    <strong>C-RNTI is a temporary, per-connection ID.</strong>
-    A handset that re-attaches (cell reselect, RRC release, airplane mode)
-    will be reissued a new C-RNTI by the eNB. Per-RNTI tracks here are
-    connection-scoped, not subscriber-scoped. Position estimates use UL
-    grants only — DL grants come from the eNB.
+<div class="banner">
+  <strong>C-RNTI is connection-scoped, not subscriber-scoped.</strong>
+  <span class="dim">A handset that re-attaches will be reissued a new C-RNTI.
+  Positions use UL grants only — DL grants come from the eNB.</span>
+</div>
+<div class="workspace">
+  <div class="map-wrap">
+    <div id="map"></div>
+    <div class="map-overlay" id="map-overlay">map · waiting for GPS</div>
+    <div class="legend" id="legend" style="display:none">
+      <div class="label">UEs on map</div>
+      <div id="legend-rows"></div>
+    </div>
   </div>
-  <div id="empty" class="empty">waiting for first PDCCH decode…</div>
-  <table id="tbl" style="display:none">
-    <thead><tr>
-      <th>C-RNTI</th>
-      <th>Attached PCI</th>
-      <th>DCI · MCS · PRB</th>
-      <th>UL RSSI</th>
-      <th>UL / DL grants</th>
-      <th>Last seen</th>
-      <th>UL trend</th>
-      <th>Estimated UE location</th>
-    </tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <div class="log" id="log"></div>
-</main>
+  <aside class="side">
+    <div class="side-head">
+      <strong>UEs · live</strong>
+      <span id="side-sum">—</span>
+    </div>
+    <div class="cards" id="cards">
+      <div class="empty" id="empty">
+        Waiting for the first PDCCH decode.
+        <div class="hint">UEs appear here with their C-RNTI, live signal trend,
+        and position estimate as UL grants and GPS fixes accumulate.</div>
+      </div>
+    </div>
+  </aside>
+</div>
+<div class="scrubber" id="scrubber">
+  <button class="live-btn" id="live-btn" type="button">
+    <span class="led"></span><span id="live-btn-text">LIVE</span>
+  </button>
+  <span class="lbl">replay</span>
+  <input type="range" id="scrub-range" min="0" max="1" value="1" step="0.001" disabled>
+  <span class="time" id="scrub-time">—</span>
+</div>
+<footer id="log"></footer>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 <script>
-const rowsEl = document.getElementById('rows');
-const tblEl = document.getElementById('tbl');
-const emptyEl = document.getElementById('empty');
-const logEl = document.getElementById('log');
-const nUesEl = document.getElementById('n-ues');
-const nUeSightingsEl = document.getElementById('n-ue-sightings');
-const uptimeEl = document.getElementById('uptime');
-const statusEl = document.getElementById('status');
-const gpsEl = document.getElementById('gps');
+const cardsEl     = document.getElementById('cards');
+const emptyEl     = document.getElementById('empty');
+const logEl       = document.getElementById('log');
+const nUesEl      = document.getElementById('n-ues');
+const nPosEl      = document.getElementById('n-pos');
+const nGrantsEl   = document.getElementById('n-ue-sightings');
+const uptimeEl    = document.getElementById('uptime');
+const statusEl    = document.getElementById('status');
+const statusText  = document.getElementById('status-text');
+const gpsEl       = document.getElementById('gps');
+const gpsText     = document.getElementById('gps-text');
+const mapEl       = document.getElementById('map');
+const mapOverlay  = document.getElementById('map-overlay');
+const legendEl    = document.getElementById('legend');
+const legendRows  = document.getElementById('legend-rows');
+const sideSumEl   = document.getElementById('side-sum');
+
+// Stable per-UE color so map markers, card accents and legend agree.
+const PALETTE = [
+  '#7fb9d9', '#d9a280', '#a8d97f', '#d97fa8', '#d9d37f',
+  '#9aa0d0', '#80c9d9', '#d9805a', '#a9d9bb', '#c8a3d9',
+];
+function colorFor(key) {
+  let h = 0;
+  for (const ch of String(key)) h = (h * 31 + ch.charCodeAt(0)) | 0;
+  return PALETTE[Math.abs(h) % PALETTE.length];
+}
 
 let totalUeSightings = 0;
 let latestGps = null;
+let selectedKey = null;
 const ues = new Map();
 
-function rsrpClass(v) {
-  if (v == null) return '';
-  if (v >= -75) return 'rsrp-strong';
-  if (v >= -95) return 'rsrp-mid';
-  return 'rsrp-weak';
+// --- map ----------------------------------------------------------------
+let map = null;
+let droneMarker = null;
+let droneTrailLine = null;
+const droneTrail = [];
+const ueLayers = new Map();   // key -> {marker, accuracy, label}
+
+function initMapIfReady(centerLat, centerLon) {
+  if (map || typeof L === 'undefined') return;
+  map = L.map(mapEl, { zoomControl: true, attributionControl: true })
+        .setView([centerLat, centerLon], 17);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
+    maxZoom: 19, subdomains: 'abc',
+    attribution: '© OpenStreetMap, © CARTO',
+  }).addTo(map);
+  droneTrailLine = L.polyline(droneTrail, { color:'#7ea2c8', weight:2, opacity:0.7 }).addTo(map);
+  ues.forEach((u) => updateUeLayer(u));
 }
+function leafletUnavailable() {
+  if (typeof L !== 'undefined' || mapEl.classList.contains('unavailable')) return;
+  mapEl.classList.add('unavailable');
+  mapEl.textContent = 'map needs internet for tiles · positions still listed on the right';
+}
+setTimeout(leafletUnavailable, 4000);
+
+function updateDroneMarker() {
+  if (!map || !latestGps) return;
+  const g = latestGps.gps;
+  if (!droneMarker) {
+    droneMarker = L.circleMarker([g.lat, g.lon], {
+      radius: 6, color:'#d9e6f7', weight:2, fillColor:'#5a8fd9', fillOpacity:0.9,
+    }).addTo(map).bindTooltip('drone', {permanent:false, direction:'top'});
+    map.setView([g.lat, g.lon], Math.max(map.getZoom(), 17));
+  } else {
+    droneMarker.setLatLng([g.lat, g.lon]);
+  }
+  const last = droneTrail[droneTrail.length - 1];
+  if (!last || last[0] !== g.lat || last[1] !== g.lon) {
+    droneTrail.push([g.lat, g.lon]);
+    if (droneTrail.length > 1000) droneTrail.shift();
+    if (droneTrailLine) droneTrailLine.setLatLngs(droneTrail);
+  }
+}
+function updateUeLayer(u) {
+  if (!map) return;
+  const p = u.est_position;
+  const color = colorFor(u.key);
+  let layer = ueLayers.get(u.key);
+  if (!p) {
+    // No estimate yet — make sure any stale marker is removed.
+    if (layer) {
+      map.removeLayer(layer.marker);
+      map.removeLayer(layer.accuracy);
+      ueLayers.delete(u.key);
+    }
+    return;
+  }
+  const selected = (u.key === selectedKey);
+  const markerOpts = {
+    radius: selected ? 10 : 7,
+    color: color, weight: selected ? 3 : 2,
+    fillColor: color, fillOpacity: selected ? 0.75 : 0.55,
+  };
+  if (!layer) {
+    const marker = L.circleMarker([p.lat, p.lon], markerOpts).addTo(map);
+    marker.bindTooltip(u.c_rnti_hex,
+      {permanent: true, direction: 'right', offset: [10, 0], className: 'ue-tip'});
+    marker.on('click', () => selectUe(u.key, true));
+    const accuracy = L.circle([p.lat, p.lon], {
+      radius: Math.max(2, p.cep95_m || 5),
+      color: color, weight: 1, opacity: 0.5,
+      fillColor: color, fillOpacity: 0.06,
+      dashArray: '4 3',
+    }).addTo(map);
+    layer = {marker, accuracy};
+    ueLayers.set(u.key, layer);
+  } else {
+    layer.marker.setLatLng([p.lat, p.lon]);
+    layer.marker.setStyle(markerOpts);
+    layer.accuracy.setLatLng([p.lat, p.lon]);
+    layer.accuracy.setRadius(Math.max(2, p.cep95_m || 5));
+    layer.accuracy.setStyle({color: color, fillColor: color,
+                             opacity: selected ? 0.85 : 0.5,
+                             fillOpacity: selected ? 0.12 : 0.06});
+  }
+}
+function refreshAllLayers() {
+  ues.forEach(u => updateUeLayer(u));
+}
+function focusUeOnMap(key) {
+  const layer = ueLayers.get(key);
+  if (!layer || !map) return;
+  map.setView(layer.marker.getLatLng(), Math.max(map.getZoom(), 18),
+              {animate: true});
+}
+function renderMapOverlay() {
+  if (!latestGps) {
+    mapOverlay.innerHTML = 'map · <span style="color:var(--dim)">waiting for GPS</span>';
+    return;
+  }
+  const g = latestGps.gps;
+  const positioned = [...ues.values()].filter(u => u.est_position).length;
+  mapOverlay.innerHTML =
+    `<div><strong>drone</strong> ${g.lat.toFixed(5)}, ${g.lon.toFixed(5)}</div>` +
+    `<div>trail ${droneTrail.length} pts · ${positioned}/${ues.size} positioned</div>`;
+}
+function renderLegend() {
+  if (!ues.size) { legendEl.style.display = 'none'; return; }
+  legendEl.style.display = '';
+  const items = [...ues.values()].sort((a, b) => (b.ul_count || 0) - (a.ul_count || 0));
+  legendRows.innerHTML = items.map(u => {
+    const c = colorFor(u.key);
+    const cls = ['row',
+                 u.est_position ? 'has-pos' : 'no-pos',
+                 u.key === selectedKey ? 'active' : ''].join(' ');
+    return `<div class="${cls}" data-key="${u.key}">
+              <span class="sw" style="background:${c}"></span>
+              <span>${u.c_rnti_hex}</span>
+              <span style="color:var(--dim-2)">PCI ${u.pci}</span>
+            </div>`;
+  }).join('');
+  legendRows.querySelectorAll('.row').forEach(el => {
+    el.addEventListener('click', () => selectUe(el.getAttribute('data-key'), true));
+  });
+}
+
+// --- cards --------------------------------------------------------------
 function fmt(v, suffix='', digits=1) {
   if (v == null || Number.isNaN(v)) return '—';
   return v.toFixed(digits) + suffix;
@@ -684,177 +1233,333 @@ function fmtFreq(hz) {
 function timeAgo(iso) {
   if (!iso) return '—';
   const t = Date.parse(iso);
+  if (isNaN(t)) return '—';
   const s = Math.max(0, (Date.now() - t) / 1000);
   if (s < 2) return 'now';
-  if (s < 60) return Math.round(s) + 's ago';
-  if (s < 3600) return Math.round(s/60) + 'm ago';
-  return Math.round(s/3600) + 'h ago';
+  if (s < 60) return Math.round(s) + 's';
+  if (s < 3600) return Math.round(s/60) + 'm';
+  return Math.round(s/3600) + 'h';
 }
-function sparkPath(history) {
-  if (!history || history.length < 2) return '';
-  const w = 120, h = 28, pad = 2;
+function rsrpClass(v) {
+  if (v == null) return 'rsrp-none';
+  if (v >= -75) return 'rsrp-strong';
+  if (v >= -95) return 'rsrp-mid';
+  return 'rsrp-weak';
+}
+function sparkSvg(history, color) {
+  if (!history || history.length < 2) {
+    return `<svg class="spark" viewBox="0 0 130 36" style="--ue-color:${color}"></svg>`;
+  }
+  const W = 130, H = 36, pad = 2;
   const vals = history.map(p => p[1]);
   const min = Math.min(...vals), max = Math.max(...vals);
   const span = Math.max(1, max - min);
-  const dx = (w - 2*pad) / (history.length - 1);
-  return history.map((p, i) => {
+  const dx = (W - 2*pad) / (history.length - 1);
+  let line = '', fill = '';
+  history.forEach((p, i) => {
     const x = pad + i*dx;
-    const y = pad + (h - 2*pad) * (1 - (p[1] - min) / span);
-    return (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
-  }).join(' ');
-}
-function minimapSvg(ue) {
-  const trail = ue.trail || [];
-  const est = ue.est_position;
-  if (trail.length < 2 && !est) return '';
-  const all = [];
-  trail.forEach(p => all.push([p.lat, p.lon]));
-  if (est) all.push([est.lat, est.lon]);
-  const lats = all.map(p => p[0]);
-  const lons = all.map(p => p[1]);
-  const padDeg = 0.0001;
-  const minLat = Math.min(...lats) - padDeg, maxLat = Math.max(...lats) + padDeg;
-  const minLon = Math.min(...lons) - padDeg, maxLon = Math.max(...lons) + padDeg;
-  const W = 110, H = 84;
-  const project = (lat, lon) => {
-    const x = (lon - minLon) / Math.max(1e-9, maxLon - minLon) * W;
-    const y = H - (lat - minLat) / Math.max(1e-9, maxLat - minLat) * H;
-    return [x, y];
-  };
-  let svg = '';
-  trail.forEach(p => {
-    const [x, y] = project(p.lat, p.lon);
-    const c = rsrpClass(p.ul_rssi_dbm);
-    const fill = c === 'rsrp-strong' ? '#7ad9a1'
-              : c === 'rsrp-mid'    ? '#f0c270'
-              : c === 'rsrp-weak'   ? '#f08580' : '#5a6470';
-    svg += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="1.6" fill="${fill}" fill-opacity="0.7"/>`;
+    const y = pad + (H - 2*pad) * (1 - (p[1] - min) / span);
+    const cmd = (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+    line += cmd + ' ';
+    fill += (i === 0 ? `M${x.toFixed(1)},${H} L${x.toFixed(1)},${y.toFixed(1)}`
+                     : ` L${x.toFixed(1)},${y.toFixed(1)}`);
   });
-  if (est) {
-    const [x, y] = project(est.lat, est.lon);
-    svg += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="4" fill="none" stroke="#d9d3ff" stroke-width="1.4"/>`;
-    svg += `<line x1="${(x-6).toFixed(1)}" y1="${y.toFixed(1)}" x2="${(x+6).toFixed(1)}" y2="${y.toFixed(1)}" stroke="#d9d3ff" stroke-width="0.9"/>`;
-    svg += `<line x1="${x.toFixed(1)}" y1="${(y-6).toFixed(1)}" x2="${x.toFixed(1)}" y2="${(y+6).toFixed(1)}" stroke="#d9d3ff" stroke-width="0.9"/>`;
-  }
-  return `<svg class="minimap" viewBox="0 0 ${W} ${H}">${svg}</svg>`;
+  fill += ` L${(pad + (history.length-1)*dx).toFixed(1)},${H} Z`;
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" style="--ue-color:${color}">`
+       + `<path class="fill" d="${fill}"/>`
+       + `<path class="line" d="${line}"/></svg>`;
 }
-function positionBlock(ue) {
-  const p = ue.est_position;
+function positionBlock(u) {
+  const p = u.est_position;
   if (!p) {
-    if (!latestGps) return '<span class="no-pos">no GPS yet</span>';
-    if ((ue.ul_count || 0) < 2) return `<span class="no-pos">need ≥ 2 UL grants (have ${ue.ul_count || 0})</span>`;
-    if (ue.n_geo_samples < 2) return `<span class="no-pos">need ≥ 2 fixes (have ${ue.n_geo_samples})</span>`;
-    return '<span class="no-pos">computing…</span>';
+    let why;
+    if (!latestGps) why = 'no GPS fix yet';
+    else if ((u.ul_count || 0) < 2) why = `need ≥ 2 UL grants (have ${u.ul_count || 0})`;
+    else if ((u.n_geo_samples || 0) < 2) why = `need ≥ 2 geo-tagged grants (have ${u.n_geo_samples || 0})`;
+    else why = 'computing…';
+    return `<div class="position no-pos">
+              <div class="row1"><span class="latlon">no position</span></div>
+              <div class="meta-row">${why}</div>
+            </div>`;
   }
-  const lat = p.lat.toFixed(6), lon = p.lon.toFixed(6);
-  const cep = p.cep95_m != null ? '±' + p.cep95_m.toFixed(1) + 'm' : '';
-  const alt = p.alt_m != null ? `, ${p.alt_m.toFixed(0)}m AGL` : '';
-  return `<div class="pos">${lat}, ${lon} <span class="cep">${cep}</span>`
-       + `<span class="method">${p.method} · ${p.n_samples} UL samples${alt}</span></div>`
-       + minimapSvg(ue);
+  const cep = p.cep95_m != null ? `±${p.cep95_m.toFixed(1)} m` : '';
+  const alt = p.alt_m != null ? `, ${p.alt_m.toFixed(0)} m AGL` : '';
+  return `<div class="position">
+            <div class="row1">
+              <span class="latlon">${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}</span>
+              <span class="cep">${cep}</span>
+            </div>
+            <div class="meta-row">${p.method} · ${p.n_samples} UL samples${alt}</div>
+          </div>`;
 }
-function renderRow(ue) {
-  let tr = document.getElementById('row-' + ue.key);
-  if (!tr) {
-    tr = document.createElement('tr');
-    tr.id = 'row-' + ue.key;
-    rowsEl.appendChild(tr);
+function renderCard(u) {
+  const color = colorFor(u.key);
+  let card = document.getElementById('card-' + u.key);
+  const isNew = !card;
+  if (isNew) {
+    card = document.createElement('div');
+    card.id = 'card-' + u.key;
+    card.className = 'card';
+    card.addEventListener('click', () => selectUe(u.key, true));
+    cardsEl.appendChild(card);
   }
-  const dciTags = (ue.dci_formats || []).map(f => `<span class="tag tag-dci">DCI ${f}</span>`).join('');
-  const ulTag = (ue.ul_count > 0) ? `<span class="tag tag-ul">UL ${ue.ul_count}</span>` : '';
-  const dlTag = (ue.dl_count > 0) ? `<span class="tag tag-dl">DL ${ue.dl_count}</span>` : '';
-  const lastMcs = ue.mcs != null ? `MCS ${ue.mcs}` : '—';
-  const lastPrb = ue.n_prb != null ? `${ue.n_prb} PRB` : '—';
-  const lastTbs = ue.tbs_bytes != null ? `${ue.tbs_bytes} B` : '';
-  tr.innerHTML = `
-    <td><span class="crnti">${ue.c_rnti_hex}</span><div class="dim">${ue.center_hz != null ? fmtFreq(ue.center_hz) : '—'}</div></td>
-    <td><strong>${ue.pci}</strong></td>
-    <td>${dciTags}<div class="dim">${lastMcs} · ${lastPrb} ${lastTbs ? '· ' + lastTbs : ''}</div></td>
-    <td class="rsrp ${rsrpClass(ue.ul_rssi_dbm)}">${fmt(ue.ul_rssi_dbm, ' dBm')}</td>
-    <td>${ulTag}${dlTag}</td>
-    <td title="${ue.last_seen}">${timeAgo(ue.last_seen)}</td>
-    <td><svg class="spark" viewBox="0 0 120 28"><path d="${sparkPath(ue.ul_rssi_history)}" fill="none" stroke="#7fb9d9" stroke-width="1.5"/></svg></td>
-    <td>${positionBlock(ue)}</td>
+  card.style.setProperty('--ue-color', color);
+  card.classList.toggle('selected', u.key === selectedKey);
+
+  const rssi = u.ul_rssi_dbm;
+  const rssiCls = rsrpClass(rssi);
+  const rssiBody = rssi != null
+    ? `${rssi.toFixed(1)}<span class="unit">dBm UL</span>`
+    : `no UL<span class="unit">DL-only</span>`;
+  const ulChip  = (u.ul_count > 0) ? `<span class="chip ul">UL ${u.ul_count}</span>` : '';
+  const dlChip  = (u.dl_count > 0) ? `<span class="chip dl">DL ${u.dl_count}</span>` : '';
+  const dciTags = (u.dci_formats || []).map(f => `<span class="chip dci">DCI ${f}</span>`).join('');
+  const mcs = u.mcs    != null ? `<span class="chip plain">MCS ${u.mcs}</span>` : '';
+  const prb = u.n_prb  != null ? `<span class="chip plain">${u.n_prb} PRB</span>` : '';
+  const tbs = u.tbs_bytes != null ? `<span class="chip plain">${u.tbs_bytes} B</span>` : '';
+  const motion = u.motion && u.motion.label
+    ? `<span class="chip motion-${u.motion.label}" title="${u.motion.note || ''}">${u.motion.label}</span>`
+    : '';
+
+  card.innerHTML = `
+    <div class="head">
+      <div class="identity">
+        <span class="sw"></span>
+        <span class="crnti">${u.c_rnti_hex}</span>
+        <span class="pci-tag">PCI ${u.pci}</span>
+      </div>
+      <span class="seen" title="${u.last_seen || ''}">${timeAgo(u.last_seen)} ago</span>
+    </div>
+    <div class="cell">${fmtFreq(u.center_hz)}</div>
+    <div class="metrics">
+      <div class="metric-rssi">
+        <div class="label">current UL RSSI</div>
+        <div class="value ${rssiCls}">${rssiBody}</div>
+      </div>
+      ${sparkSvg(u.ul_rssi_history, color)}
+    </div>
+    ${positionBlock(u)}
+    <div class="foot">${motion}${ulChip}${dlChip}${dciTags}${mcs}${prb}${tbs}</div>
   `;
-  tr.classList.add('fresh');
-  setTimeout(() => tr.classList.remove('fresh'), 1500);
+  if (!isNew) {
+    card.classList.remove('fresh');
+    void card.offsetWidth;
+  }
+  card.classList.add('fresh');
 }
-function sortRows() {
+function sortCards() {
   const sorted = [...ues.values()].sort((a, b) => {
     const ap = a.est_position ? 0 : 1;
     const bp = b.est_position ? 0 : 1;
     if (ap !== bp) return ap - bp;
-    return (b.ul_count || 0) - (a.ul_count || 0);
+    if ((b.ul_count || 0) !== (a.ul_count || 0))
+      return (b.ul_count || 0) - (a.ul_count || 0);
+    return (b.ul_rssi_dbm ?? -1e9) - (a.ul_rssi_dbm ?? -1e9);
   });
   sorted.forEach((u, i) => {
-    const tr = document.getElementById('row-' + u.key);
-    if (tr && rowsEl.children[i] !== tr) rowsEl.appendChild(tr);
+    const card = document.getElementById('card-' + u.key);
+    if (card && cardsEl.children[i] !== card) cardsEl.appendChild(card);
   });
 }
+function selectUe(key, fromUi) {
+  selectedKey = selectedKey === key ? null : key;
+  document.querySelectorAll('.card').forEach(c => {
+    c.classList.toggle('selected', c.id === 'card-' + selectedKey);
+  });
+  refreshAllLayers();
+  renderLegend();
+  if (fromUi && selectedKey) {
+    const c = document.getElementById('card-' + selectedKey);
+    if (c) c.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+    focusUeOnMap(selectedKey);
+  }
+}
+
+// --- chrome (status, gps, log) ------------------------------------------
 function setStatus(s) {
-  let text = s.phase;
+  let text = s.phase || 'idle';
   if (s.phase === 'sniffing') {
-    const mhz = s.center_hz != null ? (s.center_hz/1e6).toFixed(2) + ' MHz' : 'target cell';
-    text = `sniffing PDCCH @ ${mhz} · gain ${s.gain_db ?? '?'} dB`;
+    const mhz = s.center_hz != null ? (s.center_hz/1e6).toFixed(2) + ' MHz' : '';
+    text = mhz ? `live · ${mhz}` : 'live';
+  } else if (s.phase === 'simulating') {
+    text = 'simulating';
   } else if (s.message) {
     text += ' — ' + s.message;
   }
-  statusEl.textContent = text;
-  statusEl.className = 'status-pill status-' + s.phase;
+  statusText.textContent = text;
+  statusEl.className = 'pill status-' + (s.phase || 'idle');
 }
 function setGps(rec) {
   latestGps = rec;
-  if (!rec) { gpsEl.textContent = 'GPS: —'; return; }
-  const g = rec.gps;
-  gpsEl.className = 'gps-pill fix-' + (g.fix || 'unknown');
-  gpsEl.textContent = `GPS: ${g.lat.toFixed(5)}, ${g.lon.toFixed(5)} (${g.fix})`;
+  if (!rec) {
+    gpsText.textContent = 'GPS: —';
+    gpsEl.className = 'pill gps-unknown';
+  } else {
+    const g = rec.gps;
+    gpsEl.className = 'pill gps-' + (g.fix || 'unknown');
+    gpsText.textContent = `${g.lat.toFixed(5)}, ${g.lon.toFixed(5)} · ${g.fix}`;
+    initMapIfReady(g.lat, g.lon);
+    updateDroneMarker();
+  }
+  renderMapOverlay();
 }
-function logLine(text) {
+function logLine(html) {
   const d = document.createElement('div');
+  d.className = 'row';
   const ts = new Date().toTimeString().slice(0, 8);
-  d.innerHTML = '<span class="ts">' + ts + '</span>' + text;
+  d.innerHTML = '<span class="ts">' + ts + '</span>' + html;
   logEl.prepend(d);
-  while (logEl.children.length > 50) logEl.removeChild(logEl.lastChild);
+  while (logEl.children.length > 80) logEl.removeChild(logEl.lastChild);
 }
+
+function updateSummary() {
+  let positioned = 0;
+  ues.forEach(u => { if (u.est_position) positioned += 1; });
+  nUesEl.textContent = ues.size;
+  nPosEl.textContent = positioned;
+  nGrantsEl.textContent = totalUeSightings;
+  sideSumEl.textContent = ues.size ? `${positioned}/${ues.size} positioned` : '—';
+  emptyEl.style.display = ues.size ? 'none' : '';
+}
+
+// --- SSE ----------------------------------------------------------------
 function applyEvent(ev) {
   if (ev.type === 'snapshot') {
     ues.clear();
-    rowsEl.innerHTML = '';
-    (ev.ues || []).forEach(u => { ues.set(u.key, u); renderRow(u); });
+    [...cardsEl.querySelectorAll('.card')].forEach(c => c.remove());
+    ueLayers.forEach(({marker, accuracy}) => {
+      if (map) { map.removeLayer(marker); map.removeLayer(accuracy); }
+    });
+    ueLayers.clear();
+    droneTrail.length = 0;
+    (ev.gps_trail || []).forEach(p => droneTrail.push([p.lat, p.lon]));
+    if (droneTrailLine) droneTrailLine.setLatLngs(droneTrail);
     setStatus(ev.status || {phase: 'idle'});
     setGps(ev.latest_gps);
+    (ev.ues || []).forEach(u => { ues.set(u.key, u); renderCard(u); updateUeLayer(u); });
     totalUeSightings = ev.total_ue_sightings || 0;
   } else if (ev.type === 'ue_sighting') {
     const u = ev.ue;
     ues.set(u.key, u);
-    renderRow(u);
+    renderCard(u);
+    updateUeLayer(u);
     totalUeSightings += 1;
     const pos = u.est_position
       ? ` · est ${u.est_position.lat.toFixed(5)},${u.est_position.lon.toFixed(5)} ±${u.est_position.cep95_m.toFixed(0)}m`
       : '';
-    logLine(`UE ${u.c_rnti_hex} on PCI ${u.pci} · UL ${fmt(u.ul_rssi_dbm, ' dBm')}${pos}`);
+    logLine(`<b>${u.c_rnti_hex}</b> PCI ${u.pci} · UL ${fmt(u.ul_rssi_dbm, ' dBm')}${pos}`);
   } else if (ev.type === 'gps') {
     setGps(ev.fix);
   } else if (ev.type === 'status') {
     setStatus(ev.status);
     logLine('status: ' + ev.status.phase + (ev.status.message ? ' — ' + ev.status.message : ''));
   }
-  nUesEl.textContent = ues.size;
-  nUeSightingsEl.textContent = totalUeSightings;
-  if (ues.size > 0) { tblEl.style.display = ''; emptyEl.style.display = 'none'; }
-  sortRows();
+  updateSummary();
+  sortCards();
+  renderLegend();
+  renderMapOverlay();
 }
 let t0 = Date.now();
 setInterval(() => {
   uptimeEl.textContent = Math.round((Date.now() - t0)/1000) + 's';
   ues.forEach(u => {
-    const tr = document.getElementById('row-' + u.key);
-    if (tr) tr.children[5].textContent = timeAgo(u.last_seen);
+    const seenEl = document.querySelector('#card-' + u.key + ' .seen');
+    if (seenEl) seenEl.textContent = timeAgo(u.last_seen) + ' ago';
   });
 }, 1000);
+// --- replay scrubber ----------------------------------------------------
+const scrubberEl   = document.getElementById('scrubber');
+const scrubRangeEl = document.getElementById('scrub-range');
+const scrubTimeEl  = document.getElementById('scrub-time');
+const liveBtnEl    = document.getElementById('live-btn');
+const liveBtnText  = document.getElementById('live-btn-text');
+
+let replayMode = false;
+let bounds = null;          // {t_min_ns, t_max_ns, started_ns, now_ns}
+let lastScrubAt = 0;
+let scrubInflight = null;
+
+function fmtElapsed(ns) {
+  if (!bounds || !bounds.started_ns) return '—';
+  const s = Math.max(0, (ns - bounds.started_ns) / 1e9);
+  if (s < 60) return s.toFixed(1) + 's';
+  const m = Math.floor(s / 60), r = s - 60*m;
+  if (m < 60) return m + 'm ' + r.toFixed(0).padStart(2,'0') + 's';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m - 60*h) + 'm';
+}
+
+async function refreshBounds() {
+  try {
+    const r = await fetch('/bounds');
+    bounds = await r.json();
+    const haveSpan = bounds.t_min_ns != null && bounds.t_max_ns != null
+                     && bounds.t_max_ns > bounds.t_min_ns;
+    scrubRangeEl.disabled = !haveSpan;
+    if (!replayMode && haveSpan) {
+      // While LIVE, keep the slider pinned to the right edge.
+      scrubRangeEl.value = '1';
+      scrubTimeEl.textContent = 'now · ' + fmtElapsed(bounds.t_max_ns);
+    }
+    if (!haveSpan) scrubTimeEl.textContent = 'no GPS yet';
+  } catch (_) { /* server probably gone */ }
+}
+refreshBounds();
+setInterval(refreshBounds, 3000);
+
+function setReplayMode(on) {
+  replayMode = on;
+  scrubberEl.classList.toggle('replay', on);
+  liveBtnEl.classList.toggle('is-replay', on);
+  liveBtnEl.classList.toggle('is-live', !on);
+  liveBtnText.textContent = on ? 'GO LIVE' : 'LIVE';
+}
+setReplayMode(false);
+
+async function applyReplayAt(ts) {
+  if (scrubInflight) return;       // cheap rate-limit while dragging
+  scrubInflight = fetch('/replay?ts_mono_ns=' + ts)
+    .then(r => r.json())
+    .then(snap => { applyEvent(snap); })
+    .catch(() => {})
+    .finally(() => { scrubInflight = null; });
+}
+
+scrubRangeEl.addEventListener('input', () => {
+  if (!bounds || bounds.t_min_ns == null || bounds.t_max_ns == null) return;
+  const frac = parseFloat(scrubRangeEl.value);
+  const ts = Math.round(bounds.t_min_ns + frac * (bounds.t_max_ns - bounds.t_min_ns));
+  scrubTimeEl.textContent = 'replay · ' + fmtElapsed(ts);
+  if (!replayMode) setReplayMode(true);
+  // Throttle: at most ~12 Hz of replay fetches while dragging.
+  const now = performance.now();
+  if (now - lastScrubAt < 80) return;
+  lastScrubAt = now;
+  applyReplayAt(ts);
+});
+
+liveBtnEl.addEventListener('click', async () => {
+  if (!replayMode) return;
+  setReplayMode(false);
+  scrubRangeEl.value = '1';
+  try {
+    const r = await fetch('/state');
+    const snap = await r.json();
+    applyEvent(snap);
+  } catch (_) {}
+});
+
+// SSE: skip live events while we're scrubbing through history.
 const es = new EventSource('/events');
-es.onmessage = (e) => { try { applyEvent(JSON.parse(e.data)); } catch (_) {} };
-es.onerror = () => logLine('stream disconnected, browser will retry');
+es.onmessage = (e) => {
+  try {
+    const ev = JSON.parse(e.data);
+    if (replayMode && (ev.type === 'gps' || ev.type === 'ue_sighting'
+                       || (ev.type === 'snapshot' && !ev.replay))) return;
+    applyEvent(ev);
+  } catch (_) {}
+};
+es.onerror = () => logLine('<span style="color:var(--red)">stream disconnected</span> — browser will retry');
 </script></body></html>
 """
 
@@ -876,6 +1581,28 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/state":
             body = json.dumps(self.state.snapshot()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/bounds":
+            body = json.dumps(self.state.time_bounds()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.startswith("/replay"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                ts = int(qs.get("ts_mono_ns", ["0"])[0])
+            except ValueError:
+                self.send_response(400); self.end_headers(); return
+            body = json.dumps(self.state.snapshot_at(ts)).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

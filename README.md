@@ -32,37 +32,58 @@ pip install -e .
 sniffer --help
 ```
 
-Everything goes through one CLI. Pick a subcommand.
+There is **one** run path: `sniffer live`. It ingests PDCCH events
+(real radio or simulated) and serves the dashboard — C-RNTI extraction
+and per-UE positioning happen on the same page, on the same map.
 
-### Hardware-free demo (validates the pipeline)
+### Hardware-free (validates the pipeline)
 
 ```bash
-sniffer demo --plot data/demo/ues.png        # batch run + plot
-sniffer live --simulate                       # realtime UI at http://127.0.0.1:8000/
+sniffer live --simulate          # realtime UI at http://127.0.0.1:8000/
 ```
 
 The simulator stages three synthetic UEs around an eNB (two stationary,
-one walking across the cell). Stationary UEs recover to ~30 m of ground
-truth; the mobile UE shows the expected ~200 m bias — staged on
+one walking across the cell). Stationary UEs recover to ~30 m of
+ground truth; the mobile UE shows the expected ~200 m bias — staged on
 purpose to expose the limit of single-RX positioning.
 
 ### Real radio (Linux + USRP B210)
 
 ```bash
 sniffer install                                       # one-time: srsRAN + LTESniffer + venv
-sniffer gps-log &                                     # GPS stream -> data/gps-<mission>.jsonl
-sniffer live --earfcn 1850 --pci 271 --rx-gain 50     # spawns LTESniffer + UI
+sniffer live --earfcn 1850 --pci 271 --rx-gain 50     # spawns LTESniffer + dashboard
 # open http://127.0.0.1:8000/
 ```
 
-Pick the target EARFCN + PCI for the operator you care about (CellMapper
-/ OpenCellID are good starting points; `srsRAN_cell_search` works on the
-USRP itself if you don't want to rely on external databases).
+Pick the target EARFCN + PCI for the operator you care about
+(CellMapper / OpenCellID are good starting points; `srsRAN_cell_search`
+works on the USRP itself if you don't want to rely on external
+databases). GPS is auto-picked-up from `gpspipe` if `gpsd` is running
+on the host — see *Where GPS comes from* below.
+
+### Where GPS comes from
+
+The dashboard expects a position stream paired with every UE sighting.
+Three realistic sources, in order of recommendation:
+
+1. **Dedicated USB/UART GPS → gpsd → gpspipe** (default). Plug a
+   u-blox / BU-353 / similar into the SBC, `apt install gpsd
+   gpsd-clients`, and `sniffer live` picks it up automatically.
+2. **MAVLink from the flight controller.** Pixhawk / PX4 / ArduPilot
+   already owns the GPS lock for navigation; a companion computer
+   reads `GLOBAL_POSITION_INT` over UART or UDP. Adapter not in the
+   tree yet — see `docs/design.md` §7.2 for the ~10-line `pymavlink`
+   sketch.
+3. **Direct u-blox UBX** (skip both gpsd and the FC). Only worth it if
+   you want raw carrier-phase for PPK postprocessing.
+
+The full discussion lives in `docs/design.md` §7.
 
 ### Offline reprocessing
 
 ```bash
 sniffer report 'data/geotagged-*.jsonl' --plot data/run.png
+sniffer gps-log                                       # standalone gpsd recorder
 ```
 
 ## Repo layout

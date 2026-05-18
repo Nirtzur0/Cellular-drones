@@ -123,7 +123,99 @@ message and the position estimate stays null.
   for static emitters; UEs that move at all need ≥ 2 GPSDO-disciplined
   receivers.
 
-## 7. Drone power budget (real-radio path)
+## 7. Where the GPS comes from
+
+The drone needs a position stream paired with every UE sighting. The
+framework reads a single canonical record schema (`geotag` records, see
+`sniffer.schema.GpsFix`) so the source is swappable. There are three
+realistic places to get the data from, in order of recommendation:
+
+### 7.1 USB or UART GPS → gpsd → gpspipe (default, wired today)
+
+A dedicated NMEA-capable GPS receiver attached to the SBC over
+USB/UART. `gpsd` does the parsing; the dashboard tails `gpspipe -w`
+and feeds `sniffer.parse_gpsd`. This is what `sniffer live` uses today
+when `gpspipe` is on `PATH`.
+
+| Pros | Cons |
+| --- | --- |
+| Plug-and-play with almost any GPS (u-blox 7/8/9, BU-353, USGlobalSat) | Adds one more peripheral the airframe has to carry |
+| RTK-capable (gpsd handles RTCM3 inputs) | gpsd is a daemon — has to be alive on the drone |
+| Decoupled from the flight stack; survives FC reboots | No coupling to autopilot attitude/heading |
+
+Wiring:
+
+```bash
+# Pi side, one-time:
+sudo apt install gpsd gpsd-clients
+sudo systemctl enable --now gpsd
+# Plug receiver into USB → /dev/ttyACM0 (auto-discovered by gpsd)
+
+# Then on the same host:
+sniffer live --earfcn 1850 --pci 271     # automatically picks up gpspipe
+```
+
+### 7.2 MAVLink from the flight controller
+
+The Pixhawk / PX4 / ArduPilot already owns the authoritative GPS lock
+for navigation. A companion computer reads
+`GLOBAL_POSITION_INT` (msgid 33) or `GPS_RAW_INT` (msgid 24) over the
+FC's UART or a UDP MAVLink endpoint.
+
+**Why bother**: one fewer antenna on the airframe, and the position
+stream is already disciplined against the FC's EKF, which fuses GPS
+with IMU/baro — useful when GPS coverage briefly degrades.
+
+**Why not the default**: the framework deliberately doesn't bind to a
+particular flight stack. A MAVLink dropout in flight is much worse than
+a separate-GPS dropout.
+
+Sketch (`pymavlink`, ~10 lines):
+
+```python
+from pymavlink import mavutil
+mav = mavutil.mavlink_connection("udpin:0.0.0.0:14550")  # or /dev/ttyAMA0
+while True:
+    msg = mav.recv_match(type="GLOBAL_POSITION_INT", blocking=True)
+    fix = GpsFix(lat=msg.lat / 1e7, lon=msg.lon / 1e7,
+                 alt_m=msg.alt / 1e3, fix="3d", hdop=None)
+    # emit a geotag JSONL line here
+```
+
+Pull this into `sniffer/parse_mavlink.py` when you have a Pixhawk in
+hand to test against. Don't ship it without the test rig.
+
+### 7.3 Direct u-blox UBX binary
+
+Skip both gpsd and the flight controller. Open the GPS UART, parse UBX
+frames (`NAV-PVT` is the position-velocity-time message), emit
+`GpsFix`. Gives you raw observables (carrier phase, doppler) if you
+ever want to PPK-post-process for sub-meter accuracy after the
+mission. Operationally only worth it if you're chasing TDOA-grade
+clock discipline.
+
+### Time discipline
+
+`ts_mono_ns` is the join key between UE sightings and geotag records.
+For all three sources, the recommended setup is GPS PPS into chrony or
+ptp4l on the SBC, so `time.monotonic_ns()` advances at a clean rate
+disciplined against UTC. Without it, host clock drift bounds how
+tightly the geotag join window can shrink (`GEOTAG_MAX_AGE_MS = 500`
+in `live.py` is generous on purpose for this reason).
+
+### Feed rate
+
+| Source | Typical rate | Geotag window dominated by |
+| --- | --- | --- |
+| u-blox @ 10 Hz | 100 ms | LTESniffer DCI cadence (~20 Hz) |
+| Phone-class GPS @ 1 Hz | 1000 ms | GPS rate (will exceed the 500 ms join window) |
+| MAVLink default | 5 Hz | GPS rate |
+
+If you're seeing the dashboard say *"need ≥ 2 geo-tagged grants"* but
+UL grants are flowing, the GPS rate is probably too slow to match the
+join window — raise the GPS update rate before debugging the parser.
+
+## 8. Drone power budget (real-radio path)
 
 | Component | Typical W | Notes |
 | --- | --- | --- |

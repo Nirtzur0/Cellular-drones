@@ -1,11 +1,18 @@
 """Unified CLI for the cellular-drones UE sniffer.
 
-    sniffer demo                          end-to-end pipeline against simulator
-    sniffer live --simulate               realtime UI, synthetic UEs
-    sniffer live --earfcn N --pci P       realtime UI, LTESniffer on a cell
-    sniffer report <jsonl>                text summary + plot from a capture
-    sniffer gps-log                       standalone gpsd -> JSONL recorder
-    sniffer install                       apt + srsRAN + LTESniffer (Linux)
+There is one run path. `sniffer live` ingests PDCCH events (real radio
+*or* simulated) and serves the live dashboard. The dashboard performs
+C-RNTI extraction and per-UE positioning together — they are not
+separate surfaces.
+
+    sniffer live --simulate               # no hardware, synthetic UEs + GPS
+    sniffer live --earfcn N --pci P       # real radio, LTESniffer on a cell
+
+Auxiliary commands:
+
+    sniffer report <jsonl> [--plot ...]   # offline summary + plot from a capture
+    sniffer gps-log                       # standalone gpsd -> JSONL recorder
+    sniffer install                       # apt + srsRAN + LTESniffer (Linux)
 """
 from __future__ import annotations
 
@@ -20,7 +27,6 @@ from pathlib import Path
 
 
 def _delegate(module_name: str, argv: list[str]) -> int:
-    """Run a module's main() with a crafted argv."""
     mod = importlib.import_module(module_name)
     saved = sys.argv
     sys.argv = [module_name, *argv]
@@ -28,15 +34,6 @@ def _delegate(module_name: str, argv: list[str]) -> int:
         return mod.main()
     finally:
         sys.argv = saved
-
-
-def _cmd_demo(args: argparse.Namespace) -> int:
-    argv = ["--out-dir", args.out_dir,
-            "--mission-id", args.mission_id,
-            "--scenario", args.scenario]
-    if args.plot:
-        argv += ["--plot", args.plot]
-    return _delegate("sniffer.demo", argv)
 
 
 def _cmd_live(args: argparse.Namespace) -> int:
@@ -110,7 +107,6 @@ def _cmd_gps_log(args: argparse.Namespace) -> int:
 
 
 def _cmd_install(_args: argparse.Namespace) -> int:
-    # repo-root/scripts/install-linux.sh — only reachable from a checkout.
     script = Path(__file__).resolve().parents[2] / "scripts" / "install-linux.sh"
     if not script.exists():
         print(f"installer not found at {script}\n"
@@ -126,20 +122,12 @@ def _build_parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pd = sub.add_parser("demo", help="end-to-end pipeline against simulator",
-                        description="Stage synthetic UEs, run the full pipeline, "
-                                    "write JSONL + optional plot.")
-    pd.add_argument("--out-dir", default="data/demo")
-    pd.add_argument("--mission-id", default="demo-mission")
-    pd.add_argument("--scenario", choices=("box", "line"), default="box")
-    pd.add_argument("--plot", default=None,
-                    help="path to write PNG (optional)")
-    pd.set_defaults(func=_cmd_demo)
-
-    pl = sub.add_parser("live", help="realtime browser dashboard",
-                        description="Run the streaming UI. Use --simulate for "
-                                    "a hardware-free demo, or pass --earfcn "
-                                    "and --pci to drive LTESniffer.")
+    pl = sub.add_parser("live", help="run the realtime dashboard (the run path)",
+                        description="The single run path. Ingest PDCCH events "
+                                    "(real radio with --earfcn/--pci, or simulated "
+                                    "with --simulate) and serve the live dashboard "
+                                    "with both C-RNTI extraction and per-UE "
+                                    "positioning.")
     pl.add_argument("--simulate", action="store_true",
                     help="synthetic UEs + GPS (no radio needed)")
     pl.add_argument("--earfcn", type=int, default=None,

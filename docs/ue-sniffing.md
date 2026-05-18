@@ -47,10 +47,13 @@ GPS module ──► gpsd ──► gpspipe ──► gps-*.jsonl ──┐     
 ```
 
 The same pipeline runs end-to-end against the simulator without any
-hardware (`sniffer demo`); the real-radio path swaps the simulator
-stream for LTESniffer's stdout.
+hardware (`sniffer live --simulate`); the real-radio path swaps the
+simulator stream for LTESniffer's stdout.
 
 ## Quick start
+
+There is one run path: `sniffer live`. It does C-RNTI extraction
+*and* per-UE positioning on the same dashboard.
 
 ### Hardware-free (validates the pipeline)
 
@@ -58,7 +61,6 @@ stream for LTESniffer's stdout.
 pip install -r requirements.txt
 pip install -e .
 
-sniffer demo --plot data/demo/ues.png
 sniffer live --simulate
 # open http://127.0.0.1:8000/
 ```
