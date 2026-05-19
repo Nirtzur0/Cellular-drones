@@ -38,9 +38,27 @@ pip install -e .
 sniffer --help
 ```
 
-There is **one** run path: `sniffer live`. It ingests PDCCH events
-(real radio or simulated) and serves the dashboard — C-RNTI extraction
-and per-UE positioning happen on the same page, on the same map.
+The primary workflow is **survey** — sweep across all cells in a band,
+dwell on each, accumulate every C-RNTI seen. C-RNTI is cell-scoped, so
+a single-cell sniffer only enumerates one cell's UEs; `sniffer survey`
+orchestrates a sweep so you get a census of all visible UEs.
+
+```bash
+# Real radio:
+sniffer survey --band 3 --dwell-seconds 15 --total-minutes 30
+
+# Or test the orchestration logic without hardware:
+sniffer live --simulate          # realtime UI at http://127.0.0.1:8000/
+```
+
+Subcommands:
+
+| Command | What it does |
+| --- | --- |
+| `sniffer scan` | one-shot: find LTE cells in a band (wraps `srsran_cell_search`) |
+| `sniffer survey` | sweep across all cells, dwell on each, harvest C-RNTIs |
+| `sniffer live` | single-cell mode (or `--simulate` for hardware-free) |
+| `sniffer install` | Linux dependency installer (apt + srsRAN + FALCON + LTESniffer) |
 
 ### Hardware-free (validates the pipeline)
 
@@ -53,19 +71,35 @@ one walking across the cell). Stationary UEs recover to ~30 m of
 ground truth; the mobile UE shows the expected ~200 m bias — staged on
 purpose to expose the limit of single-RX positioning.
 
-### Real radio (Linux + USRP B210)
+### Real radio (Linux + USRP B210 or HackRF)
 
 ```bash
-sniffer install                                       # one-time: srsRAN + LTESniffer + venv
-sniffer live --earfcn 1850 --pci 271     # spawns LTESniffer + dashboard
+sniffer install                          # one-time: srsRAN + FALCON + LTESniffer + venv
+sniffer survey --band 3                  # sweep every cell on band 3
 # open http://127.0.0.1:8000/
 ```
 
-Pick the target EARFCN + PCI for the operator you care about
-(CellMapper / OpenCellID are good starting points; `srsRAN_cell_search`
-works on the USRP itself if you don't want to rely on external
-databases). GPS is auto-picked-up from `gpspipe` if `gpsd` is running
-on the host — see *Where GPS comes from* below.
+Or, if you already know one specific cell:
+
+```bash
+sniffer live --decoder falcon --earfcn 1850 --pci 271
+```
+
+`sniffer survey` runs `sniffer scan` first to find cells, then cycles
+through them. The dashboard shows a `SURVEYING` banner with current
+cell + countdown. C-RNTIs from every cell accumulate in one view.
+
+**Decoder note.** Stock LTESniffer writes PCAP files, not text — the
+dashboard parser doesn't consume that yet, so `--decoder ltesniffer`
+launches the binary but no UEs reach the UI. **Use `--decoder falcon`
+(the default for `sniffer survey`)** — FalconEye writes per-DCI CSV
+that the dashboard tails in real time. Tradeoffs documented in
+`docs/design.md` "Decoder choice".
+
+GPS is auto-picked from `gpspipe` if `gpsd` is running, or sniffed
+from the drone's own RemoteID broadcast via `--droneid-cmd` (see
+`docs/design.md` §7.4). Neither is required for C-RNTI extraction —
+positioning is the only thing that needs GPS.
 
 ### Where GPS comes from
 
@@ -96,18 +130,26 @@ report tool.
 
 ```
 docs/             design docs (start with ue-sniffing.md)
-scripts/          install-linux.sh (apt + srsRAN + LTESniffer build)
+scripts/          install-linux.sh (apt + srsRAN + FALCON + LTESniffer + venv)
 src/sniffer/
-  cli.py                 CLI entrypoint (sniffer live | sniffer install)
-  schema.py              UeSighting record types
-  simulate.py            synthetic LTESniffer + gpsd streams (text)
-  parse_ltesniffer.py    LTESniffer text → DECODED → ue_sighting JSONL
+  cli.py                 CLI entrypoint (scan | survey | live | install)
+  schema.py              UeSighting / GeotagRecord dataclasses
+  lte_bands.py           EARFCN ↔ Hz per 3GPP TS 36.101
+  scan.py                wraps srsran_cell_search (cell discovery)
+  sib1.py                wraps pdsch_ue (PLMN/TAC/CGI enrichment)
+  survey.py              sweep + dwell orchestrator (the primary flow)
+  falcon.py              tails FalconEye CSV → ue_sighting JSONL
+  parse_ltesniffer.py    text → ue_sighting JSONL (LTESniffer text mode)
   parse_gpsd.py          gpspipe JSON → geotag records
-  localize.py            RSSI weighted centroid, per-(PCI, C-RNTI)
-  live.py                realtime browser dashboard (the run path)
-  ta_multilateration.py  alt localizer for rogue-eNB scenarios
+  parse_droneid.py       DroneID decoder JSON → geotag records (alt GPS)
+  droneid_hackrf.py      HackRF capture-loop for file-based DroneID decoders
+  spectrum.py            hackrf_sweep wrapper, live RF waterfall
+  localize.py            RSSI weighted centroid (needs UL energy)
+  ta_multilateration.py  TA-range multilateration (alt positioning)
+  live.py                realtime browser dashboard
+  simulate.py            synthetic UE + GPS streams (for tests)
 data/             JSONL captures (gitignored)
-tests/            unit + e2e tests
+tests/            unit + integration tests
 ```
 
 ## Legal / scope

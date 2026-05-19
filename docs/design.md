@@ -94,6 +94,15 @@ databases (CellMapper, OpenCellID) work too if a USRP isn't on hand.
 - **simulate** — produces the same text that LTESniffer + gpsd would,
   paced to wall clock; feeds the same parsers. There is no separate
   "simulate path" in the code.
+- **survey** — multi-cell sweep + dwell orchestrator. C-RNTI is
+  cell-scoped, so a single-cell sniffer enumerates only one cell's
+  UEs. `sniffer.survey.run_survey_loop` cycles through a list of
+  cells, spawning a decoder (FalconEye by default) per cell for
+  `--dwell-seconds`, then moving on. All decoded grants land in the
+  same State / JSONL — the consumer sees one flat stream across the
+  whole survey. The dashboard's `SURVEYING` banner shows current
+  cell + countdown. `sniffer survey --band B` is the user-facing
+  entry point; it runs `sniffer scan` first to find cells.
 
 ### Decoder choice: LTESniffer vs FALCON
 

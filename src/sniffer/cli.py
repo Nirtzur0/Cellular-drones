@@ -143,6 +143,99 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_survey(args: argparse.Namespace) -> int:
+    """Sweep across all cells in a band, dwelling on each for N seconds.
+
+    Pipeline: `sniffer scan --band B` → cell list → for each cell,
+    spawn a decoder for `--dwell-seconds`, then move on. Repeat until
+    `--total-minutes` elapses. All C-RNTIs accumulate in the same
+    dashboard.
+    """
+    import json
+    from sniffer.scan import run_scan, Cell
+
+    if args.band is None and args.earfcn_range is None and not args.cells:
+        print("sniffer survey: provide --band, --earfcn-range, or --cells",
+              file=sys.stderr)
+        return 2
+
+    cells_payload: list[dict] = []
+    if args.cells:
+        # Manual override: user knows the cells already (skips scan).
+        try:
+            for spec in args.cells.split(","):
+                earfcn_s, pci_s = spec.split(":")
+                from sniffer.lte_bands import earfcn_to_hz_dl
+                earfcn = int(earfcn_s)
+                cells_payload.append({
+                    "earfcn": earfcn,
+                    "pci": int(pci_s),
+                    "center_hz": earfcn_to_hz_dl(earfcn),
+                })
+        except (ValueError, KeyError) as exc:
+            print(f"sniffer survey: bad --cells spec ({exc}). "
+                  f"Format: EARFCN:PCI,EARFCN:PCI,...",
+                  file=sys.stderr)
+            return 2
+    else:
+        # Drive scan, capture its cells, build the payload.
+        import io
+        earfcn_range = None
+        if args.earfcn_range is not None:
+            try:
+                lo, hi = args.earfcn_range.split(",", 1)
+                earfcn_range = (int(lo), int(hi))
+            except ValueError:
+                print("--earfcn-range must be `start,end`", file=sys.stderr)
+                return 2
+        scan_buf = io.StringIO()
+        scan_rc = run_scan(band=args.band, earfcn_range=earfcn_range,
+                           json_out=True, fh=scan_buf)
+        if scan_rc != 0:
+            print(f"sniffer survey: scan failed with rc={scan_rc}",
+                  file=sys.stderr)
+            return scan_rc
+        from sniffer.lte_bands import earfcn_to_hz_dl
+        for line in scan_buf.getvalue().splitlines():
+            try:
+                cell = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if cell.get("earfcn") is None or cell.get("pci") is None:
+                continue
+            try:
+                center_hz = earfcn_to_hz_dl(int(cell["earfcn"]))
+            except ValueError:
+                continue
+            cells_payload.append({
+                "earfcn": int(cell["earfcn"]),
+                "pci": int(cell["pci"]),
+                "center_hz": center_hz,
+            })
+
+    if not cells_payload:
+        print("sniffer survey: no cells found. Try a different band or "
+              "pass --cells manually.", file=sys.stderr)
+        return 4
+
+    print(f"sniffer survey: {len(cells_payload)} cells, "
+          f"dwell={args.dwell_seconds}s, total={args.total_minutes}min, "
+          f"decoder={args.decoder}", file=sys.stderr)
+    for c in cells_payload:
+        print(f"  EARFCN {c['earfcn']} · PCI {c['pci']} "
+              f"@ {c['center_hz']/1e6:.2f} MHz", file=sys.stderr)
+
+    argv = ["--host", args.host,
+            "--port", str(args.port),
+            "--out-dir", args.out_dir,
+            "--mission-id", args.mission_id,
+            "--survey-cells", json.dumps(cells_payload),
+            "--survey-dwell-seconds", str(args.dwell_seconds),
+            "--survey-total-seconds", str(args.total_minutes * 60.0),
+            "--survey-decoder", args.decoder]
+    return _delegate("sniffer.live", argv)
+
+
 def _cmd_install(_args: argparse.Namespace) -> int:
     script = Path(__file__).resolve().parents[2] / "scripts" / "install-linux.sh"
     if not script.exists():
@@ -224,6 +317,37 @@ def _build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--sib-binary", default=None,
                     help="path to pdsch_ue (env: PDSCH_UE_BIN)")
     ps.set_defaults(func=_cmd_scan)
+
+    psv = sub.add_parser("survey",
+                         help="sweep across all cells in a band, "
+                              "collecting C-RNTIs from each",
+                         description="Cell-sweep + dwell orchestrator. "
+                                     "Runs `sniffer scan` to find cells "
+                                     "in the band, then visits each cell "
+                                     "for --dwell-seconds with a decoder "
+                                     "(FalconEye default), cycling until "
+                                     "--total-minutes elapses. C-RNTIs "
+                                     "from every cell accumulate in one "
+                                     "dashboard.")
+    psv.add_argument("--band", type=int, default=None,
+                     help="LTE band to sweep (e.g. 3 for 1800 MHz FDD)")
+    psv.add_argument("--earfcn-range", default=None,
+                     help="alternative: 'start,end' EARFCN sweep")
+    psv.add_argument("--cells", default=None,
+                     help="skip scan: comma-separated EARFCN:PCI pairs, "
+                          "e.g. 1850:271,1850:88")
+    psv.add_argument("--dwell-seconds", type=float, default=15.0,
+                     help="seconds per cell per cycle (default 15)")
+    psv.add_argument("--total-minutes", type=float, default=30.0,
+                     help="how long to run the survey (default 30 min)")
+    psv.add_argument("--decoder", choices=("falcon", "ltesniffer"),
+                     default="falcon",
+                     help="which decoder to spawn per cell (default falcon)")
+    psv.add_argument("--host", default="127.0.0.1")
+    psv.add_argument("--port", type=int, default=8000)
+    psv.add_argument("--out-dir", default="data")
+    psv.add_argument("--mission-id", default=default_mid)
+    psv.set_defaults(func=_cmd_survey)
 
     pi = sub.add_parser("install", help="install dependencies (Linux only)")
     pi.set_defaults(func=_cmd_install)

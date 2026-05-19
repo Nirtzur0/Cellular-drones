@@ -97,6 +97,9 @@ class State:
         self._dl_only: Optional[bool] = None
         self._grants_with_ul_rssi: int = 0
         self._spectrum: Optional[SpectrumScanner] = None
+        # Survey progress (sweep + dwell across multiple cells). None
+        # outside of survey mode; a dict per cell visit otherwise.
+        self._survey_status: Optional[dict[str, Any]] = None
         self._scan_status: dict[str, Any] = {"phase": "idle", "ts_utc": utc_iso()}
         # GPS buffer: list of {ts_mono_ns, ts_utc, gps:{lat,lon,alt_m,fix,hdop}}
         self._gps: list[dict[str, Any]] = []
@@ -243,6 +246,16 @@ class State:
             status = dict(self._scan_status)
         self._broadcast({"type": "status", "status": status})
 
+    def set_survey_status(self, survey: Optional[dict[str, Any]]) -> None:
+        """Replace the survey-progress payload. Pass None to clear it
+        (when survey exits or never started)."""
+        with self._lock:
+            self._survey_status = (dict(survey) if survey is not None
+                                   else None)
+            snap = (dict(self._survey_status)
+                    if self._survey_status is not None else None)
+        self._broadcast({"type": "survey", "survey": snap})
+
     # --- snapshot ---------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:
@@ -279,6 +292,9 @@ class State:
                 # LTESniffer). False = UL energy is arriving, positioning
                 # estimators can do their job.
                 "dl_only": self._dl_only,
+                # Survey orchestrator progress (None outside survey mode).
+                "survey": (dict(self._survey_status)
+                           if self._survey_status is not None else None),
             }
 
     def attach_spectrum_scanner(self, scanner: SpectrumScanner) -> None:
@@ -1035,6 +1051,19 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
   border-color: var(--red); color: var(--red);
 }
 .banner.banner-mode strong { color: var(--red); }
+.banner.banner-survey {
+  background: rgba(93, 213, 255, 0.04);
+  border-bottom: 1px solid var(--accent-dim);
+}
+.banner.banner-survey::before {
+  border-color: var(--accent); color: var(--accent);
+}
+.banner.banner-survey strong { color: var(--accent); }
+.banner.banner-survey .dim { color: var(--txt-2); }
+.banner.banner-survey .countdown {
+  font-variant-numeric: tabular-nums;
+  color: var(--txt); padding: 0 4px;
+}
 
 /* ---------------------------------------------------------- main grid */
 .workspace {
@@ -1429,6 +1458,11 @@ footer .row b { color: var(--accent); font-weight: 600; }
   <strong>DL-ONLY MODE.</strong>
   <span class="dim">Upstream emits PDCCH only (HackRF / DL-only decoder) — no UE transmit energy observable. Positioning estimators inactive; C-RNTI surface still live. Positioning needs UL sniffing hardware (2× USRP + GPSDO, or X310).</span>
 </div>
+<div id="survey-banner" class="banner banner-survey" style="display:none">
+  <strong>SURVEYING.</strong>
+  <span id="survey-progress" class="dim">—</span>
+  <span id="survey-countdown" class="countdown"></span>
+</div>
 <div class="workspace">
   <div class="map-wrap">
     <span class="br-bl"></span><span class="br-br"></span>
@@ -1518,6 +1552,43 @@ function setDlOnly(v) {
   const el = document.getElementById('dl-only-banner');
   if (el) el.style.display = (v === true) ? '' : 'none';
 }
+
+// Survey progress (multi-cell sweep). `survey` is either null (not
+// surveying) or {phase, cycle, cell_idx, cells_total, current_earfcn,
+// current_pci, dwell_seconds, cell_started_ns, ...}.
+let surveyState = null;
+function setSurvey(s) {
+  surveyState = s ?? null;
+  const banner = document.getElementById('survey-banner');
+  if (!banner) return;
+  if (!surveyState) { banner.style.display = 'none'; return; }
+  banner.style.display = '';
+  const prog = document.getElementById('survey-progress');
+  if (prog) {
+    const decoder = surveyState.decoder ? surveyState.decoder + ' · ' : '';
+    prog.textContent =
+      `${decoder}cycle ${surveyState.cycle} · ` +
+      `cell ${surveyState.cell_idx}/${surveyState.cells_total} · ` +
+      `EARFCN ${surveyState.current_earfcn} · PCI ${surveyState.current_pci}`;
+  }
+  renderSurveyCountdown();
+}
+function renderSurveyCountdown() {
+  const el = document.getElementById('survey-countdown');
+  if (!el || !surveyState) return;
+  // We approximate "time left on this cell" client-side because the
+  // server only sends the start ts + dwell; rendering a smooth
+  // countdown without a per-second event flow keeps SSE quiet.
+  const dwell = surveyState.dwell_seconds || 0;
+  const startedMs = (surveyState.cell_started_ns || 0) / 1e6;
+  // Browser monotonic clock isn't aligned with server's, so fall back
+  // to elapsed-since-render if the math goes negative.
+  const elapsed = (performance.now() - (surveyState._anchor_ms || performance.now())) / 1000;
+  if (!surveyState._anchor_ms) surveyState._anchor_ms = performance.now();
+  const left = Math.max(0, dwell - elapsed);
+  el.textContent = `${left.toFixed(1)}s left on this cell`;
+}
+setInterval(renderSurveyCountdown, 200);
 
 // --- map ----------------------------------------------------------------
 let map = null;
@@ -1990,8 +2061,11 @@ function applyEvent(ev) {
     setStatus(ev.status || {phase: 'idle'});
     setGps(ev.latest_gps);
     setDlOnly(ev.dl_only);
+    setSurvey(ev.survey);
     (ev.ues || []).forEach(u => { ues.set(u.key, u); renderCard(u); updateUeLayer(u); });
     totalUeSightings = ev.total_ue_sightings || 0;
+  } else if (ev.type === 'survey') {
+    setSurvey(ev.survey);
   } else if (ev.type === 'ue_sighting') {
     const u = ev.ue;
     ues.set(u.key, u);
@@ -2236,6 +2310,21 @@ def main() -> int:
                    help="target PCI to stamp on FALCON-decoded grants. "
                         "FALCON's CSV has no PCI column; the caller "
                         "knows the cell from --falcon-cmd's -f freq.")
+    p.add_argument("--survey-cells", default=None,
+                   help="JSON list of cells to sweep through, e.g. "
+                        "'[{\"earfcn\":1850,\"pci\":271,\"center_hz\":1870000000}]'. "
+                        "Drives sniffer.survey.run_survey_loop instead "
+                        "of locking to a single cell.")
+    p.add_argument("--survey-dwell-seconds", type=float, default=15.0,
+                   help="how long to dwell on each cell per cycle "
+                        "(default 15s)")
+    p.add_argument("--survey-total-seconds", type=float, default=1800.0,
+                   help="total survey duration before exiting (default 30 min)")
+    p.add_argument("--survey-decoder", choices=("falcon", "ltesniffer"),
+                   default="falcon",
+                   help="which decoder to spawn per cell during survey "
+                        "(default falcon — only one whose stdout we "
+                        "currently consume)")
     p.add_argument("--droneid-cmd", action="append", default=None,
                    help="argv (space-split) for a DJI DroneID decoder that "
                         "prints one JSON object per decoded frame. Repeat "
@@ -2255,20 +2344,19 @@ def main() -> int:
                    help="hackrf_sweep range as start:end MHz (default 700:2700)")
     args = p.parse_args()
 
-    # Exactly one upstream producer must be selected. LTESniffer and
-    # FALCON are mutually exclusive — both want exclusive USRP access.
-    if args.simulate and (args.ltesniffer_cmd or args.falcon_cmd):
-        print("sniffer.live: --simulate is mutually exclusive with "
-              "--ltesniffer-cmd and --falcon-cmd.", file=sys.stderr)
+    # Exactly one upstream producer must be selected. LTESniffer, FALCON,
+    # and survey-mode are mutually exclusive — all want exclusive radio.
+    producers = sum(bool(x) for x in
+                    (args.simulate, args.ltesniffer_cmd,
+                     args.falcon_cmd, args.survey_cells))
+    if producers > 1:
+        print("sniffer.live: pick exactly one producer "
+              "(--simulate | --ltesniffer-cmd | --falcon-cmd | "
+              "--survey-cells).", file=sys.stderr)
         return 2
-    if args.ltesniffer_cmd and args.falcon_cmd:
-        print("sniffer.live: pick one — --ltesniffer-cmd OR --falcon-cmd. "
-              "Both want exclusive radio access.", file=sys.stderr)
-        return 2
-    if not args.simulate and not args.ltesniffer_cmd and not args.falcon_cmd:
-        print("sniffer.live needs --simulate, --ltesniffer-cmd, or "
-              "--falcon-cmd. Use the `sniffer live` CLI wrapper.",
-              file=sys.stderr)
+    if producers == 0:
+        print("sniffer.live needs --simulate, --ltesniffer-cmd, "
+              "--falcon-cmd, or --survey-cells.", file=sys.stderr)
         return 2
     if args.falcon_cmd and args.falcon_pci is None:
         print("sniffer.live: --falcon-cmd requires --falcon-pci "
@@ -2286,6 +2374,47 @@ def main() -> int:
                         out_dir=args.out_dir, stop=stop),
             daemon=True,
         ))
+    elif args.survey_cells:
+        from sniffer.survey import SurveyCell, run_survey_loop
+        try:
+            raw_cells = json.loads(args.survey_cells)
+            cells = [SurveyCell(earfcn=int(c["earfcn"]),
+                                pci=int(c["pci"]),
+                                center_hz=int(c["center_hz"]))
+                     for c in raw_cells]
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+            print(f"sniffer.live: bad --survey-cells JSON: {exc}",
+                  file=sys.stderr)
+            return 2
+        threads.append(threading.Thread(
+            target=run_survey_loop,
+            kwargs=dict(
+                state=state, cells=cells,
+                dwell_seconds=args.survey_dwell_seconds,
+                total_seconds=args.survey_total_seconds,
+                decoder=args.survey_decoder,
+                antennas=2, threads=4,
+                mission_id=args.mission_id, out_dir=args.out_dir,
+                stop=stop,
+            ),
+            daemon=True,
+        ))
+        threads.append(threading.Thread(
+            target=run_gpsd_loop,
+            kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
+            daemon=True,
+        ))
+        for droneid_cmd_str in (args.droneid_cmd or []):
+            cmd = droneid_cmd_str.split()
+            threads.append(threading.Thread(
+                target=run_droneid_loop,
+                kwargs=dict(
+                    state=state, droneid_cmd=cmd,
+                    mission_id=args.mission_id, stop=stop,
+                    serial_filter=args.droneid_serial,
+                ),
+                daemon=True,
+            ))
     elif args.falcon_cmd:
         cmd = args.falcon_cmd.split()
         threads.append(threading.Thread(
