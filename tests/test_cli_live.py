@@ -20,7 +20,7 @@ def _ns(**over) -> Namespace:
         host="127.0.0.1", port=8000, out_dir="data", mission_id="t",
         droneid_cmd=None, droneid_serial=None,
         simulate=False, earfcn=None, pci=None,
-        antennas=2, threads=4,
+        antennas=2, threads=4, decoder="ltesniffer",
     )
     base.update(over)
     return Namespace(**base)
@@ -104,3 +104,39 @@ def test_cmd_live_returns_3_when_ltesniffer_binary_missing(monkeypatch, capsys):
     assert rc == 3
     err = capsys.readouterr().err
     assert "LTESniffer not on PATH" in err
+
+
+def test_cmd_live_falcon_decoder_builds_correct_argv(monkeypatch):
+    """--decoder falcon → builds `FalconEye -f <hz>` and forwards
+    --falcon-cmd + --falcon-pci to sniffer.live."""
+    monkeypatch.setattr(cli.shutil, "which",
+                        lambda _n: "/usr/local/bin/FalconEye")
+    captured = {}
+
+    def fake_delegate(module: str, argv: list[str]) -> int:
+        captured["argv"] = argv
+        return 0
+
+    monkeypatch.setattr(cli, "_delegate", fake_delegate)
+    rc = cli._cmd_live(_ns(earfcn=1850, pci=271, decoder="falcon"))
+    assert rc == 0
+
+    argv = captured["argv"]
+    idx = argv.index("--falcon-cmd")
+    falcon_cmd = argv[idx + 1].split()
+    # Real FalconEye CLI is `FalconEye -f <hz>` — no -I, no -A, no -W.
+    assert falcon_cmd[0].endswith("FalconEye")
+    assert "-f" in falcon_cmd and falcon_cmd[falcon_cmd.index("-f") + 1] == "1870000000"
+    # PCI is passed alongside (FALCON's CSV doesn't carry it).
+    assert "--falcon-pci" in argv
+    assert argv[argv.index("--falcon-pci") + 1] == "271"
+    # Mutually exclusive with LTESniffer path: no ltesniffer-cmd in argv.
+    assert "--ltesniffer-cmd" not in argv
+
+
+def test_cmd_live_falcon_decoder_returns_3_when_binary_missing(monkeypatch, capsys):
+    monkeypatch.setattr(cli.shutil, "which", lambda _n: None)
+    rc = cli._cmd_live(_ns(earfcn=1850, pci=271, decoder="falcon"))
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert "FalconEye not on PATH" in err

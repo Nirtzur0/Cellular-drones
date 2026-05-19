@@ -95,6 +95,39 @@ databases (CellMapper, OpenCellID) work too if a USRP isn't on hand.
   paced to wall clock; feeds the same parsers. There is no separate
   "simulate path" in the code.
 
+### Decoder choice: LTESniffer vs FALCON
+
+`sniffer live --decoder ltesniffer` (default) is back-compat with the
+documented LTESniffer path. **Caveat that bears repeating:** LTESniffer
+writes its DCIs to PCAP files; the framework's text parser doesn't yet
+read those, so on real radio LTESniffer currently launches correctly
+but no DCIs reach the dashboard. Use it if you want PCAPs for offline
+Wireshark analysis.
+
+`sniffer live --decoder falcon` switches the upstream to
+[falkenber9/falcon](https://github.com/falkenber9/falcon)'s FalconEye,
+which writes a tab-separated **per-DCI CSV** via `-D <path>`. We tail
+that file from `sniffer.falcon.tail_csv` and feed the rows through
+`sniffer.falcon.parse_stream` into the existing State pipeline.
+Everything downstream (the DL-only auto-detect, the C-RNTI surface, the
+positioning estimators) keeps working unchanged.
+
+Tradeoffs:
+
+| Aspect | LTESniffer | FalconEye |
+| --- | --- | --- |
+| Output to text we can ingest live | **No** (PCAP only) | **Yes** (CSV via `-D`) |
+| UL+DL sniffing (when 2× USRP available) | Yes | No (DL only) |
+| Hardware tested by upstream | USRP B210 | USRP B210 / B205mini / LimeSDR Mini |
+| HackRF support | Same srsRAN path — untested | "Should work via srsLTE" — also untested |
+| Maintenance | Active (2024+) | **Dormant since Nov 2020** |
+| TDD bands (38/40/41) | Yes | **No** (FDD only) |
+| Patched srsLTE version | 23.x (srsRAN_4G) | 18.09 (5 years old) |
+
+Use FALCON when you want the dashboard to actually receive DCIs on real
+radio today. Switch to LTESniffer when its PCAP output gets wired
+(separate task), or if you need UL energy + TDD support.
+
 ## 4. Record schema
 
 One JSONL row per decoded DCI; see `docs/ue-sniffing.md` for the full

@@ -32,6 +32,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from sniffer.localize import weighted_centroid_ue
 from sniffer.ta_multilateration import ta_multilateration_ue
+from sniffer.falcon import parse_stream as parse_falcon_stream, tail_csv
 from sniffer.parse_droneid import parse_stream as parse_droneid_stream
 from sniffer.parse_gpsd import parse_stream as parse_gpsd_stream
 from sniffer.parse_ltesniffer import (
@@ -623,6 +624,76 @@ def run_ltesniffer_loop(state: State, *, ltesniffer_cmd: list[str],
             except ProcessLookupError:
                 pass
             proc.wait()
+        if stop.is_set():
+            return
+        time.sleep(1.0)
+
+
+def run_falcon_loop(state: State, *, falcon_cmd: list[str], pci: int,
+                    mission_id: str, out_dir: str, center_hz: Optional[float],
+                    stop: threading.Event) -> None:
+    """Spawn FalconEye, tail its DCI CSV, feed records into State.
+
+    FalconEye (falkenber9/falcon, the LTESniffer ancestor) writes a
+    tab-separated per-DCI tracefile via `-D <path>`. Unlike LTESniffer
+    — which writes PCAP only — FALCON's CSV is designed for tailing,
+    which is the entire reason we wire it here.
+
+    We allocate a fresh temp dir per spawn (so file-rotation logic in
+    the tailer is rarely exercised, but works), append `-D <tmp>/dci.csv`
+    to the user-supplied argv, spawn the binary, and parse rows in a
+    parallel thread. FalconEye's own stdout/stderr is forwarded to ours
+    so build / cell-lock errors are visible.
+
+    PCI is mandatory because FALCON locks to a single cell and never
+    writes the PCI in its rows — the caller knows it because they
+    passed `-f <hz>` for that exact cell.
+    """
+    import tempfile
+
+    if not falcon_cmd:
+        state.set_status("error", message="no --falcon-cmd provided")
+        return
+    if (shutil.which(falcon_cmd[0]) is None
+            and not os.path.exists(falcon_cmd[0])):
+        state.set_status(
+            "error",
+            message=(f"`{falcon_cmd[0]}` not found. Build FALCON "
+                     f"(see scripts/install-linux.sh) or set FALCON_BIN."),
+        )
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"ue-{mission_id}.jsonl")
+    parse_args = _ParseArgs(mission_id, "falcon", "usrp-falcon-0",
+                            rx_gain_db=50.0, center_hz=center_hz,
+                            sample_rate_sps=23.04e6)
+
+    while not stop.is_set():
+        with tempfile.TemporaryDirectory(prefix="falcon_dci_") as td:
+            csv_path = os.path.join(td, "dci.csv")
+            full_cmd = list(falcon_cmd) + ["-D", csv_path]
+            state.set_status("sniffing", center_hz=center_hz,
+                             decoder="falcon", out=out_path)
+            proc = subprocess.Popen(
+                full_cmd,
+                stdout=subprocess.DEVNULL,   # FalconEye stdout is verbose status
+                stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+            try:
+                with open(out_path, "a", encoding="utf-8") as jsonl_fh:
+                    sink = _UeSightingSink(state, jsonl_out=jsonl_fh)
+                    stream = tail_csv(csv_path, stop=stop)
+                    parse_falcon_stream(stream, parse_args, sink, pci=pci)
+            except Exception as exc:  # noqa: BLE001
+                state.set_status("error", message=f"falcon parse failed: {exc}")
+            finally:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                proc.wait()
         if stop.is_set():
             return
         time.sleep(1.0)
@@ -2156,6 +2227,15 @@ def main() -> int:
                    help="pipe LTESniffer stdout through normalize_stream "
                         "(use when the binary emits human-readable lines, "
                         "not canonical DECODED key=value)")
+    p.add_argument("--falcon-cmd", default=None,
+                   help="argv (space-split) for falkenber9/falcon's "
+                        "FalconEye. We append `-D <tmpdir>/dci.csv` and "
+                        "tail the file. Mutually exclusive with "
+                        "--ltesniffer-cmd.")
+    p.add_argument("--falcon-pci", type=int, default=None,
+                   help="target PCI to stamp on FALCON-decoded grants. "
+                        "FALCON's CSV has no PCI column; the caller "
+                        "knows the cell from --falcon-cmd's -f freq.")
     p.add_argument("--droneid-cmd", action="append", default=None,
                    help="argv (space-split) for a DJI DroneID decoder that "
                         "prints one JSON object per decoded frame. Repeat "
@@ -2175,13 +2255,24 @@ def main() -> int:
                    help="hackrf_sweep range as start:end MHz (default 700:2700)")
     args = p.parse_args()
 
-    # `--simulate` is off by default: the dashboard refuses to start with
-    # no producer configured rather than silently sitting empty (or worse,
-    # quietly entering simulation when real radio was expected).
-    if not args.simulate and not args.ltesniffer_cmd:
-        print("sniffer.live needs --simulate or --ltesniffer-cmd. "
-              "Use the `sniffer live` CLI wrapper, which validates this.",
+    # Exactly one upstream producer must be selected. LTESniffer and
+    # FALCON are mutually exclusive — both want exclusive USRP access.
+    if args.simulate and (args.ltesniffer_cmd or args.falcon_cmd):
+        print("sniffer.live: --simulate is mutually exclusive with "
+              "--ltesniffer-cmd and --falcon-cmd.", file=sys.stderr)
+        return 2
+    if args.ltesniffer_cmd and args.falcon_cmd:
+        print("sniffer.live: pick one — --ltesniffer-cmd OR --falcon-cmd. "
+              "Both want exclusive radio access.", file=sys.stderr)
+        return 2
+    if not args.simulate and not args.ltesniffer_cmd and not args.falcon_cmd:
+        print("sniffer.live needs --simulate, --ltesniffer-cmd, or "
+              "--falcon-cmd. Use the `sniffer live` CLI wrapper.",
               file=sys.stderr)
+        return 2
+    if args.falcon_cmd and args.falcon_pci is None:
+        print("sniffer.live: --falcon-cmd requires --falcon-pci "
+              "(FALCON's CSV has no PCI column).", file=sys.stderr)
         return 2
 
     state = State()
@@ -2195,6 +2286,33 @@ def main() -> int:
                         out_dir=args.out_dir, stop=stop),
             daemon=True,
         ))
+    elif args.falcon_cmd:
+        cmd = args.falcon_cmd.split()
+        threads.append(threading.Thread(
+            target=run_falcon_loop,
+            kwargs=dict(
+                state=state, falcon_cmd=cmd, pci=args.falcon_pci,
+                mission_id=args.mission_id, out_dir=args.out_dir,
+                center_hz=args.center_hz, stop=stop,
+            ),
+            daemon=True,
+        ))
+        threads.append(threading.Thread(
+            target=run_gpsd_loop,
+            kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
+            daemon=True,
+        ))
+        for droneid_cmd_str in (args.droneid_cmd or []):
+            cmd = droneid_cmd_str.split()
+            threads.append(threading.Thread(
+                target=run_droneid_loop,
+                kwargs=dict(
+                    state=state, droneid_cmd=cmd,
+                    mission_id=args.mission_id, stop=stop,
+                    serial_filter=args.droneid_serial,
+                ),
+                daemon=True,
+            ))
     else:
         cmd = args.ltesniffer_cmd.split()
         threads.append(threading.Thread(

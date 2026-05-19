@@ -61,14 +61,31 @@ def _cmd_live(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
 
-    binname = os.environ.get("LTESNIFFER_BIN", "LTESniffer")
-    if shutil.which(binname) is None:
-        print(f"{binname} not on PATH. Run `sniffer install` on a "
-              f"Linux + USRP B210 host, or set LTESNIFFER_BIN to your build.",
-              file=sys.stderr)
-        return 3
+    from sniffer.lte_bands import earfcn_to_hz_dl
+    try:
+        f_hz = earfcn_to_hz_dl(int(args.earfcn))
+    except ValueError as exc:
+        print(f"sniffer live: {exc}", file=sys.stderr)
+        return 2
 
-    # LTESniffer's CLI (per SysSec-KAIST/LTESniffer README):
+    if args.decoder == "falcon":
+        # FalconEye (falkenber9/falcon). Per the README:
+        #   FalconEye -f <hz>          # tunes & decodes; auto cell-search
+        #   FalconEye -f <hz> -D path  # also write per-DCI CSV (what we tail)
+        # No PCI flag — FALCON locks to whichever cell it finds at -f
+        # freq. We pass --falcon-pci to live so records get stamped.
+        binname = os.environ.get("FALCON_BIN", "FalconEye")
+        if shutil.which(binname) is None:
+            print(f"{binname} not on PATH. Run `sniffer install` to "
+                  f"build FALCON, or set FALCON_BIN.", file=sys.stderr)
+            return 3
+        falcon_cmd = [binname, "-f", str(int(f_hz))]
+        argv += ["--falcon-cmd", " ".join(falcon_cmd),
+                 "--falcon-pci", str(args.pci),
+                 "--center-hz", str(f_hz)]
+        return _delegate("sniffer.live", argv)
+
+    # Default: LTESniffer. CLI per SysSec-KAIST/LTESniffer README:
     #   -A <antennas>   mandatory (typical: 2 for B210)
     #   -W <threads>    mandatory (typical: 4 on a quad-core SBC)
     #   -f <Hz>         DL frequency in Hz (NOT EARFCN — convert first)
@@ -79,12 +96,12 @@ def _cmd_live(args: argparse.Namespace) -> int:
     #
     # No --rx-gain flag exists; UHD AGC is the default. USRP access
     # typically requires sudo or the udev rules shipped with libuhd.
-    from sniffer.lte_bands import earfcn_to_hz_dl
-    try:
-        f_hz = earfcn_to_hz_dl(int(args.earfcn))
-    except ValueError as exc:
-        print(f"sniffer live: {exc}", file=sys.stderr)
-        return 2
+    binname = os.environ.get("LTESNIFFER_BIN", "LTESniffer")
+    if shutil.which(binname) is None:
+        print(f"{binname} not on PATH. Run `sniffer install` on a "
+              f"Linux + USRP B210 host, or set LTESNIFFER_BIN to your build.",
+              file=sys.stderr)
+        return 3
 
     ltecmd = [binname,
               "-A", str(args.antennas),
@@ -162,6 +179,13 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(default 2, fits USRP B210)")
     pl.add_argument("--threads", type=int, default=4,
                     help="LTESniffer -W: worker threads (default 4)")
+    pl.add_argument("--decoder", choices=("ltesniffer", "falcon"),
+                    default="ltesniffer",
+                    help="which LTE PDCCH decoder to spawn. 'ltesniffer' "
+                         "(default) writes PCAP — its stdout is not "
+                         "parsed yet (separate task). 'falcon' uses "
+                         "falkenber9/falcon's FalconEye, which writes "
+                         "per-DCI CSV that we tail in real time.")
     pl.add_argument("--host", default="127.0.0.1")
     pl.add_argument("--port", type=int, default=8000)
     pl.add_argument("--out-dir", default="data")

@@ -91,6 +91,43 @@ mkdir -p "$SRC_DIR/LTESniffer/build"
 )
 echo "LTESniffer binary at: $SRC_DIR/LTESniffer/build/src/LTESniffer"
 
+echo "[3.5/5] FALCON (alternative DL-only LTE decoder with text output)"
+# FALCON / FalconEye (falkenber9/falcon) is what LTESniffer is built on.
+# Unlike LTESniffer (which writes PCAP only), FalconEye supports per-DCI
+# CSV output via `-D <path>` — exactly the shape `sniffer.falcon` tails.
+#
+# Caveats (verified upstream — see docs/design.md "Decoder choice"):
+#  * Project is dormant: last code commit November 2020. Builds on its
+#    own patched srsLTE 18.09 (auto-downloaded as submodule by cmake).
+#  * Tested SDRs: USRP B210 / B205mini / LimeSDR Mini. HackRF is
+#    "should work via srsLTE" but unverified by upstream. Expect to
+#    debug if you point it at HackRF.
+#  * FDD only. TDD bands (38/40/41) do NOT decode.
+#  * Needs i7-class CPU (4 physical cores, HT off) for 20 MHz; ~10
+#    MHz on weaker hardware. Pi 5 will be marginal at 20 MHz.
+if [[ ! -d "$SRC_DIR/falcon" ]]; then
+  git clone --depth 1 https://github.com/falkenber9/falcon.git \
+    "$SRC_DIR/falcon"
+fi
+mkdir -p "$SRC_DIR/falcon/build"
+( cd "$SRC_DIR/falcon/build"
+  # FALCON pulls its own srsLTE patch + c-mnalib as cmake subprojects.
+  cmake .. -DUSE_GUI=False -DUSE_CAPTURE_PROBE=False || {
+    echo "FALCON cmake failed — likely a dependency drift on a recent"
+    echo "Ubuntu. The patched srsLTE 18.09 is old. Skipping for now;"
+    echo "FALCON is optional (LTESniffer is the primary path)."
+    exit 0
+  }
+  make -j"$(nproc)" FalconEye || {
+    echo "FALCON make failed; FalconEye not available. See above."
+    exit 0
+  }
+)
+if [[ -x "$SRC_DIR/falcon/build/src/FalconEye" ]]; then
+  echo "FalconEye binary at: $SRC_DIR/falcon/build/src/FalconEye"
+  echo "  Use with: sniffer live --decoder falcon --earfcn N --pci P"
+fi
+
 echo "[4/5] DroneID decoders (alternative GPS source — pick one)"
 # Two open-source DroneID decoders are supported in-tree:
 #
