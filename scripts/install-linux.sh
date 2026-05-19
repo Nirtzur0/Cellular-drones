@@ -91,7 +91,45 @@ mkdir -p "$SRC_DIR/LTESniffer/build"
 )
 echo "LTESniffer binary at: $SRC_DIR/LTESniffer/build/src/LTESniffer"
 
-echo "[4/4] Python environment"
+echo "[4/5] DroneID decoders (alternative GPS source — pick one)"
+# Two open-source DroneID decoders are supported in-tree:
+#
+#   * DroneSecurity (RUB-SysSec)   — USRP B2xx only, live receiver via UHD.
+#                                    The most complete decoder; produces JSON
+#                                    natively.
+#   * samples2djidroneid (anarkiwi) — HackRF-compatible via the bundled
+#                                    sniffer.droneid_hackrf capture loop. File-
+#                                    based (Docker / Octave under the hood),
+#                                    slower + lossier, but the only path that
+#                                    runs on HackRF.
+#
+# We clone both. Building / running each is on the operator: DroneSecurity
+# needs `sudo apt install libuhd-dev uhd-host python3-uhd`; samples2djidroneid
+# needs Docker (or local Octave + the proto17 dji_droneid scripts).
+
+if [[ ! -d "$SRC_DIR/DroneSecurity" ]]; then
+  git clone --depth 1 https://github.com/RUB-SysSec/DroneSecurity.git \
+    "$SRC_DIR/DroneSecurity"
+fi
+( cd "$SRC_DIR/DroneSecurity"
+  # Requirements are pinned to old versions; install into the project venv.
+  # The live receiver also needs UHD: `sudo apt install libuhd-dev uhd-host
+  # python3-uhd`. We don't pull that automatically — gate on USRP hardware.
+  echo "  DroneSecurity at $SRC_DIR/DroneSecurity"
+  echo "    live (USRP):    ./src/droneid_receiver_live.py"
+  echo "    offline (file): ./src/droneid_receiver_offline.py -i samples/mavic_air_2"
+)
+
+if [[ ! -d "$SRC_DIR/samples2djidroneid" ]]; then
+  git clone --depth 1 https://github.com/anarkiwi/samples2djidroneid.git \
+    "$SRC_DIR/samples2djidroneid"
+fi
+echo "  samples2djidroneid at $SRC_DIR/samples2djidroneid"
+echo "    build the Docker image:"
+echo "      ( cd $SRC_DIR/samples2djidroneid && docker build -f Dockerfile . -t samples2djidroneid )"
+echo "    drive from HackRF (see sniffer.droneid_hackrf --help)"
+
+echo "[5/5] Python environment"
 PY_VENV=${PY_VENV:-$(pwd)/.venv}
 python3 -m venv "$PY_VENV"
 # shellcheck disable=SC1091
@@ -120,5 +158,16 @@ Discover real cells (USRP B210 plugged in):
 Then target one and stream UEs:
 
   sniffer live --earfcn 1850 --pci 271 --rx-gain 50
+
+DJI DroneID as alternative GPS source (no USB GPS / no MAVLink):
+
+  # USRP B2xx (best path) — wrap DroneSecurity's live receiver:
+  sniffer live --earfcn 1850 --pci 271 --rx-gain 50 \\
+    --droneid-cmd "python3 $SRC_DIR/DroneSecurity/src/droneid_receiver_live.py -g 40"
+
+  # HackRF (best-effort) — one decoder per band:
+  sniffer live --earfcn 1850 --pci 271 --rx-gain 50 \\
+    --droneid-cmd "python3 -m sniffer.droneid_hackrf --center-hz 2434500000 --decoder-cmd 'docker run --rm -v {iq_dir}:/data -i samples2djidroneid /data/{iq_name}'" \\
+    --droneid-cmd "python3 -m sniffer.droneid_hackrf --center-hz 5771500000 --decoder-cmd 'docker run --rm -v {iq_dir}:/data -i samples2djidroneid /data/{iq_name}'"
 
 EOF

@@ -84,6 +84,10 @@ sniffer live --earfcn 1850 --pci 271 --rx-gain 50     # spawns LTESniffer + UI
 GPS is auto-ingested from `gpspipe -w` if `gpsd` is running on the
 host. No separate step.
 
+For drone platforms, `--droneid-cmd` lets you skip the USB GPS and
+sniff the drone's own RemoteID broadcast directly with an SDR. See
+`docs/design.md` § 7.4 for the supported decoders and tradeoffs.
+
 Pick the target EARFCN + PCI by running the bundled cell-discovery
 wrapper:
 

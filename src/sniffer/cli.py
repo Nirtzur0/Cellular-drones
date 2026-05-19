@@ -41,6 +41,13 @@ def _cmd_live(args: argparse.Namespace) -> int:
             "--out-dir", args.out_dir,
             "--mission-id", args.mission_id]
 
+    # DroneID is an orthogonal GPS source: works in both --simulate and
+    # real-radio modes, and supports multiple producers (one per radio).
+    for droneid_cmd in (args.droneid_cmd or []):
+        argv += ["--droneid-cmd", droneid_cmd]
+    if args.droneid_serial:
+        argv += ["--droneid-serial", args.droneid_serial]
+
     if args.simulate:
         if args.earfcn or args.pci:
             print("--simulate is mutually exclusive with --earfcn/--pci",
@@ -137,6 +144,17 @@ def _build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--port", type=int, default=8000)
     pl.add_argument("--out-dir", default="data")
     pl.add_argument("--mission-id", default=default_mid)
+    pl.add_argument("--droneid-cmd", action="append", default=None,
+                    metavar="CMD",
+                    help="argv (space-split) for a DJI DroneID decoder "
+                         "that prints one JSON object per frame. Repeat "
+                         "for multiple radios (one HackRF per band, etc.). "
+                         "Wired as an alternative GPS source — coexists "
+                         "with gpsd if both are available.")
+    pl.add_argument("--droneid-serial", default=None, metavar="SUBSTR",
+                    help="restrict DroneID frames to those whose serial "
+                         "number contains SUBSTR (case-sensitive). Useful "
+                         "when multiple drones are airborne.")
     pl.set_defaults(func=_cmd_live)
 
     ps = sub.add_parser("scan",

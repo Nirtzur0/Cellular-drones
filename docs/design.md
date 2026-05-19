@@ -206,6 +206,70 @@ ever want to PPK-post-process for sub-meter accuracy after the
 mission. Operationally only worth it if you're chasing TDOA-grade
 clock discipline.
 
+### 7.4 DJI DroneID — sniff the drone's own broadcast
+
+> **Opt-in, off by default.** The DroneID path adds a second SDR
+> (HackRF) plus a decoder subprocess to the power budget. With no
+> `--droneid-cmd` flag on `sniffer live`, none of this runs. Leave it
+> off for tight-power-budget missions (phone-bank-powered Pi, etc.)
+> and rely on gpsd or just no GPS at all.
+
+Every modern DJI consumer drone (Mavic Air 2, Mini 2/3, Mavic 3,
+FPV, …) continuously broadcasts an unencrypted RemoteID frame over
+OcuSync containing the drone's lat/lon/altitude. If the receiver host
+already has an SDR (which it does, for LTE sniffing), you can pull the
+drone's own GPS off-air with no USB GPS dongle, no MAVLink, no DJI
+SDK, no phone in the loop.
+
+Wired as a generic decoder subprocess via `--droneid-cmd` on
+`sniffer live`; the decoder must print one JSON object per decoded
+frame on stdout. `sniffer.parse_droneid` normalises the two known
+open-source decoder schemas into the same `GeotagRecord` rows that
+`gpsd` emits — DroneID coexists with gpsd if both are configured.
+
+Two supported decoders:
+
+| Decoder | Hardware | Live? | Notes |
+| --- | --- | --- | --- |
+| [RUB-SysSec/DroneSecurity](https://github.com/RUB-SysSec/DroneSecurity) | **USRP B2xx only** (UHD) | Yes, native | The reference implementation; 50 MSPS, hops 2.4 + 5 GHz |
+| [anarkiwi/samples2djidroneid](https://github.com/anarkiwi/samples2djidroneid) | **HackRF-capable** (15.36 MSPS) | No (file-based) | Drive via `sniffer.droneid_hackrf` capture loop; Docker / Octave underneath |
+
+Setup:
+
+```bash
+# B2xx path (real-time, full coverage):
+sudo apt install libuhd-dev uhd-host python3-uhd
+sniffer live --earfcn 1850 --pci 271 --rx-gain 50 \
+  --droneid-cmd "python3 ~/src/DroneSecurity/src/droneid_receiver_live.py -g 40"
+
+# HackRF path (offline-style, partial coverage — one tune per HackRF):
+( cd ~/src/samples2djidroneid && docker build -f Dockerfile . -t samples2djidroneid )
+sniffer live --earfcn 1850 --pci 271 --rx-gain 50 \
+  --droneid-cmd "python3 -m sniffer.droneid_hackrf --device-serial $S1 \
+      --center-hz 2434500000 --decoder-cmd 'docker run --rm -v {iq_dir}:/data -i samples2djidroneid /data/{iq_name}'" \
+  --droneid-cmd "python3 -m sniffer.droneid_hackrf --device-serial $S2 \
+      --center-hz 5771500000 --decoder-cmd 'docker run --rm -v {iq_dir}:/data -i samples2djidroneid /data/{iq_name}'"
+```
+
+`--droneid-serial SUBSTR` restricts ingested frames to one drone's
+serial number — important when more than one drone is in the air.
+
+**Caveats:**
+
+- DroneID is broadcast at ~1 Hz. Slower than a USB GPS, dominates the
+  500 ms geotag join window. Acceptable for slow / stationary flight;
+  marginal for fast passes with many UL grants.
+- HackRF's 20 MSPS ceiling means each HackRF covers ~15 MHz of band.
+  One per band (2.4 GHz + 5 GHz) is the practical minimum for
+  reasonable detection rate. Two HackRFs *do not combine* into a wider
+  capture — they're independent radios.
+- The HackRF path is not real-time: chunks are captured, written to
+  disk, decoded, repeated. Latency 2-5 s. Frames during decode are
+  missed.
+- Legality is jurisdiction-specific. Receiving RemoteID broadcasts is
+  what RemoteID was designed for; using the data to track individuals
+  may not be.
+
 ### Time discipline
 
 `ts_mono_ns` is the join key between UE sightings and geotag records.
@@ -222,6 +286,7 @@ in `live.py` is generous on purpose for this reason).
 | u-blox @ 10 Hz | 100 ms | LTESniffer DCI cadence (~20 Hz) |
 | Phone-class GPS @ 1 Hz | 1000 ms | GPS rate (will exceed the 500 ms join window) |
 | MAVLink default | 5 Hz | GPS rate |
+| DroneID broadcast (§ 7.4) | ~1 Hz | GPS rate — extend `GEOTAG_MAX_AGE_MS` to ≥ 1500 ms |
 
 If you're seeing the dashboard say *"need ≥ 2 geo-tagged grants"* but
 UL grants are flowing, the GPS rate is probably too slow to match the

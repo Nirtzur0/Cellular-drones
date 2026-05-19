@@ -32,6 +32,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from sniffer.localize import weighted_centroid_ue
 from sniffer.ta_multilateration import ta_multilateration_ue
+from sniffer.parse_droneid import parse_stream as parse_droneid_stream
 from sniffer.parse_gpsd import parse_stream as parse_gpsd_stream
 from sniffer.parse_ltesniffer import (
     normalize_stream,
@@ -606,6 +607,63 @@ def run_gpsd_loop(state: State, *, mission_id: str,
                 proc.terminate()
             except ProcessLookupError:
                 pass
+        if stop.is_set():
+            return
+        time.sleep(1.0)
+
+
+def run_droneid_loop(state: State, *, droneid_cmd: list[str],
+                     mission_id: str, stop: threading.Event,
+                     serial_filter: Optional[str] = None) -> None:
+    """Spawn a DroneID decoder, feed its JSON into State as a GPS source.
+
+    `droneid_cmd` is the full argv to a DroneID decoder that prints one
+    JSON object per decoded frame on stdout. Two known-supported shapes:
+
+      * `RUB-SysSec/DroneSecurity` (USRP B2xx, 50 MSPS) — its live
+        receiver emits the JSON natively, so the cmd is roughly
+        `["python", ".../droneid_receiver_live.py", "-g", "40"]`.
+
+      * `anarkiwi/samples2djidroneid` (HackRF, 15.36 MSPS) — file-based,
+        wrap with `python -m sniffer.droneid_hackrf --decoder-cmd "..."`
+        to get a continuous JSON stream from the HackRF capture loop.
+
+    `serial_filter` restricts to frames matching that serial (substring),
+    useful when several drones are airborne and only one is yours.
+
+    The decoded position lands on State as a GpsFix with fix='droneid'
+    — same code path as gpsd. Use multiple producers (one per HackRF /
+    one per band) by starting the loop multiple times.
+    """
+    if not droneid_cmd:
+        return
+    if (shutil.which(droneid_cmd[0]) is None
+            and not os.path.exists(droneid_cmd[0])):
+        state.set_status(
+            "error",
+            message=(f"`{droneid_cmd[0]}` not found. Build the decoder "
+                     f"(scripts/install-linux.sh) or pass --droneid-cmd."),
+        )
+        return
+    while not stop.is_set():
+        proc = subprocess.Popen(
+            droneid_cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        try:
+            sink = _GpsSink(state)
+            assert proc.stdout is not None
+            parse_droneid_stream(proc.stdout, mission_id, sink,
+                                 serial_filter=serial_filter)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            proc.wait()
         if stop.is_set():
             return
         time.sleep(1.0)
@@ -1941,6 +1999,16 @@ def main() -> int:
                    help="pipe LTESniffer stdout through normalize_stream "
                         "(use when the binary emits human-readable lines, "
                         "not canonical DECODED key=value)")
+    p.add_argument("--droneid-cmd", action="append", default=None,
+                   help="argv (space-split) for a DJI DroneID decoder that "
+                        "prints one JSON object per decoded frame. Repeat "
+                        "the flag for multiple radios (e.g. one HackRF per "
+                        "band). Alternative GPS source — coexists with gpsd.")
+    p.add_argument("--droneid-serial", default=None,
+                   help="restrict DroneID frames to those whose serial "
+                        "(substring-match) equals this value. Use when "
+                        "several drones may be airborne and you only want "
+                        "yours feeding the geotag stream.")
     args = p.parse_args()
 
     # `--simulate` is off by default: the dashboard refuses to start with
@@ -1980,6 +2048,17 @@ def main() -> int:
             kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
             daemon=True,
         ))
+        for droneid_cmd_str in (args.droneid_cmd or []):
+            cmd = droneid_cmd_str.split()
+            threads.append(threading.Thread(
+                target=run_droneid_loop,
+                kwargs=dict(
+                    state=state, droneid_cmd=cmd,
+                    mission_id=args.mission_id, stop=stop,
+                    serial_filter=args.droneid_serial,
+                ),
+                daemon=True,
+            ))
     for t in threads:
         t.start()
 
