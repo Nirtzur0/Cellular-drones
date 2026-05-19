@@ -92,7 +92,7 @@ demonstrating the limit of single-RX positioning for moving targets.
 
 ```bash
 sniffer install                                       # one-time
-sniffer live --earfcn 1850 --pci 271 --rx-gain 50     # spawns LTESniffer + UI
+sniffer live --earfcn 1850 --pci 271     # spawns LTESniffer + UI
 # open http://127.0.0.1:8000/
 ```
 

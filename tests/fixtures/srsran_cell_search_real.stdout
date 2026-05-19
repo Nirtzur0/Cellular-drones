@@ -1,0 +1,12 @@
+Opening RF device with 1 RX antennas...
+[  0/299]: EARFCN 6150 Freq. 791.00 MHz looking for PSS.
+[  1/299]: EARFCN 6151 Freq. 791.10 MHz looking for PSS.
+[100/299]: EARFCN 6253 Freq. 801.30 MHz looking for PSS.
+Found CELL ID 257. 6 PRB, 1 ports
+Found CELL 801.3 MHz, EARFCN=6253, PHYID=257, 6 PRB, 1 ports, PSS power=31.0 dBm
+[101/299]: EARFCN 6254 Freq. 801.40 MHz looking for PSS.
+[150/299]: EARFCN 6300 Freq. 806.00 MHz looking for PSS.
+Found CELL ID 88. 50 PRB, 2 ports
+Found CELL 806.0 MHz, EARFCN=6300, PHYID=88, 50 PRB, 2 ports, PSS power=18.4 dBm
+[299/299]: EARFCN 6449 Freq. 805.90 MHz looking for PSS.
+Done. Total cells found: 2

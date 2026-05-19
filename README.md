@@ -57,7 +57,7 @@ purpose to expose the limit of single-RX positioning.
 
 ```bash
 sniffer install                                       # one-time: srsRAN + LTESniffer + venv
-sniffer live --earfcn 1850 --pci 271 --rx-gain 50     # spawns LTESniffer + dashboard
+sniffer live --earfcn 1850 --pci 271     # spawns LTESniffer + dashboard
 # open http://127.0.0.1:8000/
 ```
 

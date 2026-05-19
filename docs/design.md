@@ -66,9 +66,13 @@ databases (CellMapper, OpenCellID) work too if a USRP isn't on hand.
 ### Components
 
 - **LTESniffer (driven by `sniffer live`)** — `cli.py` builds the
-  binary's argv from `--earfcn/--pci/--rx-gain`, spawns it as a
-  subprocess inside `live.py`, pipes stdout through `normalize_stream`
-  in-process, and feeds the result to the Python parser writing JSONL.
+  binary's argv from `--earfcn/--pci` (converting EARFCN→Hz via
+  `sniffer.lte_bands.earfcn_to_hz_dl` for LTESniffer's `-f`),
+  spawns it as a subprocess inside `live.py`, pipes stdout through
+  `normalize_stream` in-process, and feeds the result to the Python
+  parser writing JSONL. The full argv is the real LTESniffer flag set:
+  `-A 2 -W 4 -f <hz> -I <pci> -m 0 -a "num_recv_frames=512"`. USRP
+  access typically needs sudo or the udev rules from `libuhd-dev`.
 - **parse_ltesniffer** — does both halves of the text-to-record
   pipeline: `normalize_stream` canonicalises LTESniffer's drifting text
   into `DECODED key=value` lines, then `parse_stream` emits one
@@ -263,12 +267,12 @@ Setup:
 ```bash
 # B2xx path (real-time, full coverage):
 sudo apt install libuhd-dev uhd-host python3-uhd
-sniffer live --earfcn 1850 --pci 271 --rx-gain 50 \
+sniffer live --earfcn 1850 --pci 271 \
   --droneid-cmd "python3 ~/src/DroneSecurity/src/droneid_receiver_live.py -g 40"
 
 # HackRF path (offline-style, partial coverage — one tune per HackRF):
 ( cd ~/src/samples2djidroneid && docker build -f Dockerfile . -t samples2djidroneid )
-sniffer live --earfcn 1850 --pci 271 --rx-gain 50 \
+sniffer live --earfcn 1850 --pci 271 \
   --droneid-cmd "python3 -m sniffer.droneid_hackrf --device-serial $S1 \
       --center-hz 2434500000 --decoder-cmd 'docker run --rm -v {iq_dir}:/data -i samples2djidroneid /data/{iq_name}'" \
   --droneid-cmd "python3 -m sniffer.droneid_hackrf --device-serial $S2 \

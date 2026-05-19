@@ -157,16 +157,16 @@ Discover real cells (USRP B210 plugged in):
 
 Then target one and stream UEs:
 
-  sniffer live --earfcn 1850 --pci 271 --rx-gain 50
+  sniffer live --earfcn 1850 --pci 271
 
 DJI DroneID as alternative GPS source (no USB GPS / no MAVLink):
 
   # USRP B2xx (best path) — wrap DroneSecurity's live receiver:
-  sniffer live --earfcn 1850 --pci 271 --rx-gain 50 \\
+  sniffer live --earfcn 1850 --pci 271 \\
     --droneid-cmd "python3 $SRC_DIR/DroneSecurity/src/droneid_receiver_live.py -g 40"
 
   # HackRF (best-effort) — one decoder per band:
-  sniffer live --earfcn 1850 --pci 271 --rx-gain 50 \\
+  sniffer live --earfcn 1850 --pci 271 \\
     --droneid-cmd "python3 -m sniffer.droneid_hackrf --center-hz 2434500000 --decoder-cmd 'docker run --rm -v {iq_dir}:/data -i samples2djidroneid /data/{iq_name}'" \\
     --droneid-cmd "python3 -m sniffer.droneid_hackrf --center-hz 5771500000 --decoder-cmd 'docker run --rm -v {iq_dir}:/data -i samples2djidroneid /data/{iq_name}'"
 

@@ -26,23 +26,47 @@ from typing import Iterable, Iterator, Optional
 DEFAULT_BINARY = "srsran_cell_search"
 DEFAULT_SIB_BINARY = "pdsch_ue"
 
-# Permissive `key=value` and `key: value` matcher. Same approach as
-# parse_ltesniffer.normalize_line — robust to upstream output churn.
+# srsran_cell_search emits keys with spaces in them ("PSS power=31.0").
+# Pre-normalize those into underscored single-token keys before the
+# regex runs.
+_KEY_ALIASES = (
+    ("PSS power", "pss_power"),
+    ("SSS power", "sss_power"),
+    ("DL freq",   "dl_freq"),
+    ("UL freq",   "ul_freq"),
+)
+
+# Permissive `key=value` and `key: value` matcher.
 _KV_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*([-+\d.eE]+)")
-# Field names srsran_cell_search and friends use across versions.
+
+# Field names srsran_cell_search and friends use across versions. The
+# real `Found CELL ...` line uses PHYID, not PCI; "PSS power" is the
+# signal-strength surrogate (PSS detector peak in dBm).
 _FIELD_MAP = {
     "earfcn":     "earfcn",
     "dl_earfcn":  "earfcn",
     "freq":       "earfcn",        # some builds emit MHz here; we keep raw
     "pci":        "pci",
+    "phyid":      "pci",           # srsran_cell_search prints PHYID
     "cell_id":    "pci",
     "rsrp":       "rsrp_dbm",
     "rsrp_dbm":   "rsrp_dbm",
     "psr":        "rsrp_dbm",      # some builds label PSS power as PSR
-    "pss_power":  "rsrp_dbm",
+    "pss_power":  "rsrp_dbm",      # current srsran_cell_search
     "cfo":        "cfo_hz",
     "cfo_hz":     "cfo_hz",
 }
+
+
+def _normalize_spaced_keys(line: str) -> str:
+    """Rewrite 'PSS power=' to 'pss_power=' so the KV regex matches."""
+    for src, dst in _KEY_ALIASES:
+        # Match the exact token, case-insensitive, before `=` or `:`.
+        line = re.sub(
+            rf"\b{re.escape(src)}\b(?=\s*[:=])",
+            dst, line, flags=re.IGNORECASE,
+        )
+    return line
 
 
 @dataclass
@@ -73,6 +97,7 @@ def parse_stream(lines: Iterable[str]) -> Iterator[Cell]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        line = _normalize_spaced_keys(line)
         fields: dict[str, str] = {}
         for k, v in _KV_RE.findall(line):
             canon = _FIELD_MAP.get(k.lower())

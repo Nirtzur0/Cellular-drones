@@ -68,16 +68,35 @@ def _cmd_live(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 3
 
-    ltecmd = [binname, "--earfcn", str(args.earfcn),
-              "--target-pci", str(args.pci)]
-    if args.rx_gain is not None:
-        ltecmd += ["--rx-gain", str(args.rx_gain)]
+    # LTESniffer's CLI (per SysSec-KAIST/LTESniffer README):
+    #   -A <antennas>   mandatory (typical: 2 for B210)
+    #   -W <threads>    mandatory (typical: 4 on a quad-core SBC)
+    #   -f <Hz>         DL frequency in Hz (NOT EARFCN — convert first)
+    #   -I <PCI>        target PCI; bypasses internal cell search
+    #   -m <0|1>        mode: 0 = downlink-only, 1 = uplink+downlink
+    #   -a "<usrp_args>"  USRP runtime args (B210 wants
+    #                     num_recv_frames=512 for clean sync)
+    #
+    # No --rx-gain flag exists; UHD AGC is the default. USRP access
+    # typically requires sudo or the udev rules shipped with libuhd.
+    from sniffer.lte_bands import earfcn_to_hz_dl
+    try:
+        f_hz = earfcn_to_hz_dl(int(args.earfcn))
+    except ValueError as exc:
+        print(f"sniffer live: {exc}", file=sys.stderr)
+        return 2
+
+    ltecmd = [binname,
+              "-A", str(args.antennas),
+              "-W", str(args.threads),
+              "-f", str(int(f_hz)),
+              "-I", str(args.pci),
+              "-m", "0",   # DL-only — UL needs 2× USRP + GPSDO, out of scope
+              "-a", "num_recv_frames=512"]
 
     argv += ["--ltesniffer-cmd", " ".join(ltecmd),
-             "--center-hz", str(args.center_hz),
+             "--center-hz", str(f_hz),
              "--normalize-ltesniffer"]
-    if args.rx_gain is not None:
-        argv += ["--rx-gain-db", str(args.rx_gain)]
     return _delegate("sniffer.live", argv)
 
 
@@ -132,14 +151,17 @@ def _build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--simulate", action="store_true",
                     help="synthetic UEs + GPS (no radio needed)")
     pl.add_argument("--earfcn", type=int, default=None,
-                    help="target LTE downlink EARFCN (e.g. 1850)")
+                    help="target LTE downlink EARFCN (e.g. 1850 = "
+                         "1870.0 MHz on band 3). Internally converted "
+                         "to Hz via sniffer.lte_bands.earfcn_to_hz_dl.")
     pl.add_argument("--pci", type=int, default=None,
-                    help="target physical cell ID")
-    pl.add_argument("--rx-gain", type=float, default=None,
-                    help="LTESniffer RX gain in dB")
-    pl.add_argument("--center-hz", type=float, default=1_842_500_000,
-                    help="DL carrier in Hz (for the UI caption; "
-                         "EARFCN is what actually tunes the SDR)")
+                    help="target physical cell ID (passed to LTESniffer "
+                         "as -I, bypassing internal cell search)")
+    pl.add_argument("--antennas", type=int, default=2,
+                    help="LTESniffer -A: number of antennas "
+                         "(default 2, fits USRP B210)")
+    pl.add_argument("--threads", type=int, default=4,
+                    help="LTESniffer -W: worker threads (default 4)")
     pl.add_argument("--host", default="127.0.0.1")
     pl.add_argument("--port", type=int, default=8000)
     pl.add_argument("--out-dir", default="data")

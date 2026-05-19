@@ -54,6 +54,26 @@ def test_parse_stream_handles_colon_separated_fields():
     assert cells[0].rsrp_dbm == pytest.approx(-100.0)
 
 
+def test_parse_stream_handles_real_srsran_cell_search_output():
+    """Real srsran_cell_search prints `PHYID=` (not `PCI=`) and uses
+    `PSS power=` (with a space) for the signal-strength surrogate.
+    Both were absent from the original fixture and the parser dropped
+    those fields silently."""
+    text = (Path(__file__).parent / "fixtures"
+            / "srsran_cell_search_real.stdout").read_text()
+    cells = list(scan.parse_stream(text.splitlines()))
+    assert len(cells) == 2
+    by_pci = {c.pci: c for c in cells}
+    # Both cells must come out with PCI populated (via PHYID synonym).
+    assert 257 in by_pci and 88 in by_pci
+    # And with PSS-power-derived RSSI:
+    assert by_pci[257].rsrp_dbm == pytest.approx(31.0)
+    assert by_pci[88].rsrp_dbm == pytest.approx(18.4)
+    # EARFCN comes from the same line, not the preceding sweep status:
+    assert by_pci[257].earfcn == 6253
+    assert by_pci[88].earfcn == 6300
+
+
 def test_run_scan_returns_2_when_no_band_or_range():
     rc = scan.run_scan(fh=io.StringIO())
     assert rc == 2
