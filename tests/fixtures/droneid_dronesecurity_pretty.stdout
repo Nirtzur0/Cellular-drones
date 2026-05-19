@@ -1,0 +1,89 @@
+Center Freq:  2434500000.0 @ 50.0
+Found 3 Drone-ID RF frames in spectrum capture.
+
+Received DroneID packet:
+{
+    "pkt_len": 88,
+    "unk": 16,
+    "version": 2,
+    "sequence_number": 1,
+    "state_info": 8179,
+    "serial_number": "1ZNCJ4ABC123",
+    "longitude": 7.267960786785307,
+    "latitude": 51.446866781640146,
+    "altitude": 39.32,
+    "height": 5.49,
+    "v_north": 0,
+    "v_east": -7,
+    "v_up": 0,
+    "d_1_angle": 16900,
+    "gps_time": 1650894901980,
+    "app_lat": 43.26826445428658,
+    "app_lon": 6.640125363111847,
+    "longitude_home": 7.267943598058820,
+    "latitude_home": 51.446883970366635,
+    "device_type": "Mavic Air 2",
+    "uuid_len": 0,
+    "uuid": "",
+    "crc-packet": "c935",
+    "crc-calculated": "c935"
+}
+
+Received DroneID packet:
+Invalid packet (CRC mismatch)
+{
+    "pkt_len": 88,
+    "unk": 16,
+    "version": 2,
+    "sequence_number": 2,
+    "state_info": 8179,
+    "serial_number": "Sa#upeStore&q?",
+    "longitude": 7.123456,
+    "latitude": 51.111111,
+    "altitude": 0.0,
+    "height": 0.0,
+    "v_north": 0,
+    "v_east": 0,
+    "v_up": 0,
+    "d_1_angle": 0,
+    "gps_time": 0,
+    "app_lat": 0,
+    "app_lon": 0,
+    "longitude_home": 0,
+    "latitude_home": 0,
+    "device_type": "",
+    "uuid_len": 0,
+    "uuid": "",
+    "crc-packet": "d985",
+    "crc-calculated": "9b01"
+}
+
+Received DroneID packet:
+{
+    "pkt_len": 88,
+    "unk": 16,
+    "version": 2,
+    "sequence_number": 3,
+    "state_info": 8179,
+    "serial_number": "1ZNCJ4ABC123",
+    "longitude": 7.267970000000000,
+    "latitude": 51.446880000000000,
+    "altitude": 40.50,
+    "height": 6.80,
+    "v_north": 1,
+    "v_east": -7,
+    "v_up": 0,
+    "d_1_angle": 16920,
+    "gps_time": 1650894903980,
+    "app_lat": 43.26826445428658,
+    "app_lon": 6.640125363111847,
+    "longitude_home": 7.267943598058820,
+    "latitude_home": 51.446883970366635,
+    "device_type": "Mavic Air 2",
+    "uuid_len": 0,
+    "uuid": "",
+    "crc-packet": "aa11",
+    "crc-calculated": "aa11"
+}
+
+Locking Frequency to 2434500000.0

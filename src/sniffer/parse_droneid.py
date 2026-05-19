@@ -32,7 +32,7 @@ DroneID origin survives via `gps.fix = "droneid"`.
 from __future__ import annotations
 
 import json
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 from sniffer.schema import (
     GeotagRecord,
@@ -123,6 +123,59 @@ def _frame_to_gpsfix(frame: dict) -> Optional[GpsFix]:
     return GpsFix(lat=lat, lon=lon, alt_m=alt_m, fix="droneid", hdop=None)
 
 
+def _iter_json_objects(lines: Iterable[str]) -> Iterator[dict]:
+    """Yield one dict per top-level JSON object found in `lines`.
+
+    Handles two real-world output shapes from supported decoders:
+
+    1. **One JSON per line** (samples2djidroneid, JSONL files): each line
+       parses standalone.
+    2. **Multi-line pretty-printed JSON** (DroneSecurity prints frames
+       via `json.dumps(..., indent=4)`): the object spans many lines.
+
+    We accumulate any text starting with `{` and use a brace-depth
+    counter to find the matching `}`. The counter is naive — it doesn't
+    track string literals — but DroneID JSON values contain only digits,
+    decimals, simple ASCII identifiers, and short hex strings, none of
+    which carry unbalanced braces. Decoder log lines, banners, and
+    blank lines that appear between/around JSON blocks are ignored.
+
+    Yields the parsed dict; silently drops anything that fails parsing.
+    """
+    buf_parts: list[str] = []
+    depth = 0
+    for raw in lines:
+        # If we're not in a JSON block, skip until we see an opening brace.
+        if depth == 0:
+            stripped = raw.lstrip()
+            if not stripped.startswith("{"):
+                continue
+            # Trim leading non-JSON text on the same line, e.g.
+            # `Received frame: { ... }` — start from the first `{`.
+            raw = stripped
+        # Update depth across the full text we add to the buffer.
+        for ch in raw:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth < 0:
+                    # Stray closer — reset and skip.
+                    buf_parts = []
+                    depth = 0
+                    break
+        buf_parts.append(raw)
+        if depth == 0 and buf_parts:
+            blob = "".join(buf_parts)
+            buf_parts = []
+            try:
+                obj = json.loads(blob)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
 def parse_stream(
     input_stream: Iterable[str],
     mission_id: str,
@@ -131,25 +184,16 @@ def parse_stream(
     clock_ns: Callable[[], int] = mono_ns,
     serial_filter: Optional[str] = None,
 ) -> int:
-    """Read decoder JSON lines, write GeotagRecord JSONL.
+    """Consume decoder output, write GeotagRecord JSONL.
 
-    `serial_filter` restricts to frames where the serial matches exactly
+    `serial_filter` restricts to frames where the serial matches
     (case-sensitive substring match; useful when several drones are in
     the air and only one is ours). When None, all valid frames pass.
 
     Returns the number of GeotagRecords emitted.
     """
     n = 0
-    for raw_line in input_stream:
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            raw = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(raw, dict):
-            continue
+    for raw in _iter_json_objects(input_stream):
         if not _crc_ok(raw):
             continue
         frame = normalize_frame(raw)

@@ -140,3 +140,38 @@ def test_parse_stream_emits_geotag_kind_record():
     assert r["kind"] == "geotag"
     assert "ts_mono_ns" in r and "ts_utc" in r
     assert r["mission_id"] == "t-droneid"
+
+
+def test_parse_stream_handles_dronesecurity_pretty_printed_output():
+    """DroneSecurity prints json.dumps(..., indent=4) — multi-line JSON
+    interleaved with banner/log text. The parser must accumulate JSON
+    blocks across lines via brace counting."""
+    rows = _drain("droneid_dronesecurity_pretty.stdout")
+    # 3 packets in the fixture: 2 good CRCs, 1 mismatched CRC.
+    assert len(rows) == 2
+    assert all(r["kind"] == "geotag" for r in rows)
+    assert all(r["gps"]["fix"] == "droneid" for r in rows)
+    # The bad-CRC packet must NOT appear (its CRC fields don't match).
+    lats = [r["gps"]["lat"] for r in rows]
+    assert abs(lats[0] - 51.446866781640146) < 1e-12
+    assert abs(lats[1] - 51.446880000000000) < 1e-12
+
+
+def test_iter_json_objects_handles_compact_and_pretty_mixed():
+    """A single stream can mix one-per-line JSONL with multi-line pretty."""
+    from sniffer.parse_droneid import _iter_json_objects
+    text = (
+        "log line that should be ignored\n"
+        '{"latitude": 1.0, "longitude": 2.0, "altitude": 3.0}\n'
+        "another log line\n"
+        "{\n"
+        '    "latitude": 4.0,\n'
+        '    "longitude": 5.0,\n'
+        '    "altitude": 6.0\n'
+        "}\n"
+        "trailing noise\n"
+    )
+    objs = list(_iter_json_objects(text.splitlines(keepends=True)))
+    assert len(objs) == 2
+    assert objs[0]["latitude"] == 1.0
+    assert objs[1]["latitude"] == 4.0
