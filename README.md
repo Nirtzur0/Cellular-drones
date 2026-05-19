@@ -152,6 +152,25 @@ data/             JSONL captures (gitignored)
 tests/            unit + integration tests
 ```
 
+## Testing on the Pi
+
+The simulator covers the pipeline; real-radio coverage requires the
+target host. `scripts/pi-smoke-test.sh` walks the whole stack:
+
+```bash
+# On the Pi, after `sniffer install`:
+./scripts/pi-smoke-test.sh                  # full test
+./scripts/pi-smoke-test.sh --no-radio       # skip radio-dependent phases
+./scripts/pi-smoke-test.sh --band 7         # test on a different LTE band
+./scripts/pi-smoke-test.sh --earfcn 1850 --pci 271
+                                            # pin a known cell
+```
+
+The script reports PASS / FAIL / SKIP per phase and prints expected
+output + retry hints on failure. **Phase 8 (single-cell C-RNTI via
+FalconEye) is the must-pass for the framework to be useful** — every
+other phase is supporting cast. Logs land in `/tmp/{sim,live,survey,pytest}.log`.
+
 ## Legal / scope
 
 Passive receive only, in authorized environments: private LTE (srsRAN
