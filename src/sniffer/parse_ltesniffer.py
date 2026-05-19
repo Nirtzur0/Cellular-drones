@@ -1,34 +1,36 @@
-"""Turn LTESniffer DL-mode stdout into schema-conformant `ue_sighting` JSONL.
+"""LTESniffer text → `ue_sighting` JSONL.
 
-LTESniffer (oai-research-cci/LTESniffer) decodes the PDCCH of a target LTE
-cell and prints one line per recovered DCI. We canonicalise its output —
-either the upstream CSV/text form or a wrapper-script-flattened form — to
-this `key=value` syntax (one DCI per line):
+LTESniffer (oai-research-cci/LTESniffer) decodes the PDCCH of a target
+LTE cell and prints one line per recovered DCI. Real builds emit one of
+several shapes — `[SFN=… SF=…] PCI=… RNTI=… DCI=… …`, CSV rows,
+upstream-version text drift, etc. This module does both halves of the
+text-to-record pipeline:
+
+1. **normalize** — `normalize_line` / `normalize_stream` translate any
+   recognisable LTESniffer line into a canonical `DECODED key=value`
+   form using permissive regexes and a field-name synonym table.
+
+2. **parse** — `parse_stream` reads canonical `DECODED …` lines and
+   emits one `UeSighting` JSONL record per DCI.
+
+Canonical form (one DCI per line):
 
     DECODED ts=1700000000123 pci=271 c_rnti=0x4ad2 format=1A direction=DL \
             mcs=15 prb=8 tbs=752 dl_rsrp_dbm=-85.3 frame=42 subframe=3
 
-    DECODED ts=1700000000125 pci=271 c_rnti=0x4ad2 format=0  direction=UL \
-            mcs=12 prb=4 tbs=224 ul_rssi_dbm=-92.1 frame=42 subframe=4
-
 Notes:
 - `c_rnti` may be decimal or `0x`-prefixed hex.
-- `ts` is optional; absent → use the injected `clock_ns` callback.
-- Anything else is preserved verbatim under `ue.raw` so downstream code
-  can do its own dissection without re-parsing stdout.
+- Anything not promoted to a typed field is preserved under `ue.raw`.
 
-This module is deliberately format-tolerant: real LTESniffer text output
-drifts across versions, so `sniffer.normalize_ltesniffer.normalize_stream`
-canonicalises it before we parse here. The `sniffer live --earfcn ...`
-CLI wires that pipe up in-process.
+The live dashboard pipes LTESniffer stdout through `normalize_stream`
+in-process and then into `parse_stream`. There is no separate
+canonicaliser process.
 """
 
 from __future__ import annotations
 
-import argparse
 import re
-import sys
-from typing import Callable, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 from sniffer.schema import (
     RadioConfig,
@@ -37,6 +39,107 @@ from sniffer.schema import (
     mono_ns,
     utc_iso,
 )
+
+# --- normalize -----------------------------------------------------------
+
+_FIELD_MAP = {
+    "pci": "pci",
+    "rnti": "c_rnti",
+    "c_rnti": "c_rnti",
+    "crnti": "c_rnti",
+    "format": "format",
+    "dci": "format",
+    "mcs": "mcs",
+    "rbs": "prb",
+    "nof_prb": "prb",
+    "n_prb": "prb",
+    "prb": "prb",
+    "direction": "direction",
+    "dir": "direction",
+    "tbs": "tbs",
+    "tb_size": "tbs",
+    "harq": "harq",
+    "rsrp": "dl_rsrp_dbm",
+    "rsrp_dbm": "dl_rsrp_dbm",
+    "dl_rsrp": "dl_rsrp_dbm",
+    "ul_rssi": "ul_rssi_dbm",
+    "ul_rssi_dbm": "ul_rssi_dbm",
+    "rssi": "ul_rssi_dbm",
+    "sfn": "frame",
+    "frame": "frame",
+    "sf": "subframe",
+    "subframe": "subframe",
+    "ta": "ta_n_steps",
+    "ta_n_steps": "ta_n_steps",
+    "timing_advance": "ta_n_steps",
+}
+
+_KV_NORMALIZE_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*([^\s,]+)")
+
+
+def _normalise_value(key: str, value: str) -> Optional[str]:
+    value = value.strip().strip(",;[](){}")
+    if not value:
+        return None
+    if key in ("pci", "mcs", "prb", "tbs", "harq", "frame", "subframe",
+               "ta_n_steps"):
+        return value.rstrip(".")
+    if key == "c_rnti":
+        if value.lower().startswith("0x"):
+            return value.lower()
+        try:
+            return f"{int(value):#06x}"
+        except ValueError:
+            return value
+    if key == "direction":
+        v = value.upper()
+        if v in ("DL", "DOWNLINK"): return "DL"
+        if v in ("UL", "UPLINK"):   return "UL"
+        return v
+    return value
+
+
+def normalize_line(line: str) -> Optional[str]:
+    """Translate one LTESniffer text line into canonical DECODED form.
+
+    Returns None if the line has nothing usable (banner/log noise, no
+    RNTI, etc.).
+    """
+    raw = line.strip()
+    if not raw or raw.startswith("#"):
+        return None
+    if "rnti" not in raw.lower() and "c-rnti" not in raw.lower():
+        return None
+    fields: dict[str, str] = {}
+    for k, v in _KV_NORMALIZE_RE.findall(raw):
+        canon = _FIELD_MAP.get(k.lower())
+        if canon is None:
+            continue
+        n = _normalise_value(canon, v)
+        if n is not None:
+            fields[canon] = n
+    if "pci" not in fields or "c_rnti" not in fields:
+        return None
+    if "direction" not in fields:
+        fields["direction"] = "UL" if "ul_rssi_dbm" in fields else "DL"
+    parts = ["DECODED"]
+    for k in ("frame", "subframe", "pci", "c_rnti", "format", "direction",
+             "mcs", "prb", "tbs", "harq", "dl_rsrp_dbm", "ul_rssi_dbm",
+             "ta_n_steps"):
+        if k in fields:
+            parts.append(f"{k}={fields[k]}")
+    return " ".join(parts)
+
+
+def normalize_stream(lines: Iterable[str]) -> Iterator[str]:
+    """Pipe an LTESniffer text stream through `normalize_line`."""
+    for line in lines:
+        out = normalize_line(line)
+        if out is not None:
+            yield out
+
+
+# --- parse ---------------------------------------------------------------
 
 _DECODED = re.compile(r"^\s*DECODED\b", re.IGNORECASE)
 _KV = re.compile(r"(\w+)=([\S]+)")
@@ -69,7 +172,7 @@ def _parse_decoded(line: str) -> Optional[dict]:
         out["pci"] = _to_int(fields["pci"])
     if "c_rnti" in fields:
         out["c_rnti"] = _to_int(fields["c_rnti"])
-    elif "rnti" in fields:  # tolerate either spelling
+    elif "rnti" in fields:
         out["c_rnti"] = _to_int(fields["rnti"])
     if "format" in fields:
         out["dci_format"] = fields["format"]
@@ -87,10 +190,11 @@ def _parse_decoded(line: str) -> Optional[dict]:
         out["dl_rsrp_dbm"] = _to_float(fields["dl_rsrp_dbm"])
     if "ul_rssi_dbm" in fields:
         out["ul_rssi_dbm"] = _to_float(fields["ul_rssi_dbm"])
-    # Stash anything we did not promote — frame/subframe/cqi/etc.
+    if "ta_n_steps" in fields:
+        out["ta_n_steps"] = _to_int(fields["ta_n_steps"])
     raw = {k: v for k, v in fields.items() if k not in (
         "pci", "c_rnti", "rnti", "format", "direction", "mcs", "prb",
-        "tbs", "harq", "dl_rsrp_dbm", "ul_rssi_dbm",
+        "tbs", "harq", "dl_rsrp_dbm", "ul_rssi_dbm", "ta_n_steps",
     )}
     if raw:
         out["raw"] = raw
@@ -111,8 +215,6 @@ def _make_record(args, clock_ns: Callable[[], int],
         rx_gain_db=getattr(args, "rx_gain_db", None),
     )
     raw = fields.get("raw", {})
-    # If the wrapper emitted a `ts` (ms epoch), prefer it; we keep mono_ns
-    # for the join since GPS uses the same clock.
     ue = UeEvent(
         pci=int(pci),
         c_rnti=int(c_rnti),
@@ -124,6 +226,7 @@ def _make_record(args, clock_ns: Callable[[], int],
         tbs_bytes=fields.get("tbs_bytes"),
         ul_rssi_dbm=fields.get("ul_rssi_dbm"),
         dl_rsrp_dbm=fields.get("dl_rsrp_dbm"),
+        ta_n_steps=fields.get("ta_n_steps"),
         raw=raw,
     )
     return UeSighting(
@@ -142,9 +245,13 @@ def parse_stream(
     args,
     output_stream,
     clock_ns: Callable[[], int] = mono_ns,
-    *,
-    human_stream=None,
 ) -> int:
+    """Consume canonical DECODED lines; write UeSighting JSONL.
+
+    Returns the number of records emitted. `args` must have
+    `mission_id`, `backend`, `device`, `center_hz`, `sample_rate_sps`,
+    `rx_gain_db` attributes (a Namespace or `_ParseArgs` works).
+    """
     n = 0
     for raw in input_stream:
         line = raw.rstrip("\n")
@@ -156,37 +263,5 @@ def parse_stream(
             continue
         output_stream.write(rec.to_jsonl() + "\n")
         output_stream.flush()
-        if human_stream is not None:
-            direction = rec.ue.direction.upper()
-            power = (rec.ue.ul_rssi_dbm if rec.ue.direction == "ul"
-                     else rec.ue.dl_rsrp_dbm)
-            power_str = f"{power:.1f} dBm" if power is not None else "—"
-            human_stream.write(
-                f"[ltesniffer] {direction} PCI={rec.ue.pci} "
-                f"C-RNTI={rec.ue.c_rnti:#06x} "
-                f"DCI={rec.ue.dci_format} MCS={rec.ue.mcs} "
-                f"PRB={rec.ue.n_prb} pwr={power_str}\n"
-            )
-            human_stream.flush()
         n += 1
     return n
-
-
-def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mission-id", required=True)
-    p.add_argument("--backend", default="ltesniffer")
-    p.add_argument("--device", default="usrp-b210-0")
-    p.add_argument("--center-hz", type=float, default=None)
-    p.add_argument("--sample-rate-sps", type=float, default=None)
-    p.add_argument("--rx-gain-db", type=float, default=None)
-    p.add_argument("--human", action="store_true",
-                   help="Also print a human-readable summary to stderr.")
-    args = p.parse_args()
-    human = sys.stderr if args.human else None
-    parse_stream(sys.stdin, args, sys.stdout, human_stream=human)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

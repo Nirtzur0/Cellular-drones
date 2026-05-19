@@ -1,0 +1,10 @@
+Opening RF device
+Tuned to 1842500000 Hz
+Cell found: PCI=271 Mode=1
+Decoded MIB. sfn=1, nof_ports=2
+Decoding SIB1...
+SIB1 decoded successfully.
+PLMN: 425 01
+TAC: 18452
+cellIdentity: 67305473
+done

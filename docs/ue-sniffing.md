@@ -27,28 +27,24 @@ passive receiver.
 
 ## Pipeline
 
+Everything runs inside `sniffer live` — there is no offline join step.
+
 ```
-USRP B210 (UHD) ──► LTESniffer ──► normalize_stream ──► JSONL (ue_sighting)
-                              (in-process, inside `sniffer live`)
-                                       │                  │
-GPS module ──► gpsd ──► gpspipe ──► gps-*.jsonl ──┐       │
-                                                  │       │
-                          sniffer.geotag joiner ◄─┴───────┘
-                                  │
-                                  ▼
-                       geotagged-<mission>.jsonl
-                                  │
-                ┌─────────────────┴─────────────────┐
-                ▼                                   ▼
-  sniffer.localize (per-RNTI)        sniffer.live (browser dashboard)
-                │                                   │
-                ▼                                   ▼
-  sniffer report → PNG plot            http://127.0.0.1:8000/
+LTESniffer stdout ──► normalize_stream ──► parse_ltesniffer ─┐
+                                                              │
+gpspipe -w stdout ──► parse_gpsd ─────────────────────────────┤
+                                                              ▼
+                                                          live.State
+                                                  (in-memory join, ≤500 ms;
+                                                   weighted_centroid_ue)
+                                                              │
+                                                              ▼
+                                                  SSE → http://127.0.0.1:8000/
 ```
 
-The same pipeline runs end-to-end against the simulator without any
-hardware (`sniffer live --simulate`); the real-radio path swaps the
-simulator stream for LTESniffer's stdout.
+The simulator follows exactly the same path: `simulate.ltesniffer_lines`
+and `simulate.gpsd_lines` emit the same wire text, paced to wall clock
+and piped through the same parsers.
 
 ## Quick start
 
@@ -81,14 +77,22 @@ demonstrating the limit of single-RX positioning for moving targets.
 
 ```bash
 sniffer install                                       # one-time
-sniffer gps-log &                                     # GPS stream (optional)
 sniffer live --earfcn 1850 --pci 271 --rx-gain 50     # spawns LTESniffer + UI
 # open http://127.0.0.1:8000/
 ```
 
-Pick the target EARFCN + PCI from CellMapper / OpenCellID, or run
-`srsRAN_cell_search` on the USRP directly if you don't trust external
-databases.
+GPS is auto-ingested from `gpspipe -w` if `gpsd` is running on the
+host. No separate step.
+
+Pick the target EARFCN + PCI by running the bundled cell-discovery
+wrapper:
+
+```bash
+sniffer scan --band 3                 # sweep band 3 (1800 MHz)
+sniffer scan --band 3 --decode-sib1   # + operator (PLMN), TAC, CGI
+```
+
+…or from CellMapper / OpenCellID if no USRP is plugged in.
 
 ## Record schema (UE sighting)
 
@@ -118,6 +122,8 @@ One JSONL row per decoded DCI:
     "tbs_bytes": 408,
     "ul_rssi_dbm": -92.1,
     "dl_rsrp_dbm": null,
+    "ta_n_steps": 14,
+    "ta_meters": 1093.75,
     "raw": {"frame": "512", "subframe": "3"}
   },
   "gps": {"lat": 32.085, "lon": 34.781, "alt_m": 30.0, "fix": "rtk_fix", "age_ms": 14},
@@ -128,6 +134,14 @@ One JSONL row per decoded DCI:
 DL grants are stored too (for an activity timeline) but never feed the
 localizer — DL energy is the eNB's transmission, the same for every UE
 on the cell.
+
+`ta_n_steps` and `ta_meters` are populated only when the upstream
+LTESniffer build emits Timing Advance per grant (the simulator does;
+the published PDCCH-only build does not — see `docs/localization.md`).
+When present, they feed a second, independent positioning path —
+`ta_multilateration` — that the dashboard shows alongside the
+RSSI-centroid estimate as a separately labelled position. Neither
+estimator is a fallback for the other.
 
 ## Caveats
 
@@ -165,18 +179,17 @@ heavily skewed to DL, the UE is "heard but unlocalisable."
 
 ## Adapting LTESniffer's actual output
 
-Real LTESniffer text drifts across versions. Rather than hard-code one
-format, the pipeline uses a two-stage normaliser:
+Real LTESniffer text drifts across versions. `sniffer.parse_ltesniffer`
+handles both halves of the text-to-record translation in one module:
 
-1. `sniffer live --earfcn N --pci P` spawns LTESniffer and pipes its
-   stdout through `normalize_stream` (from
-   `sniffer.normalize_ltesniffer`) in-process. The normaliser uses
-   permissive regexes to recognise `KEY=value` and `KEY: value` fields
-   in any order, normalises field names (`rnti` → `c_rnti`, `RBs` →
-   `prb`, etc.), and emits canonical `DECODED key=value` lines.
-2. `sniffer.parse_ltesniffer.parse_stream` reads those canonical lines
-   and emits schema-conformant `ue_sighting` records.
+1. `normalize_stream` uses permissive regexes to recognise `KEY=value`
+   and `KEY: value` fields in any order, normalises field names
+   (`rnti` → `c_rnti`, `RBs` → `prb`, etc.), and emits canonical
+   `DECODED key=value` lines.
+2. `parse_stream` reads those canonical lines and emits
+   schema-conformant `ue_sighting` records.
 
 If your LTESniffer build emits a format the normaliser doesn't handle,
-add the field to `_FIELD_MAP` in `src/sniffer/normalize_ltesniffer.py`.
-The test in `tests/test_parse_ltesniffer.py` is the regression net.
+add the field to `_FIELD_MAP` at the top of
+`src/sniffer/parse_ltesniffer.py`. `tests/test_parse_ltesniffer.py`
+is the regression net.

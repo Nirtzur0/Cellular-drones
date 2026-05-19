@@ -1,17 +1,16 @@
 """Unified CLI for the cellular-drones UE sniffer.
 
-There is one run path. `sniffer live` ingests PDCCH events (real radio
-*or* simulated) and serves the live dashboard. The dashboard performs
-C-RNTI extraction and per-UE positioning together — they are not
-separate surfaces.
+`sniffer live` ingests PDCCH events (real radio *or* simulated) and
+serves the live dashboard. The dashboard performs C-RNTI extraction
+and per-UE positioning together — they are not separate surfaces.
 
     sniffer live --simulate               # no hardware, synthetic UEs + GPS
     sniffer live --earfcn N --pci P       # real radio, LTESniffer on a cell
 
-Auxiliary commands:
+Auxiliary:
 
-    sniffer report <jsonl> [--plot ...]   # offline summary + plot from a capture
-    sniffer gps-log                       # standalone gpsd -> JSONL recorder
+    sniffer scan --band 3                 # discover cells via srsran_cell_search
+    sniffer scan --band 3 --decode-sib1   # + PLMN/TAC/CGI via pdsch_ue
     sniffer install                       # apt + srsRAN + LTESniffer (Linux)
 """
 from __future__ import annotations
@@ -75,35 +74,30 @@ def _cmd_live(args: argparse.Namespace) -> int:
     return _delegate("sniffer.live", argv)
 
 
-def _cmd_report(args: argparse.Namespace) -> int:
-    argv = [args.input_glob]
-    if args.plot:
-        argv += ["--plot", args.plot]
-    return _delegate("sniffer.report", argv)
-
-
-def _cmd_gps_log(args: argparse.Namespace) -> int:
-    if shutil.which("gpspipe") is None:
-        print("gpspipe not found. Install gpsd (apt install gpsd gpsd-clients).",
-              file=sys.stderr)
-        return 1
-    os.makedirs(args.out_dir, exist_ok=True)
-    out_path = Path(args.out_dir) / f"gps-{args.mission_id}.jsonl"
-    print(f"Logging GPS fixes -> {out_path}", file=sys.stderr)
-    gpspipe = subprocess.Popen(["gpspipe", "-w"], stdout=subprocess.PIPE)
-    try:
-        with open(out_path, "ab") as fh:
-            parse = subprocess.Popen(
-                [sys.executable, "-m", "sniffer.parse_gpsd",
-                 "--mission-id", args.mission_id],
-                stdin=gpspipe.stdout, stdout=fh,
-            )
-            assert gpspipe.stdout is not None
-            gpspipe.stdout.close()  # let SIGPIPE propagate on shutdown
-            return parse.wait()
-    finally:
-        if gpspipe.poll() is None:
-            gpspipe.terminate()
+def _cmd_scan(args: argparse.Namespace) -> int:
+    if args.band is None and args.earfcn_range is None:
+        print("sniffer scan needs --band or --earfcn-range", file=sys.stderr)
+        return 2
+    earfcn_range = None
+    if args.earfcn_range is not None:
+        try:
+            start, end = args.earfcn_range.split(",", 1)
+            earfcn_range = (int(start), int(end))
+        except ValueError:
+            print("--earfcn-range must be `start,end` (e.g. 1800,1900)",
+                  file=sys.stderr)
+            return 2
+    from sniffer.scan import run_scan
+    binary = (args.binary or os.environ.get("SRSRAN_CELL_SEARCH_BIN")
+              or "srsran_cell_search")
+    sib_binary = (args.sib_binary or os.environ.get("PDSCH_UE_BIN")
+                  or "pdsch_ue")
+    return run_scan(
+        band=args.band, earfcn_range=earfcn_range,
+        decode_sib1=args.decode_sib1,
+        binary=binary, sib_binary=sib_binary,
+        json_out=args.jsonl,
+    )
 
 
 def _cmd_install(_args: argparse.Namespace) -> int:
@@ -145,17 +139,27 @@ def _build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--mission-id", default=default_mid)
     pl.set_defaults(func=_cmd_live)
 
-    pr = sub.add_parser("report", help="text summary + plot from JSONL",
-                        description="Aggregate a saved geotagged capture into "
-                                    "a per-UE summary and optional PNG plot.")
-    pr.add_argument("input_glob", help="glob for geotagged-*.jsonl files")
-    pr.add_argument("--plot", default=None, help="path to write PNG")
-    pr.set_defaults(func=_cmd_report)
-
-    pg = sub.add_parser("gps-log", help="standalone gpsd -> JSONL recorder")
-    pg.add_argument("--mission-id", default=default_mid)
-    pg.add_argument("--out-dir", default="data")
-    pg.set_defaults(func=_cmd_gps_log)
+    ps = sub.add_parser("scan",
+                        help="discover LTE cells with srsran_cell_search",
+                        description="One-shot wrapper around srsRAN's "
+                                    "cell_search binary. Use the printed "
+                                    "(EARFCN, PCI) to target `sniffer live`.")
+    ps.add_argument("--band", type=int, default=None,
+                    help="3GPP LTE band number (e.g. 3, 7, 20)")
+    ps.add_argument("--earfcn-range", default=None,
+                    help="alternative to --band: `start,end` EARFCN sweep "
+                         "(e.g. 1800,1900)")
+    ps.add_argument("--decode-sib1", action="store_true",
+                    help="after each cell, run pdsch_ue to extract "
+                         "PLMN / TAC / CGI from SIB1 (adds 5-10 s/cell)")
+    ps.add_argument("--jsonl", action="store_true",
+                    help="emit JSONL instead of a table")
+    ps.add_argument("--binary", default=None,
+                    help="path to srsran_cell_search "
+                         "(env: SRSRAN_CELL_SEARCH_BIN)")
+    ps.add_argument("--sib-binary", default=None,
+                    help="path to pdsch_ue (env: PDSCH_UE_BIN)")
+    ps.set_defaults(func=_cmd_scan)
 
     pi = sub.add_parser("install", help="install dependencies (Linux only)")
     pi.set_defaults(func=_cmd_install)

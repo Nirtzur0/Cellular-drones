@@ -3,14 +3,33 @@
 How the framework turns a stream of geo-tagged UE sightings into a
 position estimate for each UE.
 
-## Method: RSSI weighted centroid
+## Two independent estimators, one per observable
 
-One implemented method. No fallbacks, no second algorithm pretending to
-add precision it doesn't have.
+Two methods, each driven by a different physical observable on the same
+UL grants. **Neither falls back to the other.** When both are available
+they are shown side-by-side in the dashboard and JSONL, labelled with
+`method` so the consumer knows which observable produced which estimate.
 
-| Method | Hardware needed | Expected accuracy |
-| --- | --- | --- |
-| RSSI weighted centroid | 1 RX + good geotag | 30–80 m, stationary UE |
+| Method | Observable | Hardware needed | Accuracy on stationary UE |
+| --- | --- | --- | --- |
+| `weighted_centroid` | UL RSSI per grant | 1 RX + good geotag | 30–80 m |
+| `ta_multilateration` | UL Timing Advance per grant | 1 RX + good geotag + TA-emitting LTESniffer | 5–30 m, ≥ 4 anchors |
+
+The two answer different questions. RSSI weights samples by received
+power and biases toward the densest cluster of close passes. TA solves
+range circles around each drone position, so geometry — not power —
+drives the fit. They will visibly disagree by tens of metres on the
+same UE; that is informative, not an error condition.
+
+> **Real-radio TA caveat.** LTESniffer's published PDCCH-only build does
+> not emit Timing Advance (TA arrives on PDSCH in RAR / MAC CE). The
+> parser is ready for `ta` / `timing_advance` / `ta_n_steps` fields, the
+> simulator emits TA today, and the e2e test asserts the full path. On
+> real radio the TA estimate stays empty until LTESniffer (or a fork) is
+> taught to surface TA. The plumbing is dead-safe in the absence of TA
+> — the solver simply returns `None`.
+
+### RSSI weighted centroid
 
 Given samples `(p_i, r_i)` of position and linear-domain UL RSSI:
 
@@ -30,6 +49,25 @@ The localizer drops DL on input.
 `sniffer.localize.weighted_centroid_ue` implements this. The live
 dashboard calls it every time a new geo-tagged UL grant lands, and
 publishes the estimate to the browser over SSE.
+
+### TA multilateration
+
+Given samples `(p_i, ta_i)` of drone position and one-way TA range:
+
+```
+minimise_x  sum( huber( ||p_i - x|| - ta_i ; sigma ) )
+```
+
+One TA step (16·Ts) is 156.25 m round-trip, so each step encodes 78.125 m
+one-way; quantisation noise alone is ~22.5 m. We solve with Huber loss
+(outlier-tolerant) via `scipy.optimize.least_squares`. The estimator
+refuses to converge when geometry is degenerate (anchors collinear; all
+TA values equal; fewer than 4 anchors) — see `sniffer.ta_multilateration`.
+
+The same per-UE history that feeds the centroid feeds the TA solver in
+parallel: a separate deque (`ta_geo_history`) buffers records that carry
+`ue.ta_meters`. Result lands on the UE entry as `est_position_ta` and
+ships in the same `ue_sighting` SSE payload as the centroid estimate.
 
 ## Uncertainty
 
@@ -67,7 +105,10 @@ not in the codebase.
 
 ## Validation
 
-`tests/test_localize.py` exercises the math on synthetic free-space
-trajectories. `tests/test_e2e.py` runs the full pipeline against the
-simulator and asserts `error_xy_m < 100 m` for the stationary UEs; in
-practice the simulator hits ~30 m.
+`tests/test_localize.py` exercises the centroid math on synthetic
+free-space trajectories. `tests/test_ta_multilateration.py` exercises
+the TA solver in isolation, including geometry-refusal cases.
+`tests/test_e2e.py` runs the full simulator-driven pipeline through
+both estimators and asserts `error_xy_m < 100 m` for the centroid and
+`< 50 m` for TA on the stationary UEs; in practice the simulator hits
+~30 m for the centroid and ~5–10 m for TA.

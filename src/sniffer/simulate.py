@@ -9,8 +9,8 @@ streams that look like:
 …for a configurable eNB + UE roster + drone trajectory under a
 log-distance path-loss model with optional shadow fading.
 
-The same module powers the `demo` entry point and the `tests/test_e2e.py`
-integration test.
+Drives `sniffer live --simulate` and the `tests/test_e2e.py` integration
+test.
 """
 
 from __future__ import annotations
@@ -24,7 +24,13 @@ from typing import Iterator
 
 from pyproj import Geod
 
+from sniffer.schema import TA_STEP_METERS
+
 GEOD = Geod(ellps="WGS84")
+
+# LTE caps TA_n_steps at 1282 (≈100 km one-way). Clamp simulated TA so we
+# never emit a value that would never appear on a real link.
+_TA_N_STEPS_MAX = 1282
 
 
 @dataclass
@@ -283,7 +289,7 @@ def ltesniffer_lines(cfg: SimulationConfig) -> Iterator[str]:
     subframe = 0
     while t <= t_end:
         # A simulated-clock marker on every tick. Parser ignores comment
-        # lines; the demo driver picks these up to advance its simulated
+        # lines; the test driver picks these up to advance its simulated
         # mono_ns clock so GPS↔UE timestamp joins line up.
         yield f"# TICK t={t:.6f}\n"
         drone = _interp_waypoint(cfg.waypoints, t)
@@ -318,12 +324,21 @@ def ltesniffer_lines(cfg: SimulationConfig) -> Iterator[str]:
                 mcs = rng.randint(2, 24)
                 n_prb = rng.choice([1, 2, 4, 8, 16])
                 tbs = 50 + mcs * n_prb * 8
+                # TA round-trips the UE↔drone link, but ta_n_steps encodes
+                # the one-way distance (steps × 78.125 m). Simulate that.
+                _, _, ground_d = GEOD.inv(drone.lon, drone.lat,
+                                          ue_pos.lon, ue_pos.lat)
+                slant_m = math.sqrt(
+                    ground_d ** 2 + (drone.alt_m - ue_pos.alt_m) ** 2
+                )
+                ta_n = max(0, min(_TA_N_STEPS_MAX,
+                                  round(slant_m / TA_STEP_METERS)))
                 yield (
                     f"DECODED frame={frame} subframe={subframe} "
                     f"pci={em.pci} c_rnti={ue.c_rnti:#06x} "
                     f"format=0 direction=UL "
                     f"mcs={mcs} prb={n_prb} tbs={tbs} "
-                    f"ul_rssi_dbm={rssi:.2f}\n"
+                    f"ul_rssi_dbm={rssi:.2f} ta_n_steps={ta_n}\n"
                 )
             else:
                 mcs = rng.randint(4, 27)

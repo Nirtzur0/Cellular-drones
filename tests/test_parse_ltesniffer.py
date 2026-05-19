@@ -1,4 +1,4 @@
-"""Unit tests for sniffer.parse_ltesniffer + sniffer.normalize_ltesniffer."""
+"""Unit tests for sniffer.parse_ltesniffer (normalize + parse)."""
 
 from __future__ import annotations
 
@@ -6,8 +6,7 @@ import io
 import json
 from argparse import Namespace
 
-from sniffer.normalize_ltesniffer import normalize_line
-from sniffer.parse_ltesniffer import parse_stream
+from sniffer.parse_ltesniffer import normalize_line, parse_stream
 
 
 def _args(**over) -> Namespace:
@@ -91,3 +90,28 @@ def test_parse_stream_requires_pci_and_rnti():
     n = parse_stream(iter(text.splitlines(keepends=True)), _args(), out)
     assert n == 0
     assert out.getvalue() == ""
+
+
+def test_normalize_picks_up_ta_step_synonyms():
+    out = normalize_line(
+        "PCI=42 RNTI=0xbeef DCI=0 dir=UL ul_rssi_dbm=-100 TA=42"
+    )
+    assert "ta_n_steps=42" in out
+    out2 = normalize_line(
+        "PCI=42 RNTI=0xbeef DCI=0 dir=UL ul_rssi_dbm=-100 timing_advance=7"
+    )
+    assert "ta_n_steps=7" in out2
+
+
+def test_parse_stream_extracts_ta_steps_and_derives_meters():
+    text = (
+        "DECODED pci=271 c_rnti=0x4ad2 format=0 direction=UL "
+        "mcs=10 prb=2 ul_rssi_dbm=-90 ta_n_steps=42\n"
+    )
+    out = io.StringIO()
+    n = parse_stream(iter(text.splitlines(keepends=True)), _args(), out)
+    assert n == 1
+    rec = json.loads(out.getvalue().strip())
+    assert rec["ue"]["ta_n_steps"] == 42
+    # Schema's __post_init__ derives ta_meters from ta_n_steps:
+    assert rec["ue"]["ta_meters"] == 42 * 78.12526041666667

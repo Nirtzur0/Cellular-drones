@@ -1,0 +1,11 @@
+Opening RF device...
+Initialised RF device for band 3
+[BAND 3] EARFCN=1800 sweep range 1800-1900
+Searching for cell on EARFCN=1800
+Found PCI=271 RSRP=-85.4 CFO=-1234.5
+Searching for cell on EARFCN=1850
+Found PCI=24 RSRP=-91.2 CFO=412.0
+Found PCI=378 RSRP=-105.7 CFO=-220.3
+Searching for cell on EARFCN=1900
+no cells found
+done

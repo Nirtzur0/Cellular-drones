@@ -26,35 +26,41 @@ Decisions are anchored to maintained projects rather than rewrites.
 | [gpsd](https://gpsd.gitlab.io) + `gpspipe` | NMEA → JSON TPV stream | We just tail `gpspipe -w` and parse to our geotag schema. |
 | UHD | USRP host-driver | Plain `libuhd-dev` from apt; no IO/perf tuning required for B210 over USB3. |
 
-There is **no** in-tree HackRF / cell-discovery surface — the prior
-`LTE-Cell-Scanner` path was removed in v0.2 along with the macOS bits.
-Pick the target EARFCN + PCI out-of-band (CellMapper, OpenCellID, or
-`srsRAN_cell_search`) and feed it to `sniffer live --earfcn N --pci P`.
+There is no in-tree HackRF discovery surface — the prior `LTE-Cell-Scanner`
+path was removed in v0.2 along with the macOS bits. For cell selection,
+use the bundled `sniffer scan` (a wrapper around `srsran_cell_search`):
+
+    sniffer scan --band 3                # quick sweep
+    sniffer scan --band 3 --decode-sib1  # + PLMN / TAC / CGI via pdsch_ue
+
+Then feed the chosen cell to `sniffer live --earfcn N --pci P`. External
+databases (CellMapper, OpenCellID) work too if a USRP isn't on hand.
 
 ## 3. Architecture
 
 ```
-┌─────────────────────────────────────────────┐  ┌──────────────────────┐
-│ Airborne payload                            │  │ Post-flight          │
-│                                             │  │                      │
-│  Antenna ─► USRP B210 ─► LTESniffer ─►      │  │   • report.py        │
-│             (UHD)        DECODED text       │  │   • localize.py      │
-│                              │              │  │   • make_plot()      │
-│                              ▼              │  │                      │
-│              normalize_ltesniffer.py        │  └──────────────────────┘
-│                              │              │           ▲
-│                              ▼              │           │
-│                  parse_ltesniffer.py        │           │
-│                              │              │           │
-│                              ▼              │  geotagged-<mission>.jsonl
-│                  ue-<mission>.jsonl  ───────┼──────┐
-│                                             │      │
-│  GPS module ─► gpsd ─► gpspipe ─► parse_gpsd│      │
-│                              │              │      │
-│                              ▼              │      ▼
-│                  gps-<mission>.jsonl  ──────┼──► geotag.join()
-│                                             │
-└─────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│ sniffer live                                                       │
+│                                                                    │
+│  Antenna ─► USRP B210 ─► LTESniffer ─► normalize_stream            │
+│             (UHD)        DECODED text       │                      │
+│                                              ▼                      │
+│                                       parse_ltesniffer              │
+│                                              │                      │
+│                                              ▼                      │
+│  GPS module ─► gpsd ─► gpspipe ─► parse_gpsd │                      │
+│                                              │                      │
+│                                              ▼                      │
+│                                    live.State (in-memory)           │
+│                                  • nearest-GPS join ≤500 ms         │
+│                                  • weighted_centroid_ue             │
+│                                  • SSE broadcast                    │
+│                                              │                      │
+│                                              ▼                      │
+│                              http://127.0.0.1:8000/                 │
+│                                                                    │
+│   Side effect: ue-<mission>.jsonl on disk (one DCI per line).      │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Components
@@ -63,21 +69,27 @@ Pick the target EARFCN + PCI out-of-band (CellMapper, OpenCellID, or
   binary's argv from `--earfcn/--pci/--rx-gain`, spawns it as a
   subprocess inside `live.py`, pipes stdout through `normalize_stream`
   in-process, and feeds the result to the Python parser writing JSONL.
-- **normalize_ltesniffer** — permissive field-renaming step. LTESniffer's
-  text output drifts between versions; this layer keeps the downstream
-  schema stable.
-- **parse_ltesniffer** — emits one `ue_sighting` JSONL record per DCI.
-  Records carry UL RSSI for UL grants and DL RSRP for DL grants. Both
-  are stored, but only UL grants feed the per-UE localizer.
+- **parse_ltesniffer** — does both halves of the text-to-record
+  pipeline: `normalize_stream` canonicalises LTESniffer's drifting text
+  into `DECODED key=value` lines, then `parse_stream` emits one
+  `ue_sighting` JSONL record per DCI. Records carry UL RSSI for UL
+  grants and DL RSRP for DL grants. Both are stored, but only UL grants
+  feed the per-UE localizer.
 - **gpsd / parse_gpsd** — one `geotag` record per fix at ~10 Hz.
-- **geotag.join** — single-pass O(n+m) merge on monotonic time, ±500 ms
-  window. UE sightings older than the GPS fix window are dropped.
+- **live.State** — single-pass O(log n) GPS join on monotonic time,
+  ±500 ms window. Holds the per-UE rolling state and runs
+  `weighted_centroid_ue` as new UL grants arrive. The same `State`
+  serves snapshots and SSE events to browser clients.
 - **localize** — per-(PCI, C-RNTI) RSSI weighted centroid, computed
-  in a local ENU frame. Single estimator, no fallback path.
-- **live** — stdlib HTTP server + SSE; pushes per-UE updates to the
-  browser dashboard as DCIs come in.
-- **report** — text summary + matplotlib PNG of the per-UE positions
-  alongside the drone trajectory.
+  in a local ENU frame.
+- **ta_multilateration** — per-(PCI, C-RNTI) multilateration from LTE
+  Timing Advance ranges, when those are available on the parsed grants.
+  Independent of the centroid; the two estimators are reported
+  side-by-side and **neither falls back to the other** — each is shown
+  labelled (`weighted_centroid` and `ta_multilateration`).
+- **simulate** — produces the same text that LTESniffer + gpsd would,
+  paced to wall clock; feeds the same parsers. There is no separate
+  "simulate path" in the code.
 
 ## 4. Record schema
 

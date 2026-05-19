@@ -19,7 +19,7 @@ import io
 import json
 import os
 import queue
-import random
+import re
 import shutil
 import signal
 import subprocess
@@ -28,13 +28,15 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from sniffer.localize import weighted_centroid_ue
-from sniffer.motion import classify_motion
-from sniffer.normalize_ltesniffer import normalize_stream
+from sniffer.ta_multilateration import ta_multilateration_ue
 from sniffer.parse_gpsd import parse_stream as parse_gpsd_stream
-from sniffer.parse_ltesniffer import parse_stream as parse_ltesniffer_stream
+from sniffer.parse_ltesniffer import (
+    normalize_stream,
+    parse_stream as parse_ltesniffer_stream,
+)
 from sniffer.schema import (
     GpsFix,
     RadioConfig,
@@ -45,12 +47,10 @@ from sniffer.schema import (
 )
 from sniffer.simulate import (
     Emitter,
-    _default_ues,
-    _interp_waypoint,
-    _rsrp_dbm,
-    _ue_position,
-    _ul_rssi_dbm,
+    SimulationConfig,
     box_trajectory,
+    gpsd_lines,
+    ltesniffer_lines,
 )
 
 
@@ -147,8 +147,9 @@ class State:
                     "dci_formats": [],
                     "ul_rssi_history": deque(maxlen=RSSI_HISTORY_MAX),
                     "geo_history": deque(maxlen=UE_HISTORY_MAX),
+                    "ta_geo_history": deque(maxlen=UE_HISTORY_MAX),
                     "est_position": None,
-                    "motion": None,
+                    "est_position_ta": None,
                 }
                 self._ues[key] = entry
 
@@ -172,19 +173,33 @@ class State:
                 entry["dl_rsrp_dbm"] = ue.dl_rsrp_dbm
             self._total_ue_sightings += 1
 
-            if ue.direction == "ul" and ue.ul_rssi_dbm is not None:
+            if ue.direction == "ul" and (
+                ue.ul_rssi_dbm is not None or ue.ta_meters is not None
+            ):
                 hit = self._nearest_gps_locked(sighting.ts_mono_ns)
                 if hit is not None:
                     gps_rec, age_ms = hit
-                    entry["geo_history"].append({
-                        "kind": "ue_sighting",
-                        "ts_mono_ns": sighting.ts_mono_ns,
-                        "gps": {**gps_rec["gps"], "age_ms": age_ms},
-                        "ue": {"pci": pci, "c_rnti": c_rnti,
-                               "direction": "ul",
-                               "ul_rssi_dbm": ue.ul_rssi_dbm},
-                    })
-                    _recompute_ue_position(entry)
+                    gps_with_age = {**gps_rec["gps"], "age_ms": age_ms}
+                    if ue.ul_rssi_dbm is not None:
+                        entry["geo_history"].append({
+                            "kind": "ue_sighting",
+                            "ts_mono_ns": sighting.ts_mono_ns,
+                            "gps": gps_with_age,
+                            "ue": {"pci": pci, "c_rnti": c_rnti,
+                                   "direction": "ul",
+                                   "ul_rssi_dbm": ue.ul_rssi_dbm},
+                        })
+                        _recompute_ue_position(entry)
+                    if ue.ta_meters is not None:
+                        entry["ta_geo_history"].append({
+                            "kind": "ue_sighting",
+                            "ts_mono_ns": sighting.ts_mono_ns,
+                            "gps": gps_with_age,
+                            "ue": {"pci": pci, "c_rnti": c_rnti,
+                                   "direction": "ul",
+                                   "ta_meters": ue.ta_meters},
+                        })
+                        _recompute_ue_position_ta(entry)
 
             payload = _entry_to_dict_ue(entry)
         self._broadcast({"type": "ue_sighting", "ue": payload})
@@ -203,7 +218,8 @@ class State:
             ues = [_entry_to_dict_ue(e) for e in self._ues.values()]
             ues.sort(
                 key=lambda u: (
-                    u.get("est_position") is None,
+                    (u.get("est_position") is None
+                     and u.get("est_position_ta") is None),
                     -(u.get("ul_count") or 0),
                     -(u.get("ul_rssi_dbm") or -1e9),
                 )
@@ -253,12 +269,13 @@ class State:
             for entry in self._ues.values():
                 past = [g for g in entry["geo_history"]
                         if g["ts_mono_ns"] <= at_ts_mono_ns]
-                if not past:
+                past_ta = [g for g in entry["ta_geo_history"]
+                           if g["ts_mono_ns"] <= at_ts_mono_ns]
+                if not past and not past_ta:
                     continue
-                last_g = past[-1]
-                cent = weighted_centroid_ue(past)
+                last_g = past[-1] if past else past_ta[-1]
+                cent = weighted_centroid_ue(past) if past else None
                 est_pos = None
-                motion = None
                 if cent is not None:
                     est_pos = {
                         "lat": cent.lat, "lon": cent.lon,
@@ -267,9 +284,17 @@ class State:
                         "n_samples": cent.n_samples,
                         "altitude_estimated": cent.altitude_estimated,
                     }
-                    m = classify_motion(past, cent.lat, cent.lon)
-                    motion = {"label": m.label, "corr": m.corr,
-                              "n_samples": m.n_samples, "note": m.note}
+                ta_res = (ta_multilateration_ue(past_ta)
+                          if len(past_ta) >= 4 else None)
+                est_pos_ta = None
+                if ta_res is not None:
+                    est_pos_ta = {
+                        "lat": ta_res.lat, "lon": ta_res.lon,
+                        "alt_m": ta_res.alt_m, "cep95_m": ta_res.cep95_m,
+                        "method": "ta_multilateration",
+                        "n_samples": ta_res.n_samples,
+                        "altitude_estimated": ta_res.altitude_estimated,
+                    }
                 ues_out.append({
                     "key": entry["key"],
                     "pci": entry["pci"],
@@ -278,8 +303,8 @@ class State:
                     "center_hz": entry["center_hz"],
                     "first_seen": entry["first_seen"],
                     "last_seen": last_g.get("ts_utc", entry["first_seen"]),
-                    "count": len(past),
-                    "ul_count": len(past),
+                    "count": len(past) or len(past_ta),
+                    "ul_count": len(past) or len(past_ta),
                     "dl_count": 0,
                     "dci_formats": entry.get("dci_formats", []),
                     "mcs": None, "n_prb": None, "tbs_bytes": None,
@@ -287,15 +312,17 @@ class State:
                     "dl_rsrp_dbm": None,
                     "ul_rssi_history": [],
                     "n_geo_samples": len(past),
+                    "n_ta_samples": len(past_ta),
                     "trail": [{"lat": g["gps"]["lat"],
                                "lon": g["gps"]["lon"],
                                "ul_rssi_dbm": g["ue"]["ul_rssi_dbm"]}
                               for g in past[-40:]],
                     "est_position": est_pos,
-                    "motion": motion,
+                    "est_position_ta": est_pos_ta,
                 })
             ues_out.sort(
-                key=lambda u: (u.get("est_position") is None,
+                key=lambda u: ((u.get("est_position") is None
+                                and u.get("est_position_ta") is None),
                                -(u.get("ul_count") or 0)),
             )
             return {
@@ -341,9 +368,10 @@ class State:
 
 def _entry_to_dict_ue(entry: dict[str, Any]) -> dict[str, Any]:
     out = {k: v for k, v in entry.items()
-           if k not in ("ul_rssi_history", "geo_history")}
+           if k not in ("ul_rssi_history", "geo_history", "ta_geo_history")}
     out["ul_rssi_history"] = list(entry["ul_rssi_history"])
     out["n_geo_samples"] = len(entry["geo_history"])
+    out["n_ta_samples"] = len(entry["ta_geo_history"])
     trail = list(entry["geo_history"])[-40:]
     out["trail"] = [{"lat": g["gps"]["lat"], "lon": g["gps"]["lon"],
                      "ul_rssi_dbm": g["ue"]["ul_rssi_dbm"]} for g in trail]
@@ -364,12 +392,28 @@ def _recompute_ue_position(entry: dict[str, Any]) -> None:
         "n_samples": centroid.n_samples,
         "altitude_estimated": centroid.altitude_estimated,
     }
-    motion = classify_motion(records, centroid.lat, centroid.lon)
-    entry["motion"] = {
-        "label": motion.label,
-        "corr": motion.corr,
-        "n_samples": motion.n_samples,
-        "note": motion.note,
+
+
+def _recompute_ue_position_ta(entry: dict[str, Any]) -> None:
+    """Mirror of `_recompute_ue_position` for the TA estimator.
+
+    Independent estimator (TA range-based multilateration), not a fallback —
+    runs alongside the centroid when TA-bearing UL grants are available and
+    is rendered as a separately labelled position. Stays None until the
+    solver has enough geometry to refuse-or-converge.
+    """
+    records = list(entry["ta_geo_history"])
+    if len(records) < 4:
+        return
+    res = ta_multilateration_ue(records)
+    if res is None:
+        return
+    entry["est_position_ta"] = {
+        "lat": res.lat, "lon": res.lon,
+        "alt_m": res.alt_m, "cep95_m": res.cep95_m,
+        "method": "ta_multilateration",
+        "n_samples": res.n_samples,
+        "altitude_estimated": res.altitude_estimated,
     }
 
 
@@ -567,95 +611,125 @@ def run_gpsd_loop(state: State, *, mission_id: str,
         time.sleep(1.0)
 
 
-def run_simulator(state: State, *, mission_id: str,
-                  stop: threading.Event) -> None:
-    """Drive State directly from a moving-drone simulation.
+_SIM_TICK_RE = re.compile(r"^#\s*TICK\s+t=([-\d.]+)")
 
-    Walks a box trajectory around a synthetic eNB in wall-clock time:
-    GpsFix at ~10 Hz, per-UE LTESniffer-style DCI events at ~10 Hz. The UE
-    list is the same one the demo + tests use so behaviour is consistent
-    across surfaces.
+
+def _paced_tick(line_iter: Iterator[str],
+                stop: threading.Event) -> Iterator[str]:
+    """Wall-clock-pace a `simulate.ltesniffer_lines` stream.
+
+    The simulator interleaves `# TICK t=X` markers (in simulated seconds)
+    with content lines. We sleep until wall-clock matches each TICK, then
+    pass the content lines through verbatim. Comment lines are swallowed
+    here so the downstream parser only sees the same DECODED text that
+    LTESniffer itself would emit on the wire.
     """
-    state.set_status("simulating", mission_id=mission_id)
+    t_start = time.monotonic()
+    for line in line_iter:
+        if stop.is_set():
+            return
+        m = _SIM_TICK_RE.match(line)
+        if m:
+            target = t_start + float(m.group(1))
+            while not stop.is_set():
+                delta = target - time.monotonic()
+                if delta <= 0:
+                    break
+                time.sleep(min(0.05, delta))
+            continue
+        if line.startswith("#"):
+            continue  # banner / header from simulate.* — not on the wire
+        yield line
+
+
+def _paced_fixed(line_iter: Iterator[str], period_s: float,
+                 stop: threading.Event) -> Iterator[str]:
+    """Wall-clock-pace a stream that has no TICK markers (e.g. gpsd_lines)."""
+    t_start = time.monotonic()
+    for i, line in enumerate(line_iter):
+        if stop.is_set():
+            return
+        target = t_start + i * period_s
+        while not stop.is_set():
+            delta = target - time.monotonic()
+            if delta <= 0:
+                break
+            time.sleep(min(0.05, delta))
+        yield line
+
+
+def _looped(factory: Callable[[], Iterator[str]],
+            stop: threading.Event) -> Iterator[str]:
+    """Re-invoke a finite line-generator factory until stop fires."""
+    while not stop.is_set():
+        yield from factory()
+
+
+def _build_sim_config(mission_id: str) -> SimulationConfig:
     emitter = Emitter(lat=32.0853, lon=34.7818, alt_m=25.0, pci=271,
                       center_hz=1_842_500_000, n_id_1=90, n_id_2=1,
                       tx_power_dbm=24.0)
-    ues = _default_ues(emitter)
-    trajectory = box_trajectory(emitter, half_size_m=100.0,
-                                altitudes=(15.0, 30.0, 60.0),
-                                n_per_side=20, leg_speed_mps=8.0)
-    rng = random.Random(1337)
+    waypoints = box_trajectory(emitter, half_size_m=100.0,
+                               altitudes=(15.0, 30.0, 60.0),
+                               n_per_side=20, leg_speed_mps=8.0)
+    return SimulationConfig(mission_id=mission_id,
+                            emitter=emitter, waypoints=waypoints)
 
-    gps_period = 0.1
-    ue_period = 0.1
-    detect_threshold = -115.0
-    ul_detect_threshold = -120.0
 
-    t_start_wall = time.monotonic()
-    last_gps_t = -1.0
-    last_ue_t = -1.0
-    t_total = trajectory[-1].t_offset_s
+def run_simulator(state: State, *, mission_id: str, out_dir: str,
+                  stop: threading.Event) -> None:
+    """Hardware-free producer for the dashboard.
 
+    This is the same code path as `run_ltesniffer_loop` + `run_gpsd_loop`,
+    just with synthetic upstreams instead of LTESniffer/gpspipe subprocesses:
+
+        simulate.ltesniffer_lines → parse_ltesniffer.parse_stream → _UeSightingSink → State
+        simulate.gpsd_lines       → parse_gpsd.parse_stream       → _GpsSink         → State
+
+    The wall-clock pacers below replay the simulated trajectory in real
+    time so SSE clients see events arrive at the cadence they would in a
+    real flight. The trajectory is looped indefinitely.
+    """
+    state.set_status("simulating", mission_id=mission_id)
+    os.makedirs(out_dir, exist_ok=True)
+    ue_path = os.path.join(out_dir, f"ue-{mission_id}.jsonl")
+
+    cfg = _build_sim_config(mission_id)
+    parse_args = _ParseArgs(mission_id, "sim", "sim-ltesniffer",
+                            rx_gain_db=0.0, center_hz=cfg.emitter.center_hz,
+                            sample_rate_sps=23.04e6)
+
+    def ue_worker() -> None:
+        try:
+            with open(ue_path, "a", encoding="utf-8") as fh:
+                sink = _UeSightingSink(state, jsonl_out=fh)
+                stream = _looped(
+                    lambda: _paced_tick(ltesniffer_lines(cfg), stop), stop)
+                parse_ltesniffer_stream(stream, parse_args, sink)
+        except Exception as exc:  # noqa: BLE001
+            state.set_status("error",
+                             message=f"simulator parse failed: {exc}")
+
+    def gps_worker() -> None:
+        try:
+            sink = _GpsSink(state)
+            stream = _looped(
+                lambda: _paced_fixed(gpsd_lines(cfg), cfg.gps_period_s, stop),
+                stop)
+            parse_gpsd_stream(stream, sink, mission_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+    workers = [threading.Thread(target=ue_worker, daemon=True),
+               threading.Thread(target=gps_worker, daemon=True)]
+    for t in workers:
+        t.start()
+
+    # Block until stop fires; workers exit naturally when their streams drain.
     while not stop.is_set():
-        t_sim = time.monotonic() - t_start_wall
-        if t_sim > t_total:
-            t_start_wall = time.monotonic()
-            continue
-        w = _interp_waypoint(trajectory, t_sim)
-        if w is None:
-            time.sleep(0.05)
-            continue
-
-        if t_sim - last_gps_t >= gps_period:
-            last_gps_t = t_sim
-            jlat = w.lat + rng.gauss(0.0, 5e-6)
-            jlon = w.lon + rng.gauss(0.0, 5e-6)
-            jalt = w.alt_m + rng.gauss(0.0, 0.3)
-            state.add_gps(GpsFix(lat=jlat, lon=jlon, alt_m=jalt,
-                                 fix="rtk_fix", hdop=0.6))
-
-        if t_sim - last_ue_t >= ue_period:
-            last_ue_t = t_sim
-            dl_rsrp = _rsrp_dbm(emitter, w, rng, 1.5)
-            if dl_rsrp >= detect_threshold:
-                for ue in ues:
-                    p_grant = ue.activity_rate_hz * ue_period
-                    if rng.random() >= p_grant:
-                        continue
-                    ue_pos = _ue_position(ue, t_sim)
-                    is_ul = rng.random() < ue.ul_share
-                    radio = RadioConfig(
-                        backend="sim", device="sim-ltesniffer",
-                        center_hz=emitter.center_hz, sample_rate_sps=23.04e6,
-                    )
-                    if is_ul:
-                        rssi = _ul_rssi_dbm(ue, ue_pos, w, emitter.center_hz,
-                                            rng, 1.5)
-                        if rssi < ul_detect_threshold:
-                            continue
-                        ue_ev = UeEvent(
-                            pci=emitter.pci, c_rnti=ue.c_rnti,
-                            direction="ul", dci_format="0",
-                            mcs=rng.randint(2, 24),
-                            n_prb=rng.choice([1, 2, 4, 8, 16]),
-                            ul_rssi_dbm=round(rssi, 2),
-                        )
-                    else:
-                        ue_ev = UeEvent(
-                            pci=emitter.pci, c_rnti=ue.c_rnti,
-                            direction="dl", dci_format="1A",
-                            mcs=rng.randint(4, 27),
-                            n_prb=rng.choice([2, 4, 8, 16, 25, 50]),
-                            dl_rsrp_dbm=round(dl_rsrp, 2),
-                        )
-                    state.ingest_ue(UeSighting(
-                        mission_id=mission_id, capture_id="sim-ltesniffer",
-                        ts_mono_ns=mono_ns(), ts_utc=utc_iso(),
-                        radio=radio, ue=ue_ev,
-                        notes="source=simulator",
-                    ))
-
-        time.sleep(0.03)
+        stop.wait(0.5)
+    for t in workers:
+        t.join(timeout=1.0)
 
 
 # --------------------------------------------------------------------------
@@ -672,83 +746,113 @@ _INDEX_HTML = """<!doctype html>
 <style>
 :root {
   color-scheme: dark;
-  --bg: #07090c;
-  --panel: #0f131a;
-  --panel-2: #141923;
-  --line: #1d232d;
-  --line-2: #262d3a;
-  --dim: #8a93a0;
-  --dim-2: #5a6470;
-  --txt: #e6e8eb;
-  --accent: #d9d3ff;
-  --green: #7ad9a1;
-  --yellow: #f0c270;
-  --red: #f08580;
-  --blue: #7fb9d9;
+  --bg: #04070a;
+  --panel: #080c11;
+  --panel-2: #0c1117;
+  --line: #15202c;
+  --line-2: #1f2c3b;
+  --line-3: #2a3b4f;
+  --dim: #6b7785;
+  --dim-2: #424d5b;
+  --dim-3: #2c343f;
+  --txt: #d5dce4;
+  --txt-2: #aab3bd;
+  --accent: #5dd5ff;          /* primary cyan — single accent */
+  --accent-dim: #1f4d63;
+  --green: #58c98a;
+  --yellow: #e6a851;
+  --red: #ff6d6d;
+  --blue: #5dd5ff;
+  --grid: rgba(93, 213, 255, 0.025);
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%;
-  font-family: -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
-  background: radial-gradient(1100px 700px at 80% -10%, #11161f 0%, #07090c 60%) var(--bg);
-  color: var(--txt); -webkit-font-smoothing: antialiased; font-size: 13px;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  background:
+    linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 32px 32px,
+    var(--bg);
+  color: var(--txt); -webkit-font-smoothing: antialiased; font-size: 12.5px;
 }
 body { display: flex; flex-direction: column; min-height: 100vh; }
 
 /* ---------------------------------------------------------- header */
 header {
   flex: 0 0 auto;
-  padding: 11px 20px;
-  border-bottom: 1px solid var(--line);
+  padding: 9px 18px 8px;
+  border-bottom: 1px solid var(--line-2);
   display: flex; align-items: center; justify-content: space-between;
-  gap: 16px; flex-wrap: wrap;
-  background: linear-gradient(180deg, rgba(20,25,35,0.55), rgba(15,19,26,0.3));
+  gap: 14px; flex-wrap: wrap;
+  background: var(--panel);
+  position: relative;
 }
-.brand { display: flex; align-items: center; gap: 10px; }
+header::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: -2px;
+  height: 1px; background: var(--accent-dim); opacity: 0.6;
+}
+.brand { display: flex; align-items: center; gap: 10px;
+         font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; }
 .brand .led {
-  width: 9px; height: 9px; border-radius: 50%;
-  background: var(--green); box-shadow: 0 0 0 4px rgba(122,217,161,0.14);
+  width: 7px; height: 7px;
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
 }
-header h1 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: 0.01em; }
-header h1 span { color: var(--dim); font-weight: 400; margin-left: 6px; }
-.meta { font-size: 11px; color: var(--dim); display: flex; gap: 14px;
-        flex-wrap: wrap; align-items: center; }
-.stat { display: flex; gap: 6px; align-items: baseline; text-transform: uppercase;
-        letter-spacing: 0.08em; }
-.stat strong { color: var(--txt); font-weight: 600; font-size: 14px;
-               font-variant-numeric: tabular-nums; letter-spacing: 0; text-transform: none; }
+header h1 { font-size: 12px; font-weight: 600; margin: 0;
+            letter-spacing: 0.16em; text-transform: uppercase; color: var(--txt); }
+header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
+                 letter-spacing: 0.12em; }
+.meta { font-size: 10.5px; color: var(--dim); display: flex; gap: 18px;
+        flex-wrap: wrap; align-items: center;
+        font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace; }
+.stat { display: flex; gap: 8px; align-items: baseline;
+        text-transform: uppercase; letter-spacing: 0.14em; }
+.stat strong { color: var(--txt); font-weight: 600; font-size: 13px;
+               font-variant-numeric: tabular-nums; letter-spacing: 0;
+               text-transform: none; }
 .pill {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 10px; border-radius: 999px;
-  font-size: 11px; border: 1px solid var(--line-2);
-  background: rgba(20, 25, 35, 0.5);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 3px 9px 3px 8px;
+  font-size: 10.5px; border: 1px solid var(--line-2);
+  background: var(--panel-2); color: var(--dim);
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  letter-spacing: 0.06em;
 }
-.pill .led { width: 6px; height: 6px; border-radius: 50%; background: var(--dim-2); }
-.pill.status-sniffing { color: var(--green); border-color:#1d4032; background:#0f1d18; }
-.pill.status-sniffing .led { background: var(--green); box-shadow: 0 0 0 3px rgba(122,217,161,0.18);
+.pill .led { width: 5px; height: 5px; background: var(--dim-2); }
+.pill.status-sniffing { color: var(--accent); border-color: var(--accent-dim);
+                        background: rgba(93,213,255,0.04); }
+.pill.status-sniffing .led { background: var(--accent);
+                              box-shadow: 0 0 6px var(--accent);
                               animation: pulse 1.6s ease-in-out infinite; }
-.pill.status-simulating { color: var(--yellow); border-color:#403118; background:#1f1810; }
+.pill.status-simulating { color: var(--yellow); border-color: #4a3a17; background: rgba(230,168,81,0.04); }
 .pill.status-simulating .led { background: var(--yellow); }
-.pill.status-error { color: var(--red); border-color:#4a1f1f; background:#241313; }
+.pill.status-error { color: var(--red); border-color: #4a1f1f; background: rgba(255,109,109,0.04); }
 .pill.status-error .led { background: var(--red); }
 .pill.status-idle { color: var(--dim); }
-.pill.gps-3d, .pill.gps-rtk_fix, .pill.gps-rtk_float { color: var(--green); border-color:#1d4032; }
-.pill.gps-3d .led, .pill.gps-rtk_fix .led, .pill.gps-rtk_float .led { background: var(--green); }
-.pill.gps-2d { color: var(--yellow); border-color:#403118; }
+.pill.gps-3d, .pill.gps-rtk_fix, .pill.gps-rtk_float {
+  color: var(--green); border-color: #1f4a32; background: rgba(88,201,138,0.04); }
+.pill.gps-3d .led, .pill.gps-rtk_fix .led, .pill.gps-rtk_float .led {
+  background: var(--green); box-shadow: 0 0 5px var(--green); }
+.pill.gps-2d { color: var(--yellow); border-color: #4a3a17; }
 .pill.gps-2d .led { background: var(--yellow); }
 .pill.gps-none, .pill.gps-unknown { color: var(--dim); }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
-/* ---------------------------------------------------------- banner */
+/* ---------------------------------------------------------- advisory */
 .banner {
-  margin: 10px 20px 0;
-  border: 1px solid var(--line-2);
-  background: linear-gradient(180deg, rgba(240,194,112,0.04), rgba(240,194,112,0.01));
-  color: var(--yellow);
-  font-size: 11.5px; padding: 7px 14px; border-radius: 7px;
+  margin: 0; padding: 5px 18px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line);
+  color: var(--dim); font-size: 10.5px;
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  letter-spacing: 0.04em;
   display: flex; align-items: center; gap: 10px;
 }
-.banner strong { color: #f7d99c; }
+.banner::before {
+  content: '!'; display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; border: 1px solid var(--yellow);
+  color: var(--yellow); font-weight: 700; font-size: 10px; flex-shrink: 0;
+}
+.banner strong { color: var(--yellow); font-weight: 600; letter-spacing: 0.04em; }
 .banner .dim { color: var(--dim); }
 
 /* ---------------------------------------------------------- main grid */
@@ -756,8 +860,8 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 6px; }
   flex: 1 1 auto; min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1.05fr) minmax(380px, 0.95fr);
-  gap: 14px;
-  padding: 12px 20px 16px;
+  gap: 10px;
+  padding: 10px 18px 12px;
 }
 @media (max-width: 1100px) {
   .workspace { grid-template-columns: 1fr; }
@@ -765,288 +869,402 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 6px; }
   .side { height: 60vh; min-height: 360px; }
 }
 
+/* ---------------------------------------------------------- panel chrome */
+.panel-tab {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--dim);
+}
+.panel-tab .dot {
+  width: 6px; height: 6px; background: var(--accent); flex-shrink: 0;
+}
+
 /* ---------------------------------------------------------- map */
 .map-wrap {
   position: relative;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  overflow: hidden;
-  background: #0e1116;
+  border: 1px solid var(--line-2);
+  background: var(--panel);
   min-height: 380px;
 }
+.map-wrap::before, .map-wrap::after,
+.map-wrap > .br-tl, .map-wrap > .br-tr,
+.map-wrap > .br-bl, .map-wrap > .br-br {
+  /* corner brackets */
+  position: absolute; width: 10px; height: 10px; z-index: 600;
+  pointer-events: none; border: 1px solid var(--accent);
+}
+.map-wrap::before { content: ''; top: -1px; left: -1px; border-right: none; border-bottom: none; }
+.map-wrap::after  { content: ''; top: -1px; right: -1px; border-left: none; border-bottom: none; }
+.map-wrap > .br-bl { bottom: -1px; left: -1px; border-right: none; border-top: none; }
+.map-wrap > .br-br { bottom: -1px; right: -1px; border-left: none; border-top: none; }
 #map { position: absolute; inset: 0; }
 #map.unavailable { display: flex; align-items: center; justify-content: center;
-                   color: var(--dim); font-size: 12px; padding: 16px; }
+                   color: var(--dim); font-size: 12px; padding: 16px;
+                   font-family: ui-monospace, monospace; }
 .map-overlay {
-  position: absolute; top: 12px; right: 12px; z-index: 500;
-  display: flex; flex-direction: column; gap: 4px;
-  font-family: ui-monospace, monospace; font-size: 11px;
+  position: absolute; top: 10px; right: 10px; z-index: 500;
+  display: flex; flex-direction: column; gap: 3px;
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-size: 10.5px;
   color: var(--dim);
-  background: rgba(10, 13, 19, 0.78);
-  border: 1px solid var(--line);
-  border-radius: 8px; padding: 8px 10px;
+  background: rgba(8, 12, 17, 0.88);
+  border: 1px solid var(--line-2);
+  padding: 7px 10px;
   pointer-events: none;
-  max-width: 220px;
+  max-width: 230px;
+  letter-spacing: 0.02em;
 }
-.map-overlay strong { color: var(--txt); font-weight: 600; }
+.map-overlay strong { color: var(--accent); font-weight: 600;
+                      text-transform: uppercase; letter-spacing: 0.1em;
+                      font-size: 10px; }
 .legend {
-  position: absolute; bottom: 12px; left: 12px; z-index: 500;
-  display: flex; flex-direction: column; gap: 4px;
-  font-family: ui-monospace, monospace; font-size: 11px;
-  background: rgba(10,13,19,0.78);
-  border: 1px solid var(--line);
-  border-radius: 8px; padding: 8px 10px;
+  position: absolute; bottom: 10px; left: 10px; z-index: 500;
+  display: flex; flex-direction: column; gap: 3px;
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-size: 10.5px;
+  background: rgba(8, 12, 17, 0.88);
+  border: 1px solid var(--line-2);
+  padding: 7px 10px;
   max-height: 50%; overflow: auto;
-  min-width: 130px;
+  min-width: 140px;
 }
 .legend .row { display: flex; align-items: center; gap: 8px; cursor: pointer;
-               color: var(--dim); padding: 1px 0; }
+               color: var(--dim); padding: 2px 0; letter-spacing: 0.02em; }
 .legend .row.active { color: var(--txt); }
 .legend .row:hover  { color: var(--txt); }
-.legend .row.has-pos::after { content: '●'; color: var(--green); margin-left: auto;
-                              font-size: 9px; }
-.legend .row.no-pos::after  { content: '○'; color: var(--dim-2); margin-left: auto;
-                              font-size: 9px; }
-.legend .sw { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
-.legend .label { color: var(--dim-2); font-size: 10px; text-transform: uppercase;
-                 letter-spacing: 0.06em; margin-bottom: 4px; }
+.legend .row.has-pos::after { content: 'LOC'; color: var(--green); margin-left: auto;
+                              font-size: 9px; letter-spacing: 0.1em; }
+.legend .row.has-pos-ta::after { content: 'TA'; color: var(--yellow); margin-left: auto;
+                                 font-size: 9px; letter-spacing: 0.1em; }
+.legend .row.no-pos::after  { content: '---'; color: var(--dim-2); margin-left: auto;
+                              font-size: 9px; letter-spacing: 0.1em; }
+.legend .sw { width: 8px; height: 8px; flex-shrink: 0; }
+.legend .label { color: var(--accent); font-size: 9.5px; text-transform: uppercase;
+                 letter-spacing: 0.18em; margin-bottom: 5px; font-weight: 600; }
+
+/* Leaflet tooltip override */
+.leaflet-tooltip.ue-tip {
+  background: rgba(8, 12, 17, 0.92) !important;
+  border: 1px solid var(--line-3) !important;
+  border-radius: 0 !important;
+  color: var(--txt) !important;
+  font-family: ui-monospace, "JetBrains Mono", monospace !important;
+  font-size: 10.5px !important;
+  padding: 2px 6px !important;
+  box-shadow: none !important;
+  letter-spacing: 0.02em !important;
+}
+.leaflet-tooltip.ue-tip::before { display: none !important; }
+.leaflet-control-attribution {
+  background: rgba(8, 12, 17, 0.75) !important;
+  color: var(--dim-2) !important;
+  font-size: 9px !important;
+}
+.leaflet-control-attribution a { color: var(--dim) !important; }
+.leaflet-bar a {
+  background: rgba(8, 12, 17, 0.92) !important;
+  color: var(--txt) !important;
+  border: 1px solid var(--line-2) !important;
+  border-radius: 0 !important;
+}
 
 /* ---------------------------------------------------------- side cards */
 .side {
+  position: relative;
   display: flex; flex-direction: column; min-height: 0;
-  border: 1px solid var(--line); border-radius: 10px;
-  background: linear-gradient(180deg, var(--panel) 0%, #0c1017 100%);
+  border: 1px solid var(--line-2);
+  background: var(--panel);
 }
+.side::before, .side::after,
+.side > .br-bl, .side > .br-br {
+  position: absolute; width: 10px; height: 10px; z-index: 5;
+  pointer-events: none; border: 1px solid var(--accent);
+}
+.side::before { content: ''; top: -1px; left: -1px; border-right: none; border-bottom: none; }
+.side::after  { content: ''; top: -1px; right: -1px; border-left: none; border-bottom: none; }
+.side > .br-bl { bottom: -1px; left: -1px; border-right: none; border-top: none; }
+.side > .br-br { bottom: -1px; right: -1px; border-left: none; border-top: none; }
 .side-head {
   flex: 0 0 auto;
   display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 14px; border-bottom: 1px solid var(--line);
-  font-size: 11px; color: var(--dim); text-transform: uppercase;
-  letter-spacing: 0.08em;
+  padding: 9px 14px; border-bottom: 1px solid var(--line-2);
+  font-size: 10px; color: var(--dim); text-transform: uppercase;
+  letter-spacing: 0.16em; background: var(--panel-2);
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
 }
-.side-head strong { color: var(--txt); font-weight: 600; font-size: 12px;
-                    letter-spacing: 0.04em; }
+.side-head .panel-tab strong {
+  color: var(--txt); font-weight: 600; font-size: 11px;
+  letter-spacing: 0.18em; }
+.side-head #side-sum {
+  color: var(--dim); font-size: 10px; letter-spacing: 0.08em;
+  font-variant-numeric: tabular-nums;
+}
 .cards { flex: 1 1 auto; overflow-y: auto; padding: 10px; }
+.cards::-webkit-scrollbar { width: 8px; }
+.cards::-webkit-scrollbar-track { background: transparent; }
+.cards::-webkit-scrollbar-thumb { background: var(--line-2); }
+.cards::-webkit-scrollbar-thumb:hover { background: var(--line-3); }
 .empty {
   margin: 16px; padding: 28px 18px; text-align: center;
-  border: 1px dashed var(--line-2); border-radius: 8px;
-  color: var(--dim); font-size: 12px; line-height: 1.6;
+  border: 1px dashed var(--line-2);
+  color: var(--dim); font-size: 11.5px; line-height: 1.65;
+  font-family: ui-monospace, monospace; letter-spacing: 0.02em;
 }
-.empty .hint { color: var(--dim-2); font-size: 11px; margin-top: 6px; }
+.empty .hint { color: var(--dim-2); font-size: 10.5px; margin-top: 8px;
+               font-family: inherit; }
 
 .card {
   position: relative;
-  background: linear-gradient(180deg, var(--panel-2) 0%, var(--panel) 100%);
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--ue-color, var(--dim-2));
-  border-radius: 8px;
-  padding: 12px 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--line-2);
+  padding: 11px 13px 12px;
   margin-bottom: 8px;
   cursor: pointer;
-  transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.12s ease;
+  transition: border-color 0.12s ease, background 0.12s ease;
 }
-.card:hover { border-color: var(--line-2); }
+.card::before {
+  content: ''; position: absolute; top: 0; left: 0; bottom: 0;
+  width: 2px; background: var(--ue-color, var(--dim-2));
+}
+.card:hover { border-color: var(--line-3); background: #0e1419; }
 .card.selected {
   border-color: var(--ue-color, var(--accent));
-  box-shadow: 0 0 0 1px var(--ue-color, var(--accent)) inset,
-              0 6px 22px -14px var(--ue-color, var(--accent));
+  background: #0e1419;
 }
-.card.fresh { animation: flash 1.4s ease; }
+.card.selected::after {
+  content: ''; position: absolute;
+  top: -1px; right: -1px; width: 8px; height: 8px;
+  border-top: 1px solid var(--ue-color, var(--accent));
+  border-right: 1px solid var(--ue-color, var(--accent));
+}
+.card.fresh { animation: flash 1.2s ease; }
 @keyframes flash {
-  0%   { background: linear-gradient(180deg, #1c2031, #16192a); }
-  100% { background: linear-gradient(180deg, var(--panel-2), var(--panel)); }
+  0%   { background: rgba(93, 213, 255, 0.08); }
+  100% { background: var(--panel-2); }
 }
 .card .head {
   display: flex; justify-content: space-between; align-items: center; gap: 10px;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
-.identity { display: flex; align-items: center; gap: 8px; }
+.identity { display: flex; align-items: center; gap: 9px; }
 .identity .sw {
-  width: 10px; height: 10px; border-radius: 50%;
+  width: 9px; height: 9px;
   background: var(--ue-color, var(--dim-2));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ue-color, transparent) 22%, transparent);
+  box-shadow: 0 0 4px var(--ue-color, transparent);
 }
 .crnti {
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-weight: 700; font-size: 18px; color: var(--txt);
-  letter-spacing: 0.01em;
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-weight: 600; font-size: 17px; color: var(--txt);
+  letter-spacing: 0.02em;
 }
 .pci-tag {
-  font-size: 10px; padding: 2px 8px; border-radius: 4px;
-  background: rgba(127,185,217,0.12); color: var(--blue);
-  font-family: ui-monospace, monospace; font-weight: 500;
-  border: 1px solid rgba(127,185,217,0.22);
+  font-size: 9.5px; padding: 2px 7px;
+  background: transparent; color: var(--accent);
+  font-family: ui-monospace, "JetBrains Mono", monospace; font-weight: 500;
+  border: 1px solid var(--accent-dim);
+  letter-spacing: 0.1em; text-transform: uppercase;
 }
-.seen { font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.seen { font-size: 10.5px; color: var(--dim); font-variant-numeric: tabular-nums;
+        font-family: ui-monospace, "JetBrains Mono", monospace; letter-spacing: 0.04em; }
 .cell {
-  font-size: 10px; color: var(--dim-2); margin-top: 1px;
-  text-transform: uppercase; letter-spacing: 0.06em;
+  font-size: 9.5px; color: var(--dim-2); margin-top: 2px;
+  text-transform: uppercase; letter-spacing: 0.14em;
+  font-family: ui-monospace, "JetBrains Mono", monospace;
 }
+.cell::before { content: 'F · '; color: var(--dim-2); }
 .metrics {
   display: grid; grid-template-columns: 1fr auto; gap: 12px;
-  align-items: end; margin: 10px 0 2px;
+  align-items: end; margin: 9px 0 2px;
 }
-.metric-rssi { display: flex; flex-direction: column; gap: 1px; }
+.metric-rssi { display: flex; flex-direction: column; gap: 2px; }
 .metric-rssi .label {
-  font-size: 10px; color: var(--dim); text-transform: uppercase;
-  letter-spacing: 0.06em;
+  font-size: 9.5px; color: var(--dim); text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-family: ui-monospace, "JetBrains Mono", monospace;
 }
 .metric-rssi .value {
-  font-size: 22px; font-weight: 600; letter-spacing: -0.02em;
+  font-size: 21px; font-weight: 500; letter-spacing: -0.01em;
   font-variant-numeric: tabular-nums;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
 }
-.metric-rssi .value .unit { font-size: 11px; color: var(--dim);
-                            margin-left: 4px; font-weight: 400; }
+.metric-rssi .value .unit { font-size: 10px; color: var(--dim);
+                            margin-left: 5px; font-weight: 400;
+                            letter-spacing: 0.08em; text-transform: uppercase; }
 .rsrp-strong { color: var(--green); }
 .rsrp-mid    { color: var(--yellow); }
 .rsrp-weak   { color: var(--red); }
-.rsrp-none   { color: var(--dim); font-size: 15px; }
-.spark { width: 130px; height: 36px; }
-.spark .fill { fill: var(--ue-color, var(--blue)); fill-opacity: 0.12; }
-.spark .line { stroke: var(--ue-color, var(--blue)); stroke-width: 1.6;
-               fill: none; stroke-linejoin: round; stroke-linecap: round; }
+.rsrp-none   { color: var(--dim); font-size: 14px; }
+.spark { width: 132px; height: 38px;
+         background: rgba(93,213,255,0.02);
+         border: 1px solid var(--line); }
+.spark .fill { fill: var(--ue-color, var(--accent)); fill-opacity: 0.07; }
+.spark .line { stroke: var(--ue-color, var(--accent)); stroke-width: 1.2;
+               fill: none; stroke-linejoin: miter; stroke-linecap: square; }
+.spark .grid { stroke: var(--line-2); stroke-width: 0.5; fill: none;
+               stroke-dasharray: 2 3; }
 
 .position {
-  margin-top: 10px;
-  background: rgba(10,13,19,0.55);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 8px 10px;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12px; color: var(--txt);
+  margin-top: 9px;
+  background: rgba(8, 12, 17, 0.55);
+  border: 1px solid var(--line-2);
+  padding: 7px 10px;
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-size: 11.5px; color: var(--txt);
   display: flex; flex-direction: column; gap: 3px;
+  position: relative;
 }
-.position .row1 { display: flex; align-items: baseline; gap: 8px; }
-.position .latlon { font-weight: 600; }
-.position .cep { color: var(--dim); font-size: 11px; }
-.position .meta-row { color: var(--dim); font-size: 10.5px;
-                      letter-spacing: 0.02em; }
-.position.no-pos { color: var(--dim-2); font-style: italic;
-                   font-size: 11px; background: transparent; border-style: dashed; }
+.position::before {
+  content: 'EST · LAT/LON'; position: absolute;
+  top: -7px; left: 8px; padding: 0 5px;
+  background: var(--panel-2);
+  color: var(--accent); font-size: 8.5px;
+  letter-spacing: 0.18em; text-transform: uppercase;
+}
+.position .row1 { display: flex; align-items: baseline; gap: 8px; margin-top: 2px; }
+.position .latlon { font-weight: 600; letter-spacing: 0.02em; }
+.position .cep { color: var(--dim); font-size: 10.5px; }
+.position .meta-row { color: var(--dim); font-size: 10px;
+                      letter-spacing: 0.06em; text-transform: uppercase; }
+.position.no-pos { color: var(--dim-2);
+                   font-size: 10.5px; border-style: dashed;
+                   background: transparent; }
+.position.no-pos::before { content: 'NO FIX'; color: var(--dim); }
 .position.no-pos .latlon { color: var(--dim); font-weight: normal; }
 
 .foot {
-  margin-top: 8px;
-  display: flex; flex-wrap: wrap; gap: 6px;
-  font-size: 11px; color: var(--dim);
-  font-family: ui-monospace, monospace;
+  margin-top: 9px;
+  display: flex; flex-wrap: wrap; gap: 4px;
+  font-size: 10px; color: var(--dim);
+  font-family: ui-monospace, "JetBrains Mono", monospace;
 }
 .chip {
-  display: inline-block; padding: 1px 7px; border-radius: 4px;
-  font-size: 10.5px;
-  background: rgba(255,255,255,0.03);
-  border: 1px solid var(--line);
+  display: inline-block; padding: 1px 6px;
+  font-size: 10px; letter-spacing: 0.08em;
+  background: transparent;
+  border: 1px solid var(--line-2);
+  color: var(--dim);
 }
-.chip.ul  { color: var(--blue); border-color: rgba(127,185,217,0.22); }
-.chip.dl  { color: #b4b8d9; border-color: rgba(180,184,217,0.18); }
-.chip.dci { color: #d9a280; border-color: rgba(217,162,128,0.22); }
+.chip.ul  { color: var(--accent); border-color: var(--accent-dim); }
+.chip.dl  { color: #aab3bd; border-color: var(--line-3); }
+.chip.dci { color: var(--yellow); border-color: #4a3a17; }
 .chip.plain { color: var(--dim); }
-.chip.motion-stationary { color: var(--green); border-color: rgba(122,217,161,0.28);
-                          background: rgba(122,217,161,0.06); }
-.chip.motion-mobile     { color: var(--yellow); border-color: rgba(240,194,112,0.32);
-                          background: rgba(240,194,112,0.06); }
-.chip.motion-indeterminate { color: var(--dim); }
 
 /* ---------------------------------------------------------- scrubber */
 .scrubber {
   flex: 0 0 auto;
   display: flex; align-items: center; gap: 12px;
-  padding: 9px 20px;
-  border-top: 1px solid var(--line);
-  background: linear-gradient(180deg, rgba(20,25,35,0.55), rgba(15,19,26,0.3));
-  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
+  padding: 8px 18px;
+  border-top: 1px solid var(--line-2);
+  background: var(--panel);
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-size: 10.5px;
   color: var(--dim);
 }
 .scrubber.replay {
-  background: linear-gradient(180deg, rgba(240,194,112,0.06), rgba(15,19,26,0.3));
-  border-top-color: rgba(240,194,112,0.28);
+  background: rgba(230,168,81,0.04);
+  border-top-color: rgba(230,168,81,0.4);
 }
 .scrubber .live-btn {
-  font-family: inherit; font-size: 11px; padding: 4px 12px;
-  border-radius: 999px; border: 1px solid rgba(122,217,161,0.3);
-  background: rgba(20,25,35,0.5); color: var(--green); cursor: pointer;
-  letter-spacing: 0.06em; transition: background 0.15s, color 0.15s;
-  display: inline-flex; align-items: center; gap: 6px;
+  font-family: inherit; font-size: 10px;
+  padding: 4px 11px;
+  border: 1px solid var(--accent-dim);
+  background: transparent; color: var(--accent); cursor: pointer;
+  letter-spacing: 0.18em; text-transform: uppercase;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  display: inline-flex; align-items: center; gap: 7px;
 }
-.scrubber.replay .live-btn { color: var(--yellow); border-color: rgba(240,194,112,0.4); }
-.scrubber .live-btn:hover { background: rgba(122,217,161,0.08); }
-.scrubber.replay .live-btn:hover { background: rgba(240,194,112,0.08); }
+.scrubber.replay .live-btn { color: var(--yellow); border-color: rgba(230,168,81,0.4); }
+.scrubber .live-btn:hover { background: rgba(93,213,255,0.06); }
+.scrubber.replay .live-btn:hover { background: rgba(230,168,81,0.06); }
 .scrubber .live-btn .led {
-  width: 7px; height: 7px; border-radius: 50%; background: var(--green);
-  box-shadow: 0 0 0 3px rgba(122,217,161,0.18);
+  width: 6px; height: 6px; background: var(--accent);
+  box-shadow: 0 0 5px var(--accent);
   animation: pulse 1.6s ease-in-out infinite;
 }
-.scrubber.replay .live-btn .led { background: var(--yellow); box-shadow: 0 0 0 3px rgba(240,194,112,0.18);
+.scrubber.replay .live-btn .led { background: var(--yellow); box-shadow: 0 0 4px var(--yellow);
                                   animation: none; }
 .scrubber input[type=range] {
-  flex: 1 1 auto; appearance: none; height: 4px; border-radius: 999px;
+  flex: 1 1 auto; appearance: none; height: 2px;
   background: var(--line-2);
   cursor: pointer; outline: none;
 }
 .scrubber input[type=range]::-webkit-slider-thumb {
-  appearance: none; width: 14px; height: 14px; border-radius: 50%;
-  background: var(--txt); border: 2px solid var(--green); cursor: grab;
+  appearance: none; width: 10px; height: 14px;
+  background: var(--accent); border: none; cursor: grab;
 }
-.scrubber.replay input[type=range]::-webkit-slider-thumb { border-color: var(--yellow); }
+.scrubber.replay input[type=range]::-webkit-slider-thumb { background: var(--yellow); }
 .scrubber input[type=range]:active::-webkit-slider-thumb { cursor: grabbing; }
-.scrubber .lbl { text-transform: uppercase; letter-spacing: 0.08em;
-                 font-size: 10px; color: var(--dim-2); }
-.scrubber .time { color: var(--txt); font-variant-numeric: tabular-nums; min-width: 78px; }
+.scrubber .lbl { text-transform: uppercase; letter-spacing: 0.18em;
+                 font-size: 9.5px; color: var(--dim-2); }
+.scrubber .time { color: var(--txt); font-variant-numeric: tabular-nums;
+                  min-width: 78px; letter-spacing: 0.04em; }
 
 /* ---------------------------------------------------------- log */
 footer {
   flex: 0 0 auto;
-  padding: 7px 20px;
-  border-top: 1px solid var(--line);
-  font-family: ui-monospace, monospace; font-size: 11px;
+  padding: 6px 18px 8px;
+  border-top: 1px solid var(--line-2);
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-size: 10.5px;
   color: var(--dim);
   max-height: 120px; overflow-y: auto;
-  background: rgba(10,13,19,0.4);
+  background: var(--panel);
+  position: relative;
 }
-footer .row { padding: 1px 0; }
-footer .row .ts { color: var(--dim-2); margin-right: 8px; }
-footer .row b { color: var(--txt); font-weight: 600; }
+footer::before {
+  content: 'TELEMETRY'; position: absolute;
+  top: -7px; left: 14px; padding: 0 6px;
+  background: var(--bg); color: var(--accent);
+  font-size: 9px; letter-spacing: 0.22em; font-weight: 600;
+}
+footer::-webkit-scrollbar { width: 6px; }
+footer::-webkit-scrollbar-track { background: transparent; }
+footer::-webkit-scrollbar-thumb { background: var(--line-2); }
+footer .row { padding: 1px 0; letter-spacing: 0.02em; }
+footer .row .ts { color: var(--dim-2); margin-right: 10px; }
+footer .row b { color: var(--accent); font-weight: 600; }
 </style>
 </head><body>
 <header>
   <div class="brand">
     <span class="led"></span>
-    <h1>Cellular drones <span>· passive UE sniffer</span></h1>
+    <h1>CELLULAR-DRONES <span>// UE INTERCEPT</span></h1>
   </div>
   <div class="meta">
-    <div class="stat">UEs <strong id="n-ues">0</strong></div>
-    <div class="stat">positioned <strong id="n-pos">0</strong></div>
-    <div class="stat">grants <strong id="n-ue-sightings">0</strong></div>
-    <div class="stat">uptime <strong id="uptime">0s</strong></div>
-    <span class="pill gps-unknown" id="gps"><span class="led"></span><span id="gps-text">GPS: —</span></span>
-    <span class="pill status-idle" id="status"><span class="led"></span><span id="status-text">idle</span></span>
+    <div class="stat">CONTACTS <strong id="n-ues">0</strong></div>
+    <div class="stat">LOC <strong id="n-pos">0</strong></div>
+    <div class="stat">GRANTS <strong id="n-ue-sightings">0</strong></div>
+    <div class="stat">T+ <strong id="uptime">0s</strong></div>
+    <span class="pill gps-unknown" id="gps"><span class="led"></span><span id="gps-text">NAV —</span></span>
+    <span class="pill status-idle" id="status"><span class="led"></span><span id="status-text">IDLE</span></span>
   </div>
 </header>
 <div class="banner">
-  <strong>C-RNTI is connection-scoped, not subscriber-scoped.</strong>
-  <span class="dim">A handset that re-attaches will be reissued a new C-RNTI.
-  Positions use UL grants only — DL grants come from the eNB.</span>
+  <strong>C-RNTI IS CONNECTION-SCOPED.</strong>
+  <span class="dim">A handset that re-attaches will be reissued a new C-RNTI · positions use UL grants only · DL grants are eNB-side.</span>
 </div>
 <div class="workspace">
   <div class="map-wrap">
+    <span class="br-bl"></span><span class="br-br"></span>
     <div id="map"></div>
-    <div class="map-overlay" id="map-overlay">map · waiting for GPS</div>
+    <div class="map-overlay" id="map-overlay"><strong>NAV</strong> · waiting for fix</div>
     <div class="legend" id="legend" style="display:none">
-      <div class="label">UEs on map</div>
+      <div class="label">// TRACKED</div>
       <div id="legend-rows"></div>
     </div>
   </div>
   <aside class="side">
+    <span class="br-bl"></span><span class="br-br"></span>
     <div class="side-head">
-      <strong>UEs · live</strong>
+      <span class="panel-tab"><span class="dot"></span><strong>TARGETS</strong></span>
       <span id="side-sum">—</span>
     </div>
     <div class="cards" id="cards">
       <div class="empty" id="empty">
-        Waiting for the first PDCCH decode.
-        <div class="hint">UEs appear here with their C-RNTI, live signal trend,
-        and position estimate as UL grants and GPS fixes accumulate.</div>
+        // STANDBY · awaiting first PDCCH decode
+        <div class="hint">Contacts populate as UL grants and GPS fixes accumulate.<br>
+        Each row: C-RNTI · cell · live signal trend · position estimate.</div>
       </div>
     </div>
   </aside>
@@ -1055,7 +1273,7 @@ footer .row b { color: var(--txt); font-weight: 600; }
   <button class="live-btn" id="live-btn" type="button">
     <span class="led"></span><span id="live-btn-text">LIVE</span>
   </button>
-  <span class="lbl">replay</span>
+  <span class="lbl">REPLAY</span>
   <input type="range" id="scrub-range" min="0" max="1" value="1" step="0.001" disabled>
   <span class="time" id="scrub-time">—</span>
 </div>
@@ -1080,9 +1298,10 @@ const legendRows  = document.getElementById('legend-rows');
 const sideSumEl   = document.getElementById('side-sum');
 
 // Stable per-UE color so map markers, card accents and legend agree.
+// Palette: cool-leaning, single-cyan-accent vibe (no rainbow).
 const PALETTE = [
-  '#7fb9d9', '#d9a280', '#a8d97f', '#d97fa8', '#d9d37f',
-  '#9aa0d0', '#80c9d9', '#d9805a', '#a9d9bb', '#c8a3d9',
+  '#5dd5ff', '#e6a851', '#58c98a', '#ff8a6d', '#a89dff',
+  '#7fb9d9', '#d9a86d', '#74d4be', '#d97fa8', '#9bb0c5',
 ];
 function colorFor(key) {
   let h = 0;
@@ -1110,7 +1329,7 @@ function initMapIfReady(centerLat, centerLon) {
     maxZoom: 19, subdomains: 'abc',
     attribution: '© OpenStreetMap, © CARTO',
   }).addTo(map);
-  droneTrailLine = L.polyline(droneTrail, { color:'#7ea2c8', weight:2, opacity:0.7 }).addTo(map);
+  droneTrailLine = L.polyline(droneTrail, { color:'#5dd5ff', weight:1.5, opacity:0.55, dashArray:'4 4' }).addTo(map);
   ues.forEach((u) => updateUeLayer(u));
 }
 function leafletUnavailable() {
@@ -1125,8 +1344,8 @@ function updateDroneMarker() {
   const g = latestGps.gps;
   if (!droneMarker) {
     droneMarker = L.circleMarker([g.lat, g.lon], {
-      radius: 6, color:'#d9e6f7', weight:2, fillColor:'#5a8fd9', fillOpacity:0.9,
-    }).addTo(map).bindTooltip('drone', {permanent:false, direction:'top'});
+      radius: 5, color:'#5dd5ff', weight:2, fillColor:'#04070a', fillOpacity:1,
+    }).addTo(map).bindTooltip('SELF', {permanent:false, direction:'top', className:'ue-tip'});
     map.setView([g.lat, g.lon], Math.max(map.getZoom(), 17));
   } else {
     droneMarker.setLatLng([g.lat, g.lon]);
@@ -1141,44 +1360,92 @@ function updateDroneMarker() {
 function updateUeLayer(u) {
   if (!map) return;
   const p = u.est_position;
+  const pTa = u.est_position_ta;
   const color = colorFor(u.key);
   let layer = ueLayers.get(u.key);
-  if (!p) {
-    // No estimate yet — make sure any stale marker is removed.
+  if (!p && !pTa) {
+    // No estimate of either kind — drop any stale layer.
     if (layer) {
-      map.removeLayer(layer.marker);
-      map.removeLayer(layer.accuracy);
+      if (layer.marker) map.removeLayer(layer.marker);
+      if (layer.accuracy) map.removeLayer(layer.accuracy);
+      if (layer.markerTa) map.removeLayer(layer.markerTa);
+      if (layer.accuracyTa) map.removeLayer(layer.accuracyTa);
       ueLayers.delete(u.key);
     }
     return;
   }
-  const selected = (u.key === selectedKey);
-  const markerOpts = {
-    radius: selected ? 10 : 7,
-    color: color, weight: selected ? 3 : 2,
-    fillColor: color, fillOpacity: selected ? 0.75 : 0.55,
-  };
   if (!layer) {
-    const marker = L.circleMarker([p.lat, p.lon], markerOpts).addTo(map);
-    marker.bindTooltip(u.c_rnti_hex,
-      {permanent: true, direction: 'right', offset: [10, 0], className: 'ue-tip'});
-    marker.on('click', () => selectUe(u.key, true));
-    const accuracy = L.circle([p.lat, p.lon], {
-      radius: Math.max(2, p.cep95_m || 5),
-      color: color, weight: 1, opacity: 0.5,
-      fillColor: color, fillOpacity: 0.06,
-      dashArray: '4 3',
-    }).addTo(map);
-    layer = {marker, accuracy};
+    layer = {};
     ueLayers.set(u.key, layer);
-  } else {
-    layer.marker.setLatLng([p.lat, p.lon]);
-    layer.marker.setStyle(markerOpts);
-    layer.accuracy.setLatLng([p.lat, p.lon]);
-    layer.accuracy.setRadius(Math.max(2, p.cep95_m || 5));
-    layer.accuracy.setStyle({color: color, fillColor: color,
-                             opacity: selected ? 0.85 : 0.5,
-                             fillOpacity: selected ? 0.12 : 0.06});
+  }
+  const selected = (u.key === selectedKey);
+
+  // --- Centroid estimate (filled marker) ---------------------------------
+  if (p) {
+    const markerOpts = {
+      radius: selected ? 10 : 7,
+      color: color, weight: selected ? 3 : 2,
+      fillColor: color, fillOpacity: selected ? 0.75 : 0.55,
+    };
+    if (!layer.marker) {
+      layer.marker = L.circleMarker([p.lat, p.lon], markerOpts).addTo(map);
+      layer.marker.bindTooltip(u.c_rnti_hex,
+        {permanent: true, direction: 'right', offset: [10, 0], className: 'ue-tip'});
+      layer.marker.on('click', () => selectUe(u.key, true));
+      layer.accuracy = L.circle([p.lat, p.lon], {
+        radius: Math.max(2, p.cep95_m || 5),
+        color: color, weight: 1, opacity: 0.5,
+        fillColor: color, fillOpacity: 0.06,
+        dashArray: '4 3',
+      }).addTo(map);
+    } else {
+      layer.marker.setLatLng([p.lat, p.lon]);
+      layer.marker.setStyle(markerOpts);
+      layer.accuracy.setLatLng([p.lat, p.lon]);
+      layer.accuracy.setRadius(Math.max(2, p.cep95_m || 5));
+      layer.accuracy.setStyle({color: color, fillColor: color,
+                               opacity: selected ? 0.85 : 0.5,
+                               fillOpacity: selected ? 0.12 : 0.06});
+    }
+  } else if (layer.marker) {
+    map.removeLayer(layer.marker); delete layer.marker;
+    map.removeLayer(layer.accuracy); delete layer.accuracy;
+  }
+
+  // --- TA estimate (hollow dashed marker) --------------------------------
+  // Rendered alongside, not in place of, the centroid. The two estimators
+  // are independent; the dashboard does not pick a winner.
+  if (pTa) {
+    const taOpts = {
+      radius: selected ? 9 : 6,
+      color: color, weight: selected ? 3 : 2,
+      fillOpacity: 0,
+      dashArray: '3 3',
+    };
+    if (!layer.markerTa) {
+      layer.markerTa = L.circleMarker([pTa.lat, pTa.lon], taOpts).addTo(map);
+      // Anchor the C-RNTI tooltip to the centroid marker when both are
+      // present; only label the TA marker if it's standing alone.
+      if (!layer.marker) {
+        layer.markerTa.bindTooltip(u.c_rnti_hex + ' · TA',
+          {permanent: true, direction: 'right', offset: [10, 0], className: 'ue-tip'});
+        layer.markerTa.on('click', () => selectUe(u.key, true));
+      }
+      layer.accuracyTa = L.circle([pTa.lat, pTa.lon], {
+        radius: Math.max(2, pTa.cep95_m || 5),
+        color: color, weight: 1, opacity: 0.4,
+        fill: false,
+        dashArray: '2 4',
+      }).addTo(map);
+    } else {
+      layer.markerTa.setLatLng([pTa.lat, pTa.lon]);
+      layer.markerTa.setStyle(taOpts);
+      layer.accuracyTa.setLatLng([pTa.lat, pTa.lon]);
+      layer.accuracyTa.setRadius(Math.max(2, pTa.cep95_m || 5));
+    }
+  } else if (layer.markerTa) {
+    map.removeLayer(layer.markerTa); delete layer.markerTa;
+    map.removeLayer(layer.accuracyTa); delete layer.accuracyTa;
   }
 }
 function refreshAllLayers() {
@@ -1196,7 +1463,8 @@ function renderMapOverlay() {
     return;
   }
   const g = latestGps.gps;
-  const positioned = [...ues.values()].filter(u => u.est_position).length;
+  const positioned = [...ues.values()]
+    .filter(u => u.est_position || u.est_position_ta).length;
   mapOverlay.innerHTML =
     `<div><strong>drone</strong> ${g.lat.toFixed(5)}, ${g.lon.toFixed(5)}</div>` +
     `<div>trail ${droneTrail.length} pts · ${positioned}/${ues.size} positioned</div>`;
@@ -1207,8 +1475,12 @@ function renderLegend() {
   const items = [...ues.values()].sort((a, b) => (b.ul_count || 0) - (a.ul_count || 0));
   legendRows.innerHTML = items.map(u => {
     const c = colorFor(u.key);
-    const cls = ['row',
-                 u.est_position ? 'has-pos' : 'no-pos',
+    // 'has-pos' wins when both estimates are present; falls back to
+    // 'has-pos-ta' for TA-only UEs so they still register as positioned.
+    const posCls = u.est_position ? 'has-pos'
+                 : u.est_position_ta ? 'has-pos-ta'
+                 : 'no-pos';
+    const cls = ['row', posCls,
                  u.key === selectedKey ? 'active' : ''].join(' ');
     return `<div class="${cls}" data-key="${u.key}">
               <span class="sw" style="background:${c}"></span>
@@ -1271,7 +1543,17 @@ function sparkSvg(history, color) {
 }
 function positionBlock(u) {
   const p = u.est_position;
-  if (!p) {
+  const pTa = u.est_position_ta;
+  function row(label, est) {
+    const cep = est.cep95_m != null ? `±${est.cep95_m.toFixed(1)} m` : '';
+    const alt = est.alt_m != null ? `, ${est.alt_m.toFixed(0)} m AGL` : '';
+    return `<div class="row1">
+              <span class="latlon">${label}${est.lat.toFixed(6)}, ${est.lon.toFixed(6)}</span>
+              <span class="cep">${cep}</span>
+            </div>
+            <div class="meta-row">${est.method} · ${est.n_samples} samples${alt}</div>`;
+  }
+  if (!p && !pTa) {
     let why;
     if (!latestGps) why = 'no GPS fix yet';
     else if ((u.ul_count || 0) < 2) why = `need ≥ 2 UL grants (have ${u.ul_count || 0})`;
@@ -1282,15 +1564,11 @@ function positionBlock(u) {
               <div class="meta-row">${why}</div>
             </div>`;
   }
-  const cep = p.cep95_m != null ? `±${p.cep95_m.toFixed(1)} m` : '';
-  const alt = p.alt_m != null ? `, ${p.alt_m.toFixed(0)} m AGL` : '';
-  return `<div class="position">
-            <div class="row1">
-              <span class="latlon">${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}</span>
-              <span class="cep">${cep}</span>
-            </div>
-            <div class="meta-row">${p.method} · ${p.n_samples} UL samples${alt}</div>
-          </div>`;
+  let body = '';
+  // Two independent estimators, each labelled; not a primary/fallback.
+  if (p) body += row(p && pTa ? 'RSSI · ' : '', p);
+  if (pTa) body += row('TA · ', pTa);
+  return `<div class="position">${body}</div>`;
 }
 function renderCard(u) {
   const color = colorFor(u.key);
@@ -1317,9 +1595,6 @@ function renderCard(u) {
   const mcs = u.mcs    != null ? `<span class="chip plain">MCS ${u.mcs}</span>` : '';
   const prb = u.n_prb  != null ? `<span class="chip plain">${u.n_prb} PRB</span>` : '';
   const tbs = u.tbs_bytes != null ? `<span class="chip plain">${u.tbs_bytes} B</span>` : '';
-  const motion = u.motion && u.motion.label
-    ? `<span class="chip motion-${u.motion.label}" title="${u.motion.note || ''}">${u.motion.label}</span>`
-    : '';
 
   card.innerHTML = `
     <div class="head">
@@ -1339,7 +1614,7 @@ function renderCard(u) {
       ${sparkSvg(u.ul_rssi_history, color)}
     </div>
     ${positionBlock(u)}
-    <div class="foot">${motion}${ulChip}${dlChip}${dciTags}${mcs}${prb}${tbs}</div>
+    <div class="foot">${ulChip}${dlChip}${dciTags}${mcs}${prb}${tbs}</div>
   `;
   if (!isNew) {
     card.classList.remove('fresh');
@@ -1349,8 +1624,8 @@ function renderCard(u) {
 }
 function sortCards() {
   const sorted = [...ues.values()].sort((a, b) => {
-    const ap = a.est_position ? 0 : 1;
-    const bp = b.est_position ? 0 : 1;
+    const ap = (a.est_position || a.est_position_ta) ? 0 : 1;
+    const bp = (b.est_position || b.est_position_ta) ? 0 : 1;
     if (ap !== bp) return ap - bp;
     if ((b.ul_count || 0) !== (a.ul_count || 0))
       return (b.ul_count || 0) - (a.ul_count || 0);
@@ -1414,7 +1689,7 @@ function logLine(html) {
 
 function updateSummary() {
   let positioned = 0;
-  ues.forEach(u => { if (u.est_position) positioned += 1; });
+  ues.forEach(u => { if (u.est_position || u.est_position_ta) positioned += 1; });
   nUesEl.textContent = ues.size;
   nPosEl.textContent = positioned;
   nGrantsEl.textContent = totalUeSightings;
@@ -1427,8 +1702,11 @@ function applyEvent(ev) {
   if (ev.type === 'snapshot') {
     ues.clear();
     [...cardsEl.querySelectorAll('.card')].forEach(c => c.remove());
-    ueLayers.forEach(({marker, accuracy}) => {
-      if (map) { map.removeLayer(marker); map.removeLayer(accuracy); }
+    ueLayers.forEach(layer => {
+      if (!map) return;
+      ['marker', 'accuracy', 'markerTa', 'accuracyTa'].forEach(k => {
+        if (layer[k]) map.removeLayer(layer[k]);
+      });
     });
     ueLayers.clear();
     droneTrail.length = 0;
@@ -1444,8 +1722,10 @@ function applyEvent(ev) {
     renderCard(u);
     updateUeLayer(u);
     totalUeSightings += 1;
-    const pos = u.est_position
-      ? ` · est ${u.est_position.lat.toFixed(5)},${u.est_position.lon.toFixed(5)} ±${u.est_position.cep95_m.toFixed(0)}m`
+    const est = u.est_position || u.est_position_ta;
+    const tag = u.est_position ? 'rssi' : (u.est_position_ta ? 'ta' : '');
+    const pos = est
+      ? ` · ${tag} ${est.lat.toFixed(5)},${est.lon.toFixed(5)} ±${est.cep95_m.toFixed(0)}m`
       : '';
     logLine(`<b>${u.c_rnti_hex}</b> PCI ${u.pci} · UL ${fmt(u.ul_rssi_dbm, ' dBm')}${pos}`);
   } else if (ev.type === 'gps') {
@@ -1663,6 +1943,15 @@ def main() -> int:
                         "not canonical DECODED key=value)")
     args = p.parse_args()
 
+    # `--simulate` is off by default: the dashboard refuses to start with
+    # no producer configured rather than silently sitting empty (or worse,
+    # quietly entering simulation when real radio was expected).
+    if not args.simulate and not args.ltesniffer_cmd:
+        print("sniffer.live needs --simulate or --ltesniffer-cmd. "
+              "Use the `sniffer live` CLI wrapper, which validates this.",
+              file=sys.stderr)
+        return 2
+
     state = State()
     stop = threading.Event()
     threads: list[threading.Thread] = []
@@ -1670,22 +1959,22 @@ def main() -> int:
     if args.simulate:
         threads.append(threading.Thread(
             target=run_simulator,
-            kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
+            kwargs=dict(state=state, mission_id=args.mission_id,
+                        out_dir=args.out_dir, stop=stop),
             daemon=True,
         ))
     else:
-        if args.ltesniffer_cmd:
-            cmd = args.ltesniffer_cmd.split()
-            threads.append(threading.Thread(
-                target=run_ltesniffer_loop,
-                kwargs=dict(
-                    state=state, ltesniffer_cmd=cmd,
-                    mission_id=args.mission_id, out_dir=args.out_dir,
-                    center_hz=args.center_hz, rx_gain_db=args.rx_gain_db,
-                    stop=stop, normalize=args.normalize_ltesniffer,
-                ),
-                daemon=True,
-            ))
+        cmd = args.ltesniffer_cmd.split()
+        threads.append(threading.Thread(
+            target=run_ltesniffer_loop,
+            kwargs=dict(
+                state=state, ltesniffer_cmd=cmd,
+                mission_id=args.mission_id, out_dir=args.out_dir,
+                center_hz=args.center_hz, rx_gain_db=args.rx_gain_db,
+                stop=stop, normalize=args.normalize_ltesniffer,
+            ),
+            daemon=True,
+        ))
         threads.append(threading.Thread(
             target=run_gpsd_loop,
             kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
@@ -1707,15 +1996,13 @@ def main() -> int:
     url = f"http://{args.host}:{args.port}/"
     print(f"live dashboard: {url}   (mission {args.mission_id})", flush=True)
     if args.simulate:
-        print("mode: simulate (synthetic UEs + GPS)", flush=True)
-    elif args.ltesniffer_cmd:
+        print("mode: simulate (synthetic UEs + GPS, via the standard "
+              "parse_ltesniffer + parse_gpsd pipeline)", flush=True)
+    else:
         print(f"mode: LTESniffer · cmd={args.ltesniffer_cmd!r} "
               f"@ {args.center_hz/1e6:.2f} MHz gain {args.rx_gain_db} dB",
               flush=True)
         print("GPS: gpspipe -w (only ingested if gpsd is running)", flush=True)
-    else:
-        print("mode: GPS only (pass --ltesniffer-cmd to feed the dashboard)",
-              flush=True)
     try:
         httpd.serve_forever()
     finally:

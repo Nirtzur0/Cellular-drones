@@ -79,12 +79,12 @@ Three realistic sources, in order of recommendation:
 
 The full discussion lives in `docs/design.md` §7.
 
-### Offline reprocessing
+### Captures
 
-```bash
-sniffer report 'data/geotagged-*.jsonl' --plot data/run.png
-sniffer gps-log                                       # standalone gpsd recorder
-```
+`sniffer live` writes `data/ue-<mission>.jsonl` (one decoded DCI per
+line, schema in `src/sniffer/schema.py`). For ad-hoc analysis after a
+flight, `jq` over that file is enough — there's no separate offline
+report tool.
 
 ## Repo layout
 
@@ -92,17 +92,14 @@ sniffer gps-log                                       # standalone gpsd recorder
 docs/             design docs (start with ue-sniffing.md)
 scripts/          install-linux.sh (apt + srsRAN + LTESniffer build)
 src/sniffer/
-  cli.py                 unified CLI entrypoint (`sniffer ...`)
+  cli.py                 CLI entrypoint (sniffer live | sniffer install)
   schema.py              UeSighting record types
-  simulate.py            synthetic LTESniffer + gpsd streams
-  parse_ltesniffer.py    DECODED key=value lines -> ue_sighting JSONL
-  normalize_ltesniffer.py permissive translator from LTESniffer text -> DECODED
-  parse_gpsd.py          gpspipe JSON -> geotag records
-  geotag.py              join UE sightings with the nearest GPS fix
+  simulate.py            synthetic LTESniffer + gpsd streams (text)
+  parse_ltesniffer.py    LTESniffer text → DECODED → ue_sighting JSONL
+  parse_gpsd.py          gpspipe JSON → geotag records
   localize.py            RSSI weighted centroid, per-(PCI, C-RNTI)
-  live.py                realtime browser dashboard
-  report.py              per-mission text summary + matplotlib plot
-  demo.py                end-to-end: simulator -> pipeline -> plot
+  live.py                realtime browser dashboard (the run path)
+  ta_multilateration.py  alt localizer for rogue-eNB scenarios
 data/             JSONL captures (gitignored)
 tests/            unit + e2e tests
 ```

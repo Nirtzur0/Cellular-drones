@@ -14,6 +14,12 @@ from typing import Any, Optional
 
 SCHEMA_VERSION = 1
 
+# One LTE Timing Advance step is 16·Ts (Ts = 1/(15000·2048) s). Round-trip
+# distance is c · 16·Ts ≈ 156.25 m, so one-way TA range is half that ≈
+# 78.125 m per step. Lives in schema so it travels with the dataclass and
+# doesn't pull numpy/scipy into the airborne host's record path.
+TA_STEP_METERS = 78.12526041666667
+
 
 @dataclass
 class GpsFix:
@@ -66,7 +72,21 @@ class UeEvent:
     #   dl_rsrp_dbm  → for DL grants, this is the eNB's transmission (same for all UEs on cell)
     ul_rssi_dbm: Optional[float] = None
     dl_rsrp_dbm: Optional[float] = None
+    # Round-trip Timing Advance. Encodes UE-to-drone (or UE-to-eNB) distance.
+    #   ta_n_steps  → raw LTE TA step count (0–1282; 1 step ≈ 78.125 m one-way)
+    #   ta_meters   → one-way distance derived from ta_n_steps via __post_init__.
+    # Both null on PDCCH-only paths (LTESniffer's published build doesn't
+    # emit TA; TA lives in RAR / MAC CE on PDSCH).
+    ta_n_steps: Optional[int] = None
+    ta_meters: Optional[float] = None
     raw: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Single source of truth: ta_meters is derived. If the caller passes
+        # ta_n_steps, recompute; otherwise leave whatever ta_meters was
+        # passed in (e.g. round-tripped from JSONL where both were stored).
+        if self.ta_n_steps is not None:
+            self.ta_meters = self.ta_n_steps * TA_STEP_METERS
 
 
 @dataclass
