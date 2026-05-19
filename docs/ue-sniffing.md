@@ -6,11 +6,23 @@ passive receiver.
 
 ## What you get
 
-- **Identity**: per-UE C-RNTI captured from PDCCH blind decode, per cell
-  (PCI). DCI format, MCS, PRB allocation, TBS — everything LTESniffer
-  emits. C-RNTI is a temporary, per-connection ID; see *Caveats* below.
-- **Position**: per-(PCI, C-RNTI) location estimate from an RSSI
-  weighted-centroid estimator, fed by UL grants only.
+The feature set depends on **which hardware you point at the cell**.
+See `docs/design.md` § 5 "Hardware modes" for the full matrix; the
+short version:
+
+- **DL-only (1× HackRF or 1× USRP at DL freq)** — C-RNTI extraction,
+  DL/UL grant counts, MCS/PRB/TBS per grant, activity timeline. **No
+  positioning** (the localizers need `ul_rssi_dbm`, which only an
+  actual UL listener can produce). Dashboard shows a banner explaining
+  this once it has enough evidence.
+- **UL+DL (2× USRP + GPSDO, or 1× X310)** — everything above plus
+  per-(PCI, C-RNTI) location from the RSSI weighted-centroid
+  estimator. Optionally TA multilateration, if the upstream decoder
+  emits TA values (the published LTESniffer build does not).
+- **Simulator (`--simulate`)** — everything above, driven by synthetic
+  IQ-equivalent text. Validates the pipeline without hardware.
+
+C-RNTI is a temporary, per-connection ID; see *Caveats* below.
 
 ## What you do *not* get
 
@@ -21,7 +33,10 @@ passive receiver.
   and is gated by jurisdictional authorization.
 - **5G UE identity**. The standard encrypts IMSI as SUCI before
   transmission. LTESniffer is LTE-only.
-- **Mobile-UE positioning from a single radio**. The
+- **Per-UE positioning from a single radio in DL-only mode.** No matter
+  how long you record, single-radio DL doesn't hear the UE transmit.
+  Positioning is a UL+DL hardware story, not a software story.
+- **Mobile-UE positioning, even with UL+DL hardware.** The
   weighted-centroid math only converges on stationary emitters. See
   *Limits* below.
 

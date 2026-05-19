@@ -53,6 +53,7 @@ from sniffer.simulate import (
     gpsd_lines,
     ltesniffer_lines,
 )
+from sniffer.spectrum import SpectrumScanner
 
 
 # Knobs --------------------------------------------------------------------
@@ -61,6 +62,16 @@ GEOTAG_MAX_AGE_MS = 500        # drop sightings >500 ms from nearest fix
 UE_HISTORY_MAX = 400           # per-UE UL-grant history retained for positioning
 RSSI_HISTORY_MAX = 120         # rolling sparkline points
 GPS_TRAIL_MAX = 600            # drone trail points sent in /state snapshot
+
+# How many UE-sightings to observe before concluding "this upstream isn't
+# emitting UE transmit energy at all". The DL-only path (HackRF + DL-only
+# LTESniffer / FalconEye) sees every C-RNTI on PDCCH but never measures
+# `ul_rssi_dbm` — only an actual UL listener (2× USRP or X310) tuned to
+# the UL band can. After this many grants with zero UL-energy hits, we
+# flip a flag so the dashboard can stop promising positioning that will
+# never arrive. 50 is a conservative threshold — at ~10 grants/sec on a
+# busy cell that's ~5 seconds of evidence.
+DL_ONLY_DETECTION_THRESHOLD = 50
 
 
 # --------------------------------------------------------------------------
@@ -78,6 +89,13 @@ class State:
         self._clients: list[queue.Queue[str]] = []
         self._started_mono_ns = mono_ns()
         self._total_ue_sightings = 0
+        # DL-only mode auto-detection. Stays None until we've seen enough
+        # grants to make a call; then True (HackRF-style DL-only, no UE
+        # transmit energy observable) or False (UL energy is arriving, so
+        # the localizers can do their thing).
+        self._dl_only: Optional[bool] = None
+        self._grants_with_ul_rssi: int = 0
+        self._spectrum: Optional[SpectrumScanner] = None
         self._scan_status: dict[str, Any] = {"phase": "idle", "ts_utc": utc_iso()}
         # GPS buffer: list of {ts_mono_ns, ts_utc, gps:{lat,lon,alt_m,fix,hdop}}
         self._gps: list[dict[str, Any]] = []
@@ -173,6 +191,16 @@ class State:
             if ue.dl_rsrp_dbm is not None:
                 entry["dl_rsrp_dbm"] = ue.dl_rsrp_dbm
             self._total_ue_sightings += 1
+            if ue.ul_rssi_dbm is not None:
+                self._grants_with_ul_rssi += 1
+            # Auto-flip DL-only mode once we have enough evidence either way.
+            # Stays None until we cross the threshold so the dashboard can
+            # show "still measuring" instead of either claim prematurely.
+            if self._dl_only is None:
+                if self._grants_with_ul_rssi > 0:
+                    self._dl_only = False
+                elif self._total_ue_sightings >= DL_ONLY_DETECTION_THRESHOLD:
+                    self._dl_only = True
 
             if ue.direction == "ul" and (
                 ue.ul_rssi_dbm is not None or ue.ta_meters is not None
@@ -203,7 +231,9 @@ class State:
                         _recompute_ue_position_ta(entry)
 
             payload = _entry_to_dict_ue(entry)
-        self._broadcast({"type": "ue_sighting", "ue": payload})
+            dl_only = self._dl_only
+        self._broadcast({"type": "ue_sighting", "ue": payload,
+                         "dl_only": dl_only})
         return payload
 
     def set_status(self, phase: str, **extra: Any) -> None:
@@ -230,6 +260,8 @@ class State:
                          for r in trail_slice]
             t_min = self._gps_ts_keys[0] if self._gps_ts_keys else None
             t_max = self._gps_ts_keys[-1] if self._gps_ts_keys else None
+            spectrum = (self._spectrum.snapshot()
+                        if self._spectrum is not None else None)
             return {
                 "type": "snapshot",
                 "ues": ues,
@@ -240,7 +272,19 @@ class State:
                 "uptime_s": (mono_ns() - self._started_mono_ns) / 1e9,
                 "time_bounds": {"t_min_ns": t_min, "t_max_ns": t_max,
                                 "started_ns": self._started_mono_ns},
+                "spectrum": spectrum,
+                # None until we've seen enough grants to know.
+                # True = DL-only upstream (HackRF / FalconEye / DL-only
+                # LTESniffer). False = UL energy is arriving, positioning
+                # estimators can do their job.
+                "dl_only": self._dl_only,
             }
+
+    def attach_spectrum_scanner(self, scanner: SpectrumScanner) -> None:
+        self._spectrum = scanner
+
+    def spectrum_snapshot(self) -> Optional[dict[str, Any]]:
+        return self._spectrum.snapshot() if self._spectrum is not None else None
 
     def time_bounds(self) -> dict[str, Any]:
         """Earliest/latest ts_mono_ns we can replay to."""
@@ -912,6 +956,14 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
 }
 .banner strong { color: var(--yellow); font-weight: 600; letter-spacing: 0.04em; }
 .banner .dim { color: var(--dim); }
+.banner.banner-mode {
+  background: rgba(255, 109, 109, 0.04);
+  border-bottom: 1px solid #4a1c1c;
+}
+.banner.banner-mode::before {
+  border-color: var(--red); color: var(--red);
+}
+.banner.banner-mode strong { color: var(--red); }
 
 /* ---------------------------------------------------------- main grid */
 .workspace {
@@ -1302,6 +1354,10 @@ footer .row b { color: var(--accent); font-weight: 600; }
   <strong>C-RNTI IS CONNECTION-SCOPED.</strong>
   <span class="dim">A handset that re-attaches will be reissued a new C-RNTI · positions use UL grants only · DL grants are eNB-side.</span>
 </div>
+<div id="dl-only-banner" class="banner banner-mode" style="display:none">
+  <strong>DL-ONLY MODE.</strong>
+  <span class="dim">Upstream emits PDCCH only (HackRF / DL-only decoder) — no UE transmit energy observable. Positioning estimators inactive; C-RNTI surface still live. Positioning needs UL sniffing hardware (2× USRP + GPSDO, or X310).</span>
+</div>
 <div class="workspace">
   <div class="map-wrap">
     <span class="br-bl"></span><span class="br-br"></span>
@@ -1327,6 +1383,15 @@ footer .row b { color: var(--accent); font-weight: 600; }
     </div>
   </aside>
 </div>
+<section id="spectrum-panel" style="margin:8px 14px 0; padding:8px 12px; border:1px solid #2a3038; border-radius:6px; background:#0b0d10;">
+  <div style="display:flex; align-items:center; gap:14px; font-size:11px; color:#8a93a0; margin-bottom:6px;">
+    <strong style="color:#7ad9a1; letter-spacing:0.06em;">SPECTRUM</strong>
+    <span id="spec-range">— MHz</span>
+    <span id="spec-peak">peak —</span>
+    <span id="spec-err" style="color:#f08580;"></span>
+  </div>
+  <canvas id="spec-canvas" width="900" height="140" style="width:100%; height:140px; display:block; background:#000;"></canvas>
+</section>
 <div class="scrubber" id="scrubber">
   <button class="live-btn" id="live-btn" type="button">
     <span class="led"></span><span id="live-btn-text">LIVE</span>
@@ -1370,7 +1435,18 @@ function colorFor(key) {
 let totalUeSightings = 0;
 let latestGps = null;
 let selectedKey = null;
+// null = still measuring; true = DL-only upstream (no UE-side energy);
+// false = UL energy is arriving, positioning estimators can converge.
+let dlOnly = null;
 const ues = new Map();
+
+function setDlOnly(v) {
+  if (v === undefined) return;
+  if (dlOnly === v) return;
+  dlOnly = v;
+  const el = document.getElementById('dl-only-banner');
+  if (el) el.style.display = (v === true) ? '' : 'none';
+}
 
 // --- map ----------------------------------------------------------------
 let map = null;
@@ -1613,10 +1689,19 @@ function positionBlock(u) {
   }
   if (!p && !pTa) {
     let why;
-    if (!latestGps) why = 'no GPS fix yet';
-    else if ((u.ul_count || 0) < 2) why = `need ≥ 2 UL grants (have ${u.ul_count || 0})`;
-    else if ((u.n_geo_samples || 0) < 2) why = `need ≥ 2 geo-tagged grants (have ${u.n_geo_samples || 0})`;
-    else why = 'computing…';
+    if (dlOnly === true) {
+      // We've confirmed the upstream emits no UE-side energy. Don't keep
+      // claiming "wait for more grants" — the wait never ends.
+      why = 'DL-only mode · no UL energy to integrate';
+    } else if (!latestGps) {
+      why = 'no GPS fix yet';
+    } else if ((u.ul_count || 0) < 2) {
+      why = `need ≥ 2 UL grants (have ${u.ul_count || 0})`;
+    } else if ((u.n_geo_samples || 0) < 2) {
+      why = `need ≥ 2 geo-tagged grants (have ${u.n_geo_samples || 0})`;
+    } else {
+      why = 'computing…';
+    }
     return `<div class="position no-pos">
               <div class="row1"><span class="latlon">no position</span></div>
               <div class="meta-row">${why}</div>
@@ -1756,8 +1841,69 @@ function updateSummary() {
 }
 
 // --- SSE ----------------------------------------------------------------
+// --- spectrum waterfall ------------------------------------------------
+const specCanvas = document.getElementById('spec-canvas');
+const specCtx = specCanvas ? specCanvas.getContext('2d') : null;
+const specRangeEl = document.getElementById('spec-range');
+const specPeakEl = document.getElementById('spec-peak');
+const specErrEl = document.getElementById('spec-err');
+const specHistory = [];   // each entry: array of {mhz, dbfs}
+const SPEC_HISTORY_MAX = 80;
+
+function renderSpectrum(snap) {
+  if (!specCtx || !snap) return;
+  if (snap.error) { specErrEl.textContent = snap.error; return; }
+  else specErrEl.textContent = '';
+  const bins = snap.latest || [];
+  if (!bins.length) return;
+  // Push to rolling history, trim
+  specHistory.push(bins);
+  if (specHistory.length > SPEC_HISTORY_MAX) specHistory.shift();
+  // Frequency range
+  const fLow = snap.freq_start_mhz, fHigh = snap.freq_end_mhz;
+  specRangeEl.textContent = `${fLow}–${fHigh} MHz`;
+  // dB scale for color: clamp -90 → -10 dBFS to 0–1
+  const dbMin = -90, dbMax = -10;
+  const w = specCanvas.width, h = specCanvas.height;
+  // Track max peak for label
+  let peak = {mhz: 0, dbfs: -1e9};
+  for (const b of bins) if (b.dbfs > peak.dbfs) peak = b;
+  specPeakEl.textContent = `peak ${peak.dbfs.toFixed(1)} dBFS @ ${peak.mhz} MHz`;
+  // Draw waterfall: shift existing image up 1px, paint new row at bottom
+  const img = specCtx.getImageData(0, 1, w, h - 1);
+  specCtx.putImageData(img, 0, 0);
+  // Build new row
+  const row = specCtx.createImageData(w, 1);
+  for (let x = 0; x < w; x++) {
+    const f = fLow + (fHigh - fLow) * (x / w);
+    // Find nearest bin to this frequency
+    let bestIdx = 0, bestDiff = 1e9;
+    for (let i = 0; i < bins.length; i++) {
+      const d = Math.abs(bins[i].mhz - f);
+      if (d < bestDiff) { bestDiff = d; bestIdx = i; }
+    }
+    let t = (bins[bestIdx].dbfs - dbMin) / (dbMax - dbMin);
+    t = Math.max(0, Math.min(1, t));
+    // viridis-ish gradient: dark blue (low) → cyan → green → yellow → red (high)
+    const r = Math.round(255 * Math.min(1, Math.max(0, 4*t - 2.5)));
+    const g = Math.round(255 * Math.min(1, Math.max(0, 4*t - 0.5)) * Math.min(1, 4 - 4*t));
+    const b = Math.round(255 * Math.min(1, Math.max(0, 1.5 - 4*t + 0.5)));
+    const off = x * 4;
+    row.data[off]     = r;
+    row.data[off + 1] = g;
+    row.data[off + 2] = b;
+    row.data[off + 3] = 255;
+  }
+  specCtx.putImageData(row, 0, h - 1);
+}
+
 function applyEvent(ev) {
+  if (ev.type === 'spectrum') {
+    renderSpectrum(ev.spectrum);
+    return;
+  }
   if (ev.type === 'snapshot') {
+    if (ev.spectrum) renderSpectrum(ev.spectrum);
     ues.clear();
     [...cardsEl.querySelectorAll('.card')].forEach(c => c.remove());
     ueLayers.forEach(layer => {
@@ -1772,6 +1918,7 @@ function applyEvent(ev) {
     if (droneTrailLine) droneTrailLine.setLatLngs(droneTrail);
     setStatus(ev.status || {phase: 'idle'});
     setGps(ev.latest_gps);
+    setDlOnly(ev.dl_only);
     (ev.ues || []).forEach(u => { ues.set(u.key, u); renderCard(u); updateUeLayer(u); });
     totalUeSightings = ev.total_ue_sightings || 0;
   } else if (ev.type === 'ue_sighting') {
@@ -1779,6 +1926,7 @@ function applyEvent(ev) {
     ues.set(u.key, u);
     renderCard(u);
     updateUeLayer(u);
+    setDlOnly(ev.dl_only);
     totalUeSightings += 1;
     const est = u.est_position || u.est_position_ta;
     const tag = u.est_position ? 'rssi' : (u.est_position_ta ? 'ta' : '');
@@ -1947,6 +2095,15 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if self.path == "/spectrum":
+            snap = self.state.spectrum_snapshot() or {"latest": [], "error": "no scanner"}
+            body = json.dumps(snap).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/events":
             self._sse()
             return
@@ -2009,6 +2166,13 @@ def main() -> int:
                         "(substring-match) equals this value. Use when "
                         "several drones may be airborne and you only want "
                         "yours feeding the geotag stream.")
+    p.add_argument("--spectrum", action="store_true",
+                   help="run hackrf_sweep in a background thread and push "
+                        "live RF spectrum to the dashboard. Mutually "
+                        "exclusive with --ltesniffer-cmd (the HackRF can "
+                        "only be held by one process at a time).")
+    p.add_argument("--spectrum-freq-mhz", default="700:2700",
+                   help="hackrf_sweep range as start:end MHz (default 700:2700)")
     args = p.parse_args()
 
     # `--simulate` is off by default: the dashboard refuses to start with
@@ -2059,6 +2223,22 @@ def main() -> int:
                 ),
                 daemon=True,
             ))
+    # Spectrum scanner — only when HackRF is otherwise idle.
+    if args.spectrum and not args.ltesniffer_cmd:
+        try:
+            f_start, f_end = (int(x) for x in args.spectrum_freq_mhz.split(":"))
+        except ValueError:
+            print(f"bad --spectrum-freq-mhz '{args.spectrum_freq_mhz}', want start:end",
+                  file=sys.stderr)
+            return 2
+        scanner = SpectrumScanner(
+            on_snapshot=lambda payload: state._broadcast(
+                {"type": "spectrum", "spectrum": payload}),
+            freq_start_mhz=f_start, freq_end_mhz=f_end,
+        )
+        state.attach_spectrum_scanner(scanner)
+        scanner.start()
+
     for t in threads:
         t.start()
 

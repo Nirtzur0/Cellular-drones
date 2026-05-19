@@ -105,7 +105,7 @@ example. Key invariants:
 The schema is dependency-free Python dataclasses (`src/sniffer/schema.py`)
 so it runs on a constrained airborne SBC without dragging numpy in.
 
-## 5. Why UL grants only for positioning
+## 5. Why UL grants only for positioning — and what that actually requires
 
 DL grants encode the eNB → UE direction. The energy our passive receiver
 sees on those subframes is the eNB's transmission — the same signal for
@@ -117,9 +117,33 @@ transmits, our drone receiver measures *that*, and the per-UE energy
 becomes the localization observable. The localizer therefore filters
 `ue.direction == "ul" AND ue.ul_rssi_dbm IS NOT NULL`.
 
-For a UE that's mostly DL-bound (streaming) you'll see lots of grants but
-few UL ones — the dashboard flags this with a "need ≥ 2 UL grants"
-message and the position estimate stays null.
+**Crucial distinction.** The DL-only path (single radio tuned to the
+cell's DL center freq) decodes the *UL grant* on PDCCH — a downlink
+message saying "C-RNTI X, transmit at slot Y". It does **not** hear the
+UE's actual transmission, which happens on a different frequency (the
+UL band). To measure `ul_rssi_dbm` you need a second radio (or a wide
+enough SDR) tuned to the UL band, listening during the granted slot.
+That's LTESniffer's `-m 1` UL mode, which needs 2× USRP B-series + GPSDO
+or a single USRP X310. HackRF cannot do this.
+
+### Hardware modes
+
+| Mode | Hardware | C-RNTI list | UL grants visible | `ul_rssi_dbm` | Positioning |
+| --- | --- | --- | --- | --- | --- |
+| **DL-only** | 1× HackRF / 1× USRP at DL freq | ✓ | ✓ (the grant, not the energy) | always `None` | inactive |
+| **UL+DL** | 2× USRP B-series + GPSDO, or 1× X310 | ✓ | ✓ | populated when UE transmits | active |
+| **Simulator** | none | ✓ | ✓ | populated synthetically | active |
+
+The dashboard auto-detects DL-only after ~50 grants land without a
+single `ul_rssi_dbm` — at which point it surfaces a red banner explaining
+the situation and stops claiming positioning is "computing". C-RNTI
+extraction, activity counters, MCS / PRB / TBS chips, and the per-UE
+sparkline all stay live in DL-only mode; only positioning estimators
+hibernate.
+
+For a UE that's mostly DL-bound (streaming) on a *UL+DL* setup, you'll
+see lots of grants but few UL ones — the dashboard flags this with a
+"need ≥ 2 UL grants" message and the position estimate stays null.
 
 ## 6. Known limits
 

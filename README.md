@@ -1,20 +1,26 @@
 # Cellular-drones
 
-A drone-mounted passive LTE UE sniffer: capture C-RNTIs off the PDCCH
-with LTESniffer, and position UEs from a moving SDR using UL grants.
+A drone-mounted passive LTE UE sniffer: capture C-RNTIs off the PDCCH,
+and (with the right hardware) position UEs from a moving SDR using UL
+grant energy.
 
-**Status**: working end-to-end against the simulator. Real-radio path
-targets LTESniffer on a USRP B210 (Linux).
+**Status**: pipeline works end-to-end against the simulator. Real-radio
+LTE path requires LTESniffer (Linux). Positioning specifically requires
+**UL sniffing hardware** — see capability matrix below.
 
 ## What this framework does
 
-| Capability                                    | Status                                |
-| --------------------------------------------- | ------------------------------------- |
-| PDCCH decode + **C-RNTI list per cell**       | yes (USRP B210 + LTESniffer)          |
-| Per-UE positioning, stationary UEs            | yes (UL grants, RSSI weighted centroid)|
-| Per-UE positioning, mobile UEs                | not supported — single-RX math biases |
-| Subscriber identity (IMSI / SUPI / phone #)   | no — passive LTE never exposes it     |
-| 5G NR UE sniffing                             | no — LTESniffer is LTE-only           |
+| Capability | DL-only (HackRF / 1× USRP) | UL+DL (2× USRP + GPSDO / X310) | Simulator |
+| --- | --- | --- | --- |
+| **C-RNTI list per cell** | ✓ | ✓ | ✓ |
+| DL/UL grant counts, MCS, PRB, TBS | ✓ | ✓ | ✓ |
+| Per-UE positioning, stationary | **✗** (no UL energy observable) | ✓ (RSSI centroid) | ✓ |
+| Per-UE positioning, mobile | ✗ (single-RX math biases) | partial bias | partial bias |
+| Subscriber identity (IMSI / SUPI) | ✗ — never on passive LTE | ✗ — never on passive LTE | ✗ |
+| 5G NR UE sniffing | ✗ — LTESniffer is LTE-only | ✗ | ✗ |
+
+The dashboard auto-detects DL-only mode and surfaces a banner explaining
+that positioning is inactive (rather than promising it indefinitely).
 
 ## Read this first
 
