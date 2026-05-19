@@ -172,6 +172,31 @@ enough SDR) tuned to the UL band, listening during the granted slot.
 That's LTESniffer's `-m 1` UL mode, which needs 2× USRP B-series + GPSDO
 or a single USRP X310. HackRF cannot do this.
 
+### Known hardware constraint: HackRF + LTE PSS detection
+
+HackRF One's RX chain works (verified: `hackrf_sweep` produces clean
+spectrum across 700–2700 MHz on the Pi we tested), but the integrated
+TCXO drifts ~2–5 kHz at 2 GHz — close to the CFO tolerance srsRAN's
+PSS detector assumes. Result: `srsran_cell_search` opens the HackRF
+through SoapySDR, sweeps the requested EARFCN range, but rarely PSS-
+locks even on cells with strong DL energy (-27 dBm at the antenna).
+
+Workarounds, increasing in effort:
+
+1. **Pin a known cell.** Skip cell search; pass `--cells EARFCN:PCI`
+   to `sniffer survey` (or `--earfcn N --pci P` to `sniffer live`).
+   LTESniffer / FalconEye can still lock when given the PCI, even if
+   the PSS sweep was inconclusive.
+2. **GPSDO clock for HackRF.** Add an external 10 MHz reference via
+   the rear-panel SMA — hardware mod, ~$50 + soldering. Eliminates
+   the CFO problem at the source.
+3. **USRP B210 / B205mini.** What the FALCON paper, LTESniffer paper,
+   and srsRAN docs all assume. Stable TCXO; PSS-locks reliably.
+
+The smoke test (`scripts/pi-smoke-test.sh`) phases 4 and 6 confirm
+the HackRF is functional; phase 7 is the one that surfaces this
+limit if it manifests on your antenna's coverage.
+
 ### Hardware modes
 
 | Mode | Hardware | C-RNTI list | UL grants visible | `ul_rssi_dbm` | Positioning |

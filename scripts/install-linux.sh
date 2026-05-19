@@ -91,6 +91,18 @@ mkdir -p "$SRC_DIR/LTESniffer/build"
 )
 echo "LTESniffer binary at: $SRC_DIR/LTESniffer/build/src/LTESniffer"
 
+# srsRAN_4G's `make install` ships srsue / libsrsran_* but NOT the
+# example binaries (cell_search, pdsch_ue, …) under /usr/local/bin.
+# LTESniffer never had a `make install` step. Symlink both so the
+# Python wrappers find them on PATH.
+echo "[3.5/5] Symlinking decoder binaries onto PATH"
+sudo ln -sfv "$SRC_DIR/srsRAN_4G/build/lib/examples/cell_search" \
+             /usr/local/bin/srsran_cell_search 2>/dev/null || true
+sudo ln -sfv "$SRC_DIR/srsRAN_4G/build/lib/examples/pdsch_ue" \
+             /usr/local/bin/pdsch_ue 2>/dev/null || true
+sudo ln -sfv "$SRC_DIR/LTESniffer/build/src/LTESniffer" \
+             /usr/local/bin/LTESniffer 2>/dev/null || true
+
 echo "[3.5/5] FALCON (alternative DL-only LTE decoder with text output)"
 # FALCON / FalconEye (falkenber9/falcon) is what LTESniffer is built on.
 # Unlike LTESniffer (which writes PCAP only), FalconEye supports per-DCI

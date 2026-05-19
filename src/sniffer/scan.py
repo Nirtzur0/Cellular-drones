@@ -133,8 +133,25 @@ def parse_stream(lines: Iterable[str]) -> Iterator[Cell]:
 
 
 def _build_cmd(binary: str, band: Optional[int],
-               earfcn_range: Optional[tuple[int, int]]) -> list[str]:
+               earfcn_range: Optional[tuple[int, int]],
+               rf_args: str = "driver=hackrf", gain_db: int = 80) -> list[str]:
+    """Compose the srsran_cell_search argv.
+
+    `rf_args` is passed verbatim to `-a`. Default "driver=hackrf"
+    nudges SoapySDR to pick the HackRF when both libuhd and
+    soapysdr-module-hackrf are installed; without it, srsran returns
+    "No Soapy devices found" even though SoapySDRUtil --find sees the
+    device. For USRP set rf_args="" (UHD is auto-detected).
+
+    `gain_db` defaults to 80 because HackRF's RX chain (LNA+AMP+VGA)
+    needs the full range engaged to PSS-decode weak macrocell signals
+    on cellular bands. srsran's own default is 70.
+    """
     cmd = [binary]
+    if rf_args:
+        cmd += ["-a", rf_args]
+    if gain_db is not None:
+        cmd += ["-g", str(gain_db)]
     if band is not None:
         cmd += ["-b", str(band)]
     if earfcn_range is not None:
@@ -181,6 +198,8 @@ def run_scan(*, band: Optional[int] = None,
              sib_binary: str = DEFAULT_SIB_BINARY,
              json_out: bool = False,
              timeout_s: int = 120,
+             rf_args: str = "driver=hackrf",
+             gain_db: int = 80,
              fh=sys.stdout) -> int:
     """Run cell_search, print results, return exit code.
 
@@ -197,7 +216,8 @@ def run_scan(*, band: Optional[int] = None,
               f"or pass --binary / set SRSRAN_CELL_SEARCH_BIN.",
               file=sys.stderr)
         return 3
-    cmd = _build_cmd(resolved, band, earfcn_range)
+    cmd = _build_cmd(resolved, band, earfcn_range,
+                     rf_args=rf_args, gain_db=gain_db)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=timeout_s, check=False)
