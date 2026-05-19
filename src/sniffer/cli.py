@@ -140,6 +140,8 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         decode_sib1=args.decode_sib1,
         binary=binary, sib_binary=sib_binary,
         json_out=args.jsonl,
+        rf_args=args.rf_args,
+        gain_db=args.gain_db,
     )
 
 
@@ -316,6 +318,14 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(env: SRSRAN_CELL_SEARCH_BIN)")
     ps.add_argument("--sib-binary", default=None,
                     help="path to pdsch_ue (env: PDSCH_UE_BIN)")
+    ps.add_argument("--rf-args", default="",
+                    help="srsran -a string. Default empty = auto-pick "
+                         "(UHD if built-in, then SoapySDR). For HackRF: "
+                         "'driver=hackrf'. For USRP with antenna on TX/RX: "
+                         "'type=b200,rx_antenna=TX/RX'.")
+    ps.add_argument("--gain-db", type=int, default=75,
+                    help="RX gain in dB (default 75). HackRF wants 80+; "
+                         "USRP B-series max effective is ~76.")
     ps.set_defaults(func=_cmd_scan)
 
     psv = sub.add_parser("survey",

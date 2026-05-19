@@ -35,16 +35,22 @@ sudo apt-get install -y --no-install-recommends \
   libpcap-dev libssl-dev gpsd gpsd-clients
 
 echo "[2/5] srsRAN_4G"
+# Install UHD now (small ~10 MB) — even if you're on HackRF, having UHD
+# means you can plug a USRP in later without rebuilding srsRAN. Tested
+# on the Pi: SoapySDR-via-UHD bridge doesn't work for USRP B-series,
+# only native libsrsran_rf_uhd does.
+sudo apt-get install -y --no-install-recommends \
+  libuhd-dev uhd-host python3-uhd soapysdr-module-uhd || true
 if [[ ! -d "$SRC_DIR/srsRAN_4G" ]]; then
   git clone --depth 1 https://github.com/srsRAN/srsRAN_4G.git "$SRC_DIR/srsRAN_4G"
 fi
 mkdir -p "$SRC_DIR/srsRAN_4G/build"
 ( cd "$SRC_DIR/srsRAN_4G/build"
-  # SoapySDR gives us the HackRF backend. UHD off — no USRP here.
-  # srsENB/srsEPC off — they pull SCTP-heavy S1AP code we never run.
+  # Both UHD and SoapySDR enabled so HackRF AND USRP both work without
+  # a rebuild. srsENB/srsEPC off — SCTP-heavy S1AP code we never run.
   cmake .. \
     -DENABLE_GUI=False \
-    -DENABLE_UHD=OFF \
+    -DENABLE_UHD=ON \
     -DENABLE_BLADERF=OFF \
     -DENABLE_ZEROMQ=OFF \
     -DENABLE_HARDSIM=OFF \
@@ -56,6 +62,16 @@ mkdir -p "$SRC_DIR/srsRAN_4G/build"
   sudo make install
 )
 sudo ldconfig
+
+# Download USRP FPGA images if a USRP is plugged in. For B200mini we
+# specifically need usrp_b200mini_fpga.bin (NOT b210 or b200 default —
+# UHD picks the file based on detected board ID).
+if command -v uhd_images_downloader >/dev/null 2>&1; then
+  sudo uhd_images_downloader -t "b2xx" 2>&1 | tail -5 || \
+    echo "uhd_images_downloader failed — Pi may be offline. Fetch zips "\
+         "manually from files.ettus.com/binaries/cache and unzip into "\
+         "/usr/share/uhd/images (see scripts/pi-smoke-test.sh)."
+fi
 
 echo "[3/4] LTESniffer"
 # Upstream is SysSec-KAIST/LTESniffer (the published research repo).

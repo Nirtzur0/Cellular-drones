@@ -1434,6 +1434,93 @@ footer::-webkit-scrollbar-thumb { background: var(--line-2); }
 footer .row { padding: 1px 0; letter-spacing: 0.02em; }
 footer .row .ts { color: var(--dim-2); margin-right: 10px; }
 footer .row b { color: var(--accent); font-weight: 600; }
+
+/* ---------------------------------------------------------- phone / narrow viewport */
+@media (max-width: 640px) {
+  /* Header: wrap brand + meta vertically; smaller pills */
+  header {
+    flex-direction: column; align-items: stretch; gap: 6px;
+    padding: 8px 10px;
+  }
+  .brand { gap: 8px; }
+  header h1 { font-size: 11px; }
+  header h1 span { display: block; margin-left: 0; font-size: 10px; }
+  .meta {
+    gap: 8px; flex-wrap: wrap; font-size: 10px;
+    justify-content: flex-start;
+  }
+  .stat { gap: 4px; }
+  .stat strong { font-size: 12px; }
+  .pill { padding: 2px 6px; font-size: 9.5px; letter-spacing: 0.02em; }
+
+  /* Workspace: stack vertical, tune for phone height */
+  .workspace {
+    padding: 6px 8px 8px; gap: 8px;
+    grid-template-columns: 1fr;
+  }
+  .map-wrap { height: 36vh; min-height: 240px; }
+  .side { height: auto; min-height: 0; max-height: 50vh; }
+
+  /* Banners + survey: tighter */
+  .banner { padding: 6px 10px; font-size: 10.5px; }
+
+  /* Side cards: stack with smaller padding */
+  .side-head { padding: 8px 10px; font-size: 10px; }
+  .cards { padding: 6px; }
+  .card { padding: 8px 10px; gap: 6px; }
+  .card .head { font-size: 10.5px; }
+
+  /* Map overlays: shrink, lower z-stack */
+  .map-overlay {
+    top: 6px; right: 6px;
+    font-size: 9.5px; padding: 4px 6px;
+    max-width: 150px;
+  }
+  .legend {
+    bottom: 6px; left: 6px;
+    font-size: 9.5px; padding: 4px 6px;
+    min-width: 96px; max-height: 36%;
+  }
+  .legend .label { font-size: 8.5px; margin-bottom: 3px; }
+
+  /* Spectrum: full-width canvas, smaller header */
+  #spectrum-panel {
+    margin: 6px 8px 0 !important; padding: 6px 8px !important;
+  }
+  #spectrum-panel canvas {
+    height: 96px !important;
+  }
+  #spectrum-panel > div:first-child {
+    font-size: 9.5px; gap: 8px;
+  }
+
+  /* Scrubber: wrap on a second row if it overflows */
+  .scrubber {
+    flex-wrap: wrap; gap: 8px; padding: 6px 10px;
+  }
+  .scrubber .lbl { font-size: 8.5px; }
+  .scrubber .time { min-width: 0; font-size: 11px; }
+  .scrubber input[type=range] { flex: 1 1 100%; order: 99; }
+  .scrubber .live-btn { padding: 4px 8px; font-size: 9px; }
+
+  /* Footer log: smaller, lower height */
+  footer {
+    max-height: 80px; padding: 6px 10px;
+    font-size: 9.5px;
+  }
+  footer::before { font-size: 8.5px; }
+
+  /* Hide hover-only chrome that doesn't apply on touch */
+  .card:hover { background: var(--panel); }
+}
+
+/* very small phones / portrait iPhones */
+@media (max-width: 380px) {
+  header h1 { font-size: 10px; }
+  .pill { font-size: 9px; padding: 1px 5px; }
+  .map-wrap { height: 32vh; min-height: 200px; }
+  #spectrum-panel canvas { height: 84px !important; }
+}
 </style>
 </head><body>
 <header>
