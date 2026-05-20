@@ -71,6 +71,16 @@ GPS_TRAIL_MAX = 600            # drone trail points sent in /state snapshot
 # columns, so it never trips this.
 DL_ONLY_DETECTION_THRESHOLD = 50
 
+# Rolling-window length (seconds) for the cell PRB-utilization metric.
+# 5 s is long enough to smooth subframe-to-subframe burstiness but short
+# enough to track real load changes (handovers, congestion onset).
+CELL_LOAD_WINDOW_S = 5.0
+
+# How many MCS samples to keep per UE for the channel-quality sparkline.
+# 60 grants on a busy UE = ~6 s of recent history, enough to spot a
+# UE losing signal mid-flight.
+MCS_HISTORY_MAX = 60
+
 
 # --------------------------------------------------------------------------
 # Aggregator + broadcaster
@@ -82,8 +92,18 @@ class State:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # key: (pci, c_rnti)
+        # key: (pci, c_rnti) — real UEs only (rnti_kind == "c_rnti").
+        # P-RNTI / SI-RNTI / RA-RNTI decodes are cell-wide broadcasts; they
+        # land in _broadcasts so the UE list and counts reflect actual handsets.
         self._ues: dict[tuple[int, int], dict[str, Any]] = {}
+        # key: (pci, rnti_kind) → counters for p_rnti / si_rnti / ra_rnti / unknown.
+        self._broadcasts: dict[tuple[int, str], dict[str, Any]] = {}
+        # Per-cell PRB occupancy window. key=pci → deque[(ts_ns, n_prb)],
+        # plus the running max(n_prb) seen for that cell — used as the
+        # estimated total PRB capacity (cells of 6/15/25/50/75/100 PRB
+        # all show up as max-observed once a UE gets a full-width grant).
+        self._cell_prb_windows: dict[int, deque] = {}
+        self._cell_prb_max: dict[int, int] = {}
         self._clients: list[queue.Queue[str]] = []
         self._started_mono_ns = mono_ns()
         self._total_ue_sightings = 0
@@ -148,9 +168,31 @@ class State:
     def ingest_ue(self, sighting: UeSighting) -> dict[str, Any]:
         pci = sighting.ue.pci
         c_rnti = sighting.ue.c_rnti
-        key = (pci, c_rnti)
         now_iso = sighting.ts_utc or utc_iso()
         ue = sighting.ue
+        kind = ue.rnti_kind or "c_rnti"
+
+        # Cell-wide broadcasts (paging, SI, RACH responses) inflate the UE
+        # count if treated as UEs. Route them to a separate counter bucket.
+        if kind != "c_rnti":
+            with self._lock:
+                bkey = (pci, kind)
+                bucket = self._broadcasts.setdefault(bkey, {
+                    "pci": pci,
+                    "kind": kind,
+                    "count": 0,
+                    "first_seen": now_iso,
+                    "last_seen": now_iso,
+                })
+                bucket["count"] += 1
+                bucket["last_seen"] = now_iso
+                self._total_ue_sightings += 1
+                broadcasts = self._broadcasts_payload_locked()
+            self._broadcast({"type": "broadcast",
+                             "broadcasts": broadcasts})
+            return {"pci": pci, "kind": kind, "rnti": c_rnti}
+
+        key = (pci, c_rnti)
         with self._lock:
             entry = self._ues.get(key)
             if entry is None:
@@ -161,17 +203,34 @@ class State:
                     "c_rnti_hex": f"{c_rnti:#06x}",
                     "center_hz": sighting.radio.center_hz,
                     "first_seen": now_iso,
+                    "first_seen_ns": sighting.ts_mono_ns,
+                    "last_seen_ns": sighting.ts_mono_ns,
                     "count": 0,
                     "ul_count": 0,
                     "dl_count": 0,
                     "dci_formats": [],
                     "ul_rssi_history": deque(maxlen=RSSI_HISTORY_MAX),
                     "geo_history": deque(maxlen=UE_HISTORY_MAX),
+                    "mcs_history": deque(maxlen=MCS_HISTORY_MAX),
                     "est_position": None,
+                    # HARQ-aware throughput: track the last NDI per
+                    # (direction, harq_id) so we count tbs_bytes only on
+                    # grants that carry NEW data (NDI flipped), not on
+                    # HARQ retransmissions (NDI unchanged).
+                    "ndi_state": {},
+                    "new_data_bytes_dl": 0,
+                    "new_data_bytes_ul": 0,
+                    # FalconEye decode confidence (histval). max = best
+                    # decode we've ever gotten for this RNTI; recent =
+                    # the latest. The UI uses max as the "trust" badge
+                    # since FalconEye's RNTI histogram is cumulative.
+                    "confidence_max": 0,
+                    "confidence_recent": 0,
                 }
                 self._ues[key] = entry
 
             entry["last_seen"] = now_iso
+            entry["last_seen_ns"] = sighting.ts_mono_ns
             entry["count"] += 1
             if ue.direction == "ul":
                 entry["ul_count"] += 1
@@ -182,6 +241,45 @@ class State:
             entry["mcs"] = ue.mcs
             entry["n_prb"] = ue.n_prb
             entry["tbs_bytes"] = ue.tbs_bytes
+            # Channel-quality sparkline: per-UE rolling MCS history.
+            # An MCS drop over time is the cleanest signal that a UE has
+            # moved away or hit a fade; rendered as a small inline chart
+            # next to the RSSI sparkline.
+            if ue.mcs is not None:
+                entry["mcs_history"].append(int(ue.mcs))
+            # Cell-load metric: append this grant's PRB count to the
+            # per-cell rolling window. We compute "% of cell PRBs in use,
+            # last 5s" on demand in snapshot() — instant cell-busy gauge.
+            if ue.n_prb is not None and ue.n_prb > 0:
+                win = self._cell_prb_windows.setdefault(pci, deque())
+                win.append((sighting.ts_mono_ns, int(ue.n_prb)))
+                # Track the cell's apparent PRB capacity. Cells advertise
+                # 6/15/25/50/75/100 PRB widths; the largest single grant
+                # we ever see ≈ the cell's full width.
+                cur_max = self._cell_prb_max.get(pci, 0)
+                if int(ue.n_prb) > cur_max:
+                    self._cell_prb_max[pci] = int(ue.n_prb)
+            if ue.confidence is not None:
+                entry["confidence_recent"] = int(ue.confidence)
+                if int(ue.confidence) > entry["confidence_max"]:
+                    entry["confidence_max"] = int(ue.confidence)
+            # HARQ-aware new-data accounting. Only when we have all three
+            # pieces (HARQ id, NDI, tbs_bytes). On first sight of a HARQ
+            # process, treat the grant as new data (initial NDI doesn't
+            # have a prior to compare to — the cautious alternative would
+            # be to wait for the first flip, but most cells start a UE on
+            # a new transport block).
+            if (ue.harq_id is not None and ue.ndi is not None
+                    and ue.tbs_bytes is not None and ue.tbs_bytes > 0):
+                hkey = (ue.direction, int(ue.harq_id))
+                prev_ndi = entry["ndi_state"].get(hkey)
+                is_new_data = (prev_ndi is None or prev_ndi != int(ue.ndi))
+                entry["ndi_state"][hkey] = int(ue.ndi)
+                if is_new_data:
+                    if ue.direction == "ul":
+                        entry["new_data_bytes_ul"] += int(ue.tbs_bytes)
+                    elif ue.direction == "dl":
+                        entry["new_data_bytes_dl"] += int(ue.tbs_bytes)
             if ue.ul_rssi_dbm is not None:
                 entry["ul_rssi_dbm"] = ue.ul_rssi_dbm
                 entry["ul_rssi_history"].append(
@@ -225,6 +323,49 @@ class State:
                          "dl_only": dl_only})
         return payload
 
+    def _broadcasts_payload_locked(self) -> list[dict[str, Any]]:
+        """Render the broadcast counters for SSE / snapshot. Caller holds lock."""
+        return [
+            {"pci": b["pci"], "kind": b["kind"], "count": b["count"],
+             "first_seen": b["first_seen"], "last_seen": b["last_seen"]}
+            for b in sorted(self._broadcasts.values(),
+                            key=lambda x: (x["pci"], x["kind"]))
+        ]
+
+    def _cell_load_payload_locked(self) -> list[dict[str, Any]]:
+        """Compute "% of cell PRBs in use, rolling 5s" per PCI.
+
+        Caller holds lock. Prunes the per-cell PRB window in place.
+        We compare PRB·subframes used to PRB·subframes available
+        (cell_max_prb × window_s × 1000 subframes/s).
+        """
+        out: list[dict[str, Any]] = []
+        cutoff_ns = mono_ns() - int(CELL_LOAD_WINDOW_S * 1e9)
+        for pci, win in self._cell_prb_windows.items():
+            # Drop samples older than the window.
+            while win and win[0][0] < cutoff_ns:
+                win.popleft()
+            if not win:
+                continue
+            cell_prb = self._cell_prb_max.get(pci, 0)
+            if cell_prb <= 0:
+                continue
+            used_prb_subframes = sum(n for _, n in win)
+            avail_prb_subframes = cell_prb * CELL_LOAD_WINDOW_S * 1000.0
+            load_pct = round(
+                100.0 * used_prb_subframes / avail_prb_subframes, 1)
+            # Clamp — heavy grant overlap or short windows can over-count.
+            if load_pct > 100.0:
+                load_pct = 100.0
+            out.append({
+                "pci": pci,
+                "load_pct": load_pct,
+                "cell_prb": cell_prb,
+                "grants_in_window": len(win),
+                "window_s": CELL_LOAD_WINDOW_S,
+            })
+        return out
+
     def set_status(self, phase: str, **extra: Any) -> None:
         with self._lock:
             self._scan_status = {"phase": phase, "ts_utc": utc_iso(), **extra}
@@ -263,6 +404,15 @@ class State:
             return {
                 "type": "snapshot",
                 "ues": ues,
+                # P-RNTI / SI-RNTI / RA-RNTI counters per (pci, kind).
+                # The UI renders these in a dedicated "Broadcast" pill
+                # so they don't get confused with real UE rows.
+                "broadcasts": self._broadcasts_payload_locked(),
+                # Per-cell PRB occupancy %, rolling 5s. Tells you if the
+                # cell is busy (>50%) vs idle — useful context when 0
+                # DCIs flow ("decoder broken" vs "cell idle"). Renders
+                # as a header pill.
+                "cell_load": self._cell_load_payload_locked(),
                 "status": dict(self._scan_status),
                 "latest_gps": self._latest_gps,
                 "gps_trail": gps_trail,
@@ -398,13 +548,35 @@ class State:
 
 
 def _entry_to_dict_ue(entry: dict[str, Any]) -> dict[str, Any]:
+    # Skip internal-only fields: rolling histories (sent as derived
+    # summaries below) and ndi_state (per-HARQ scratchpad, of no use
+    # to the dashboard).
     out = {k: v for k, v in entry.items()
-           if k not in ("ul_rssi_history", "geo_history")}
+           if k not in ("ul_rssi_history", "geo_history", "ndi_state",
+                        "mcs_history")}
     out["ul_rssi_history"] = list(entry["ul_rssi_history"])
     out["n_geo_samples"] = len(entry["geo_history"])
+    # Channel-quality sparkline data. Bare int list — the dashboard
+    # renders it as a tiny MCS-over-time chart in the UE card.
+    out["mcs_history"] = list(entry["mcs_history"])
     trail = list(entry["geo_history"])[-40:]
     out["trail"] = [{"lat": g["gps"]["lat"], "lon": g["gps"]["lon"],
                      "ul_rssi_dbm": g["ue"]["ul_rssi_dbm"]} for g in trail]
+    # HARQ-aware throughput: count only new-data DCIs (NDI flipped),
+    # divide by the UE's observation window. Pre-MIB grants and
+    # retransmissions are excluded by design so the number reflects
+    # actual payload throughput, not raw PDCCH activity.
+    first_ns = entry.get("first_seen_ns")
+    last_ns = entry.get("last_seen_ns")
+    if first_ns and last_ns and last_ns > first_ns:
+        elapsed_s = (last_ns - first_ns) / 1e9
+        # bytes → kbps; tiny windows can spike to silly numbers, so we
+        # require ≥1 s of observation before reporting anything.
+        if elapsed_s >= 1.0:
+            out["throughput_dl_kbps"] = round(
+                entry["new_data_bytes_dl"] * 8 / 1000 / elapsed_s, 1)
+            out["throughput_ul_kbps"] = round(
+                entry["new_data_bytes_ul"] * 8 / 1000 / elapsed_s, 1)
     return out
 
 
@@ -529,9 +701,34 @@ class _ParseArgs:
         self.sample_rate_sps = sample_rate_sps
 
 
+def _parse_falcon_argv(cmd: list[str]) -> dict[str, Any]:
+    """Pull useful cell metadata out of the FalconEye argv so the dashboard
+    can display gain/antennas/sample-rate without piping them separately."""
+    out: dict[str, Any] = {}
+    i = 0
+    while i < len(cmd):
+        flag = cmd[i]
+        if flag in ("-g", "-A", "-f") and i + 1 < len(cmd):
+            val = cmd[i + 1]
+            try:
+                if flag == "-g":
+                    out["gain_db"] = float(val)
+                elif flag == "-A":
+                    out["antennas"] = int(val)
+                elif flag == "-f":
+                    out["falcon_center_hz"] = float(val)
+            except ValueError:
+                pass
+            i += 2
+            continue
+        i += 1
+    return out
+
+
 def run_falcon_loop(state: State, *, falcon_cmd: list[str], pci: int,
                     mission_id: str, out_dir: str, center_hz: Optional[float],
-                    stop: threading.Event) -> None:
+                    stop: threading.Event,
+                    spectrum_tap_path: Optional[str] = None) -> None:
     """Spawn FalconEye, tail its DCI CSV, feed records into State.
 
     FalconEye (falkenber9/falcon, the LTESniffer ancestor) writes a
@@ -573,8 +770,16 @@ def run_falcon_loop(state: State, *, falcon_cmd: list[str], pci: int,
         with tempfile.TemporaryDirectory(prefix="falcon_dci_") as td:
             csv_path = os.path.join(td, "dci.csv")
             full_cmd = list(falcon_cmd) + ["-D", csv_path]
+            # Cellular-drones SpectrumTap: ask FALCON to publish per-cell
+            # FFT rows so the dashboard waterfall reflects the actual cell
+            # being decoded (vs a separate USRP-wide sweep).
+            if spectrum_tap_path:
+                os.makedirs(os.path.dirname(spectrum_tap_path), exist_ok=True)
+                full_cmd += ["-X", spectrum_tap_path]
+            cell_extras = _parse_falcon_argv(full_cmd)
             state.set_status("sniffing", center_hz=center_hz,
-                             decoder="falcon", out=out_path)
+                             decoder="falcon", out=out_path,
+                             pci=pci, **cell_extras)
             proc = subprocess.Popen(
                 full_cmd,
                 stdout=subprocess.DEVNULL,   # FalconEye stdout is verbose status
@@ -858,6 +1063,23 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
 .pill.gps-2d { color: var(--yellow); border-color: #4a3a17; }
 .pill.gps-2d .led { background: var(--yellow); }
 .pill.gps-none, .pill.gps-unknown { color: var(--dim); }
+
+/* Radio + Spectrum pills (cellular-drones state visibility). */
+.pill.radio-active { color: var(--green); border-color: #1f4a32; background: rgba(88,201,138,0.04); }
+.pill.radio-active .led { background: var(--green); box-shadow: 0 0 5px var(--green); }
+.pill.radio-sim { color: var(--yellow); border-color: #4a3a17; background: rgba(230,168,81,0.04); }
+.pill.radio-sim .led { background: var(--yellow); }
+.pill.radio-error { color: var(--red); border-color: #4a1f1f; background: rgba(255,109,109,0.04); }
+.pill.radio-error .led { background: var(--red); }
+.pill.radio-unknown { color: var(--dim); }
+.pill.spec-tap { color: var(--accent); border-color: var(--accent-dim); background: rgba(93,213,255,0.04); }
+.pill.spec-tap .led { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+.pill.spec-sweep { color: var(--green); border-color: #1f4a32; background: rgba(88,201,138,0.04); }
+.pill.spec-sweep .led { background: var(--green); }
+.pill.spec-stale { color: var(--yellow); border-color: #4a3a17; background: rgba(230,168,81,0.04); }
+.pill.spec-stale .led { background: var(--yellow); }
+.pill.spec-off, .pill.spec-unknown { color: var(--dim); }
+
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
 /* ---------------------------------------------------------- advisory */
@@ -898,6 +1120,38 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
   font-variant-numeric: tabular-nums;
   color: var(--txt); padding: 0 4px;
 }
+.banner.banner-coach {
+  background: rgba(93, 213, 255, 0.025);
+  border-bottom: 1px solid var(--line-2);
+  color: var(--txt-2);
+}
+.banner.banner-coach::before {
+  border-color: var(--accent); color: var(--accent); content: '?';
+}
+.banner.banner-coach strong { color: var(--accent); font-weight: 500; }
+
+/* Currently-tuned-cell panel (cellular-drones). */
+#cell-panel {
+  margin: 8px 14px 0; padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  background: var(--panel-2);
+  display: none;          /* shown by JS when a cell is locked */
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-size: 11px;
+}
+#cell-panel .cp-head {
+  display: flex; align-items: center; gap: 14px;
+  color: var(--dim); margin-bottom: 6px;
+}
+#cell-panel .cp-head strong { color: var(--green); letter-spacing: 0.06em; }
+#cell-panel .cp-row {
+  display: flex; flex-wrap: wrap; gap: 16px 20px;
+}
+#cell-panel .cp-field { display: flex; gap: 7px; align-items: baseline; }
+#cell-panel .cp-field .lbl { color: var(--dim); text-transform: uppercase;
+                              letter-spacing: 0.12em; font-size: 10px; }
+#cell-panel .cp-field .val { color: var(--txt); font-variant-numeric: tabular-nums; }
 
 /* ---------------------------------------------------------- main grid */
 .workspace {
@@ -1191,6 +1445,37 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
 .chip.dl  { color: #aab3bd; border-color: var(--line-3); }
 .chip.dci { color: var(--yellow); border-color: #4a3a17; }
 .chip.plain { color: var(--dim); }
+/* HARQ-aware new-data throughput. Green-leaning to stand out as the
+   "this UE is actually transferring data" signal in a busy card. */
+.chip.tp  { color: var(--green); border-color: #2f5d3e;
+            background: rgba(88,201,138,0.08); font-weight: 600; }
+/* FalconEye decode confidence indicator (histval). One dot, three colors:
+   high (≥8) = trusted, mid (4-7) = borderline, low (<4) = likely noise. */
+.conf-dot { width: 6px; height: 6px; border-radius: 50%;
+            display: inline-block; margin-right: 4px;
+            vertical-align: middle; }
+.conf-dot.conf-hi  { background: var(--green); box-shadow: 0 0 4px var(--green); }
+.conf-dot.conf-mid { background: var(--yellow); }
+.conf-dot.conf-lo  { background: var(--red); opacity: 0.6; }
+/* Broadcast pill in the header — counts P-RNTI / SI-RNTI / RA-RNTI hits
+   that are NOT real UEs (cell-wide pages, system info, RACH responses). */
+.pill.broadcast { color: var(--yellow); border-color: #4a3a17;
+                  background: rgba(230,168,81,0.05); }
+/* Cell load pill — rolling % of cell PRBs in use. Color shifts with
+   utilization so a glance tells you congested vs idle. */
+.pill.cell-load { color: var(--accent); border-color: var(--accent-dim);
+                  font-variant-numeric: tabular-nums; }
+.pill.cell-load.load-mid { color: var(--yellow); border-color: #4a3a17;
+                           background: rgba(230,168,81,0.05); }
+.pill.cell-load.load-hi  { color: var(--red); border-color: #4a1f1f;
+                           background: rgba(255,109,109,0.06); }
+/* MCS sparkline — small inline chart of per-UE modulation-and-coding
+   index over recent grants. Drops indicate channel quality degradation. */
+.mcs-spark { display: block; margin-top: 6px; opacity: 0.85; }
+.mcs-spark .lbl { font-size: 8.5px; color: var(--dim);
+                  letter-spacing: 0.1em; text-transform: uppercase;
+                  margin-bottom: 2px; }
+.mcs-spark svg { display: block; }
 
 /* ---------------------------------------------------------- scrubber */
 .scrubber {
@@ -1365,6 +1650,14 @@ footer .row b { color: var(--accent); font-weight: 600; }
     <div class="stat">LOC <strong id="n-pos">0</strong></div>
     <div class="stat">GRANTS <strong id="n-ue-sightings">0</strong></div>
     <div class="stat">T+ <strong id="uptime">0s</strong></div>
+    <span class="pill cell-load" id="cell-load-pill" style="display:none" title="">
+      <span class="led"></span><span id="cell-load-text">CELL —</span>
+    </span>
+    <span class="pill broadcast" id="bcast-pill" style="display:none" title="">
+      <span class="led"></span><span id="bcast-text">BCAST —</span>
+    </span>
+    <span class="pill radio-unknown" id="radio"><span class="led"></span><span id="radio-text">RF —</span></span>
+    <span class="pill spec-unknown" id="spec-pill"><span class="led"></span><span id="spec-pill-text">FFT —</span></span>
     <span class="pill gps-unknown" id="gps"><span class="led"></span><span id="gps-text">NAV —</span></span>
     <span class="pill status-idle" id="status"><span class="led"></span><span id="status-text">IDLE</span></span>
   </div>
@@ -1381,6 +1674,10 @@ footer .row b { color: var(--accent); font-weight: 600; }
   <strong>SURVEYING.</strong>
   <span id="survey-progress" class="dim">—</span>
   <span id="survey-countdown" class="countdown"></span>
+</div>
+<div id="coach-banner" class="banner banner-coach" style="display:none">
+  <strong id="coach-label">DIAG.</strong>
+  <span id="coach-text" class="dim">—</span>
 </div>
 <div class="workspace">
   <div class="map-wrap">
@@ -1407,9 +1704,27 @@ footer .row b { color: var(--accent); font-weight: 600; }
     </div>
   </aside>
 </div>
+<section id="cell-panel">
+  <div class="cp-head">
+    <strong>LOCKED CELL</strong>
+    <span id="cp-decoder">—</span>
+    <span id="cp-uptime" style="margin-left:auto;">T+ —</span>
+  </div>
+  <div class="cp-row">
+    <div class="cp-field"><span class="lbl">PCI</span><span class="val" id="cp-pci">—</span></div>
+    <div class="cp-field"><span class="lbl">EARFCN</span><span class="val" id="cp-earfcn">—</span></div>
+    <div class="cp-field"><span class="lbl">f<sub>c</sub></span><span class="val" id="cp-fc">—</span></div>
+    <div class="cp-field"><span class="lbl">RATE</span><span class="val" id="cp-rate">—</span></div>
+    <div class="cp-field"><span class="lbl">GAIN</span><span class="val" id="cp-gain">—</span></div>
+    <div class="cp-field"><span class="lbl">RX</span><span class="val" id="cp-rx">—</span></div>
+    <div class="cp-field"><span class="lbl">GRANTS</span><span class="val" id="cp-grants">—</span></div>
+    <div class="cp-field"><span class="lbl">DCI/s</span><span class="val" id="cp-rate-dci">—</span></div>
+  </div>
+</section>
 <section id="spectrum-panel" style="margin:8px 14px 0; padding:8px 12px; border:1px solid #2a3038; border-radius:6px; background:#0b0d10;">
   <div style="display:flex; align-items:center; gap:14px; font-size:11px; color:#8a93a0; margin-bottom:6px;">
     <strong style="color:#7ad9a1; letter-spacing:0.06em;">SPECTRUM</strong>
+    <span id="spec-source">— mode</span>
     <span id="spec-range">— MHz</span>
     <span id="spec-peak">peak —</span>
     <span id="spec-err" style="color:#f08580;"></span>
@@ -1438,6 +1753,14 @@ const statusEl    = document.getElementById('status');
 const statusText  = document.getElementById('status-text');
 const gpsEl       = document.getElementById('gps');
 const gpsText     = document.getElementById('gps-text');
+const radioEl     = document.getElementById('radio');
+const radioText   = document.getElementById('radio-text');
+const specPillEl  = document.getElementById('spec-pill');
+const specPillTxt = document.getElementById('spec-pill-text');
+const cellPanel   = document.getElementById('cell-panel');
+const coachBanner = document.getElementById('coach-banner');
+const coachText   = document.getElementById('coach-text');
+const coachLabel  = document.getElementById('coach-label');
 const mapEl       = document.getElementById('map');
 const mapOverlay  = document.getElementById('map-overlay');
 const legendEl    = document.getElementById('legend');
@@ -1470,6 +1793,84 @@ function setDlOnly(v) {
   dlOnly = v;
   const el = document.getElementById('dl-only-banner');
   if (el) el.style.display = (v === true) ? '' : 'none';
+}
+
+// Cell PRB-utilization pill (rolling 5s window). Useful context for
+// "the decoder is quiet" — high cell load + zero UEs = decoder broken;
+// low cell load + zero UEs = the cell really is idle right now.
+function setCellLoad(loads) {
+  const pill = document.getElementById('cell-load-pill');
+  const text = document.getElementById('cell-load-text');
+  if (!pill || !text) return;
+  if (!loads || loads.length === 0) {
+    pill.style.display = 'none';
+    return;
+  }
+  pill.style.display = '';
+  // Single-cell view (most common: single sniffer cell). For survey
+  // mode with several PCIs visited, show the max-load one.
+  const top = loads.reduce((a, b) =>
+    (a.load_pct >= b.load_pct ? a : b));
+  text.textContent = `CELL ${top.load_pct.toFixed(0)}% · ${top.cell_prb}PRB`;
+  pill.classList.remove('load-mid', 'load-hi');
+  if (top.load_pct >= 70) pill.classList.add('load-hi');
+  else if (top.load_pct >= 30) pill.classList.add('load-mid');
+  pill.title = loads.map(l =>
+    `PCI ${l.pci}: ${l.load_pct.toFixed(1)}% of ${l.cell_prb} PRB ` +
+    `(${l.grants_in_window} grants in last ${l.window_s}s)`).join('\n');
+}
+
+// Mini MCS sparkline — render last N MCS values as a thin polyline.
+// MCS is 0-28 (LTE-A). A descending trend = UE channel degrading.
+function mcsSparkSvg(history, color) {
+  if (!history || history.length < 2) return '';
+  const W = 110, H = 18;
+  const pad = 1;
+  const n = history.length;
+  const stepX = (W - 2 * pad) / Math.max(1, n - 1);
+  const points = history.map((v, i) => {
+    const x = pad + i * stepX;
+    // MCS 0-28 → bottom to top. Higher = better.
+    const y = H - pad - (Math.max(0, Math.min(28, v)) / 28) * (H - 2 * pad);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const last = history[n - 1];
+  return `<div class="mcs-spark">
+    <div class="lbl">MCS (${n}) · now ${last}</div>
+    <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+      <polyline points="${points}" fill="none"
+                stroke="${color}" stroke-width="1.2" opacity="0.9"/>
+    </svg>
+  </div>`;
+}
+
+// Broadcast counters (P-RNTI paging, SI-RNTI system info, RA-RNTI
+// random-access response). Not real UEs — they're cell-wide messages.
+// Render as a single pill in the header so you can see "the cell is
+// healthy / paging is flowing" without those decodes polluting the UE
+// list.
+function setBroadcasts(broadcasts) {
+  const pill = document.getElementById('bcast-pill');
+  const text = document.getElementById('bcast-text');
+  if (!pill || !text) return;
+  if (!broadcasts || broadcasts.length === 0) {
+    pill.style.display = 'none';
+    return;
+  }
+  pill.style.display = '';
+  const totals = {};
+  broadcasts.forEach(b => {
+    totals[b.kind] = (totals[b.kind] || 0) + (b.count || 0);
+  });
+  const order = ['p_rnti', 'si_rnti', 'ra_rnti', 'unknown'];
+  const labels = {p_rnti: 'PAGE', si_rnti: 'SIB',
+                  ra_rnti: 'RACH', unknown: 'OTH'};
+  const parts = order
+    .filter(k => totals[k] > 0)
+    .map(k => `${labels[k]} ${totals[k]}`);
+  text.textContent = 'BCAST · ' + parts.join(' · ');
+  pill.title = broadcasts.map(b =>
+    `PCI ${b.pci} ${labels[b.kind] || b.kind} ×${b.count}`).join('\n');
 }
 
 // Survey progress (multi-cell sweep). `survey` is either null (not
@@ -1646,6 +2047,12 @@ function fmtFreq(hz) {
   if (hz == null) return '—';
   return (hz / 1e6).toFixed(2) + ' MHz';
 }
+function fmtKbps(kbps) {
+  if (kbps == null) return '—';
+  if (kbps >= 1000) return (kbps / 1000).toFixed(2) + ' Mbps';
+  if (kbps >= 10) return kbps.toFixed(0) + ' kbps';
+  return kbps.toFixed(1) + ' kbps';
+}
 function timeAgo(iso) {
   if (!iso) return '—';
   const t = Date.parse(iso);
@@ -1740,11 +2147,24 @@ function renderCard(u) {
   const mcs = u.mcs    != null ? `<span class="chip plain">MCS ${u.mcs}</span>` : '';
   const prb = u.n_prb  != null ? `<span class="chip plain">${u.n_prb} PRB</span>` : '';
   const tbs = u.tbs_bytes != null ? `<span class="chip plain">${u.tbs_bytes} B</span>` : '';
+  // HARQ-aware throughput: only includes grants where NDI flipped
+  // (new-data), so retransmissions don't inflate the number.
+  const tpDl = u.throughput_dl_kbps != null && u.throughput_dl_kbps > 0
+    ? `<span class="chip tp">DL ${fmtKbps(u.throughput_dl_kbps)}</span>` : '';
+  const tpUl = u.throughput_ul_kbps != null && u.throughput_ul_kbps > 0
+    ? `<span class="chip tp">UL ${fmtKbps(u.throughput_ul_kbps)}</span>` : '';
+  // FalconEye histogram confidence (paper: ≥8 = trust, <4 = likely noise).
+  // Map to a 3-level dot so the eye can scan a busy list.
+  const conf = u.confidence_max || 0;
+  const confCls = conf >= 8 ? 'conf-hi' : conf >= 4 ? 'conf-mid' : 'conf-lo';
+  const confTitle = `FalconEye decode confidence (histval) max ${conf}` +
+    (conf >= 8 ? ' — trusted' : conf >= 4 ? ' — borderline' : ' — likely noise');
 
   card.innerHTML = `
     <div class="head">
       <div class="identity">
         <span class="sw"></span>
+        <span class="conf-dot ${confCls}" title="${confTitle}"></span>
         <span class="crnti">${u.c_rnti_hex}</span>
         <span class="pci-tag">PCI ${u.pci}</span>
       </div>
@@ -1758,8 +2178,9 @@ function renderCard(u) {
       </div>
       ${sparkSvg(u.ul_rssi_history, color)}
     </div>
+    ${mcsSparkSvg(u.mcs_history, color)}
     ${positionBlock(u)}
-    <div class="foot">${ulChip}${dlChip}${dciTags}${mcs}${prb}${tbs}</div>
+    <div class="foot">${tpDl}${tpUl}${ulChip}${dlChip}${dciTags}${mcs}${prb}${tbs}</div>
   `;
   if (!isNew) {
     card.classList.remove('fresh');
@@ -1808,6 +2229,149 @@ function setStatus(s) {
   }
   statusText.textContent = text;
   statusEl.className = 'pill status-' + (s.phase || 'idle');
+  lastStatus = s;
+  updateRadioPill(s);
+  updateCellPanel(s);
+  updateCoach();
+}
+
+// --- pills, cell panel, coach (cellular-drones state visibility) ----
+let lastStatus = {phase: 'idle'};
+let lastSpectrumEv = null;        // last spectrum payload (snap)
+let dciRateHistory = [];          // [{t_ms, total}] kept ~30s for rate calc
+let cellLockSinceMs = null;       // wall-clock ms when first sniffing seen
+
+function updateRadioPill(s) {
+  if (!radioEl) return;
+  const phase = (s && s.phase) || 'idle';
+  if (phase === 'sniffing') {
+    radioEl.className = 'pill radio-active';
+    const dec = (s.decoder || 'falcon').toUpperCase();
+    const mhz = s.center_hz != null ? ` · ${(s.center_hz/1e6).toFixed(1)} MHz` : '';
+    radioText.textContent = `RF ${dec}${mhz}`;
+  } else if (phase === 'simulating') {
+    radioEl.className = 'pill radio-sim';
+    radioText.textContent = 'RF sim';
+  } else if (phase === 'error') {
+    radioEl.className = 'pill radio-error';
+    radioText.textContent = 'RF err';
+  } else {
+    radioEl.className = 'pill radio-unknown';
+    radioText.textContent = 'RF —';
+  }
+}
+
+function updateSpectrumPill(snap) {
+  if (!specPillEl) return;
+  if (!snap) {
+    specPillEl.className = 'pill spec-off';
+    specPillTxt.textContent = 'FFT —';
+    return;
+  }
+  const src = snap.source || 'sweep';
+  const age = snap.last_row_age_s;
+  if (age != null && age > 5.0) {
+    specPillEl.className = 'pill spec-stale';
+    specPillTxt.textContent = `FFT stale ${age.toFixed(0)}s`;
+  } else if (src === 'file') {
+    specPillEl.className = 'pill spec-tap';
+    specPillTxt.textContent = 'FFT tap';
+  } else {
+    specPillEl.className = 'pill spec-sweep';
+    specPillTxt.textContent = 'FFT sweep';
+  }
+}
+
+function updateCellPanel(s) {
+  if (!cellPanel) return;
+  if (!s || s.phase !== 'sniffing' || s.pci == null) {
+    cellPanel.style.display = 'none';
+    cellLockSinceMs = null;
+    return;
+  }
+  if (cellLockSinceMs == null) cellLockSinceMs = Date.now();
+  cellPanel.style.display = 'block';
+  document.getElementById('cp-decoder').textContent = (s.decoder || 'falcon').toUpperCase();
+  document.getElementById('cp-pci').textContent = s.pci;
+  // EARFCN isn't stamped on status; we derive only if known elsewhere. Leave em-dash.
+  document.getElementById('cp-earfcn').textContent = s.earfcn != null ? s.earfcn : '—';
+  const fc = (s.center_hz != null ? s.center_hz : s.falcon_center_hz);
+  document.getElementById('cp-fc').textContent = fc != null
+    ? (fc/1e6).toFixed(2) + ' MHz' : '—';
+  // FALCON's internal sample rate at the cell PRB count isn't piped through
+  // status today; show — until we plumb it.
+  document.getElementById('cp-rate').textContent = s.sample_rate_sps != null
+    ? (s.sample_rate_sps/1e6).toFixed(2) + ' MS/s' : '—';
+  document.getElementById('cp-gain').textContent = s.gain_db != null
+    ? s.gain_db.toFixed(0) + ' dB' : '—';
+  document.getElementById('cp-rx').textContent = s.antennas != null ? s.antennas + '×' : '—';
+}
+
+function setCellGrantStats() {
+  if (cellPanel && cellPanel.style.display !== 'none') {
+    document.getElementById('cp-grants').textContent = totalUeSightings;
+    // DCI rate over the last ~10s of samples
+    const now = Date.now();
+    dciRateHistory.push({t: now, total: totalUeSightings});
+    while (dciRateHistory.length && now - dciRateHistory[0].t > 30000) {
+      dciRateHistory.shift();
+    }
+    if (dciRateHistory.length >= 2) {
+      const first = dciRateHistory[0];
+      const dt = (now - first.t) / 1000;
+      const dN = totalUeSightings - first.total;
+      const rate = dt > 0 ? dN / dt : 0;
+      document.getElementById('cp-rate-dci').textContent = rate.toFixed(2);
+    } else {
+      document.getElementById('cp-rate-dci').textContent = '—';
+    }
+    if (cellLockSinceMs != null) {
+      const secs = Math.round((Date.now() - cellLockSinceMs) / 1000);
+      document.getElementById('cp-uptime').textContent = 'T+ ' + secs + 's';
+    }
+  }
+}
+
+// Rule-based "what's wrong?" coach. Updates from the same state that drives
+// the pills. Keep it terse and actionable.
+function updateCoach() {
+  if (!coachBanner) return;
+  const s = lastStatus || {phase: 'idle'};
+  let msg = null, label = 'DIAG.';
+  const hasGps = !!latestGps;
+  const ulCount = (() => {
+    let n = 0; ues.forEach(u => n += (u.ul_count || 0)); return n;
+  })();
+  if (s.phase === 'idle' || !s.phase) {
+    coachBanner.style.display = 'none'; return;
+  }
+  if (s.phase === 'error') {
+    label = 'ERROR';
+    msg = s.message || 'Producer failed — check log.';
+  } else if (s.phase === 'simulating') {
+    coachBanner.style.display = 'none'; return;
+  } else if (s.phase === 'sniffing') {
+    if (totalUeSightings === 0) {
+      label = 'NO DCIs YET.';
+      msg = 'FALCON started; either still doing cell-search, or PDCCH not '
+          + 'decoding. Confirm cell freq/PCI and that you’re close enough.';
+    } else if (ulCount === 0) {
+      label = 'DL-ONLY DECODES.';
+      msg = `Got ${totalUeSightings} DL grants but 0 UL — UEs may be idle, `
+          + 'or cell asymmetric. UE positioning needs UL grants with RSSI.';
+    } else if (!hasGps) {
+      label = 'NO GPS.';
+      msg = 'Decoding UL but no GPS fix — positioning will publish without '
+          + 'coordinates. Check gpsd / antenna.';
+    } else {
+      coachBanner.style.display = 'none'; return;
+    }
+  }
+  if (msg) {
+    coachLabel.textContent = label;
+    coachText.textContent = msg;
+    coachBanner.style.display = '';
+  }
 }
 function setGps(rec) {
   latestGps = rec;
@@ -1902,10 +2466,12 @@ function renderSpectrum(snap) {
 function applyEvent(ev) {
   if (ev.type === 'spectrum') {
     renderSpectrum(ev.spectrum);
+    updateSpectrumPill(ev.spectrum);
     return;
   }
   if (ev.type === 'snapshot') {
-    if (ev.spectrum) renderSpectrum(ev.spectrum);
+    if (ev.spectrum) { renderSpectrum(ev.spectrum); updateSpectrumPill(ev.spectrum); }
+    else updateSpectrumPill(null);
     ues.clear();
     [...cardsEl.querySelectorAll('.card')].forEach(c => c.remove());
     ueLayers.forEach(layer => {
@@ -1922,10 +2488,14 @@ function applyEvent(ev) {
     setGps(ev.latest_gps);
     setDlOnly(ev.dl_only);
     setSurvey(ev.survey);
+    setBroadcasts(ev.broadcasts || []);
+    setCellLoad(ev.cell_load || []);
     (ev.ues || []).forEach(u => { ues.set(u.key, u); renderCard(u); updateUeLayer(u); });
     totalUeSightings = ev.total_ue_sightings || 0;
   } else if (ev.type === 'survey') {
     setSurvey(ev.survey);
+  } else if (ev.type === 'broadcast') {
+    setBroadcasts(ev.broadcasts || []);
   } else if (ev.type === 'ue_sighting') {
     const u = ev.ue;
     ues.set(u.key, u);
@@ -1933,6 +2503,7 @@ function applyEvent(ev) {
     updateUeLayer(u);
     setDlOnly(ev.dl_only);
     totalUeSightings += 1;
+    updateCoach();
     const est = u.est_position;
     const pos = est
       ? ` · ${est.lat.toFixed(5)},${est.lon.toFixed(5)} ±${est.cep95_m.toFixed(0)}m`
@@ -1956,6 +2527,8 @@ setInterval(() => {
     const seenEl = document.querySelector('#card-' + u.key + ' .seen');
     if (seenEl) seenEl.textContent = timeAgo(u.last_seen) + ' ago';
   });
+  setCellGrantStats();
+  updateCoach();
 }, 1000);
 // --- replay scrubber ----------------------------------------------------
 const scrubberEl   = document.getElementById('scrubber');
@@ -2243,12 +2816,22 @@ def main() -> int:
         ))
     elif args.falcon_cmd:
         cmd = args.falcon_cmd.split()
+        # When --spectrum is also set, route the spectrogram through
+        # FALCON's SpectrumTap rather than spawning a parallel uhd_sweep
+        # (impossible anyway on a single radio). FALCON writes per-cell
+        # FFT rows; SpectrumScanner tails the file.
+        falcon_tap_path = None
+        if args.spectrum:
+            os.makedirs(args.out_dir, exist_ok=True)
+            falcon_tap_path = os.path.join(
+                args.out_dir, f"spectrum-{args.mission_id}.csv")
         threads.append(threading.Thread(
             target=run_falcon_loop,
             kwargs=dict(
                 state=state, falcon_cmd=cmd, pci=args.falcon_pci,
                 mission_id=args.mission_id, out_dir=args.out_dir,
                 center_hz=args.center_hz, stop=stop,
+                spectrum_tap_path=falcon_tap_path,
             ),
             daemon=True,
         ))
@@ -2257,7 +2840,9 @@ def main() -> int:
             kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
             daemon=True,
         ))
-    # Spectrum scanner — needs its own SDR (mutually exclusive with FALCON).
+    # Spectrum scanner. Two modes:
+    #   * --falcon-cmd + --spectrum → tail FALCON's SpectrumTap CSV (real cell)
+    #   * otherwise + --spectrum    → spawn USRP-wide uhd_sweep (needs idle radio)
     if args.spectrum:
         try:
             f_start, f_end = (int(x) for x in args.spectrum_freq_mhz.split(":"))
@@ -2265,12 +2850,22 @@ def main() -> int:
             print(f"bad --spectrum-freq-mhz '{args.spectrum_freq_mhz}', want start:end",
                   file=sys.stderr)
             return 2
-        scanner = SpectrumScanner(
-            on_snapshot=lambda payload: state._broadcast(
-                {"type": "spectrum", "spectrum": payload}),
-            freq_start_mhz=f_start, freq_end_mhz=f_end,
-            gain_db=args.spectrum_gain_db,
-        )
+        if args.falcon_cmd:
+            scanner = SpectrumScanner(
+                on_snapshot=lambda payload: state._broadcast(
+                    {"type": "spectrum", "spectrum": payload}),
+                source="file",
+                file_path=falcon_tap_path,
+                freq_start_mhz=f_start, freq_end_mhz=f_end,
+            )
+        else:
+            scanner = SpectrumScanner(
+                on_snapshot=lambda payload: state._broadcast(
+                    {"type": "spectrum", "spectrum": payload}),
+                source="sweep",
+                freq_start_mhz=f_start, freq_end_mhz=f_end,
+                gain_db=args.spectrum_gain_db,
+            )
         state.attach_spectrum_scanner(scanner)
         scanner.start()
 

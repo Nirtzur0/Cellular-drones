@@ -41,6 +41,8 @@ def _cmd_live(args: argparse.Namespace) -> int:
             "--port", str(args.port),
             "--out-dir", args.out_dir,
             "--mission-id", args.mission_id]
+    if args.spectrum:
+        argv.append("--spectrum")
 
     if args.simulate:
         if args.earfcn or args.pci:
@@ -248,6 +250,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--port", type=int, default=8000)
     pl.add_argument("--out-dir", default="data")
     pl.add_argument("--mission-id", default=default_mid)
+    pl.add_argument("--spectrum", action="store_true",
+                    help="show a spectrum waterfall on the dashboard. With "
+                         "--earfcn/--pci this tails FALCON's per-cell FFT "
+                         "(no extra radio needed); with --simulate (or a "
+                         "spare SDR plugged in) it runs a wideband sweep "
+                         "via sniffer.uhd_sweep.")
     pl.set_defaults(func=_cmd_live)
 
     ps = sub.add_parser("scan",

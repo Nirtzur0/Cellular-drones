@@ -67,6 +67,22 @@ class UeEvent:
     n_prb: Optional[int] = None
     harq_id: Optional[int] = None
     tbs_bytes: Optional[int] = None
+    # 3GPP TS 36.321 §7.1 RNTI categories — derived from c_rnti value range.
+    # Lets the dashboard split actual UEs (`c_rnti`) from cell-wide
+    # broadcasts (`p_rnti`, `si_rnti`) so the "UE count" header reflects
+    # real handsets, not paging messages.
+    rnti_kind: str = "c_rnti"      # c_rnti | p_rnti | si_rnti | ra_rnti | unknown
+    # New Data Indicator from the DCI. Flips when the eNB sends new
+    # transport-block data on a HARQ process vs retransmitting it.
+    # State.ingest_ue uses this to count new-data bytes only (HARQ
+    # retransmissions don't add to throughput, just resilience).
+    ndi: Optional[int] = None
+    # FalconEye's RNTI-histogram bucket count for this decode. Higher =
+    # this RNTI has been seen repeatedly in the recent window, so the
+    # decode is much less likely to be a false positive. Per the FalconEye
+    # paper, values < ~8 are noise. Surfaced in the dashboard as a per-UE
+    # confidence indicator.
+    confidence: Optional[int] = None
     # Energy measured by our passive receiver:
     #   ul_rssi_dbm  → for UL grants, this is the UE's transmission at our RX
     #   dl_rsrp_dbm  → for DL grants, this is the eNB's transmission (same for all UEs on cell)
@@ -125,6 +141,29 @@ class GeotagRecord:
 
     def to_jsonl(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
+
+
+def classify_rnti(rnti: int) -> str:
+    """Bucket a 16-bit RNTI by its 3GPP TS 36.321 §7.1 reserved range.
+
+    The dashboard treats `c_rnti` as a real UE and routes everything else
+    (paging, system info, random access) to a separate "broadcast" lane
+    so the UE count doesn't get inflated by cell-wide messages.
+    """
+    if rnti == 0xFFFF:
+        return "p_rnti"
+    if rnti == 0xFFFE:
+        return "si_rnti"
+    # 0x0001-0x003C is the RA-RNTI window (random-access response).
+    if 0x0001 <= rnti <= 0x003C:
+        return "ra_rnti"
+    # 0xFFFC = M-RNTI (MBSFN), 0xFFFD = future. Group as broadcast-like.
+    if rnti in (0xFFFC, 0xFFFD):
+        return "unknown"
+    # Reserved 0x0000 — should never appear from a real decode.
+    if rnti == 0x0000:
+        return "unknown"
+    return "c_rnti"
 
 
 def mono_ns() -> int:

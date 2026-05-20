@@ -19,7 +19,7 @@ def _ns(**over) -> Namespace:
     base = dict(
         host="127.0.0.1", port=8000, out_dir="data", mission_id="t",
         simulate=False, earfcn=None, pci=None,
-        antennas=1, gain_db=70,
+        antennas=1, gain_db=70, spectrum=False,
     )
     base.update(over)
     return Namespace(**base)

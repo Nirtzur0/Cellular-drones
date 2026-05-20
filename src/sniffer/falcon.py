@@ -52,6 +52,7 @@ from sniffer.schema import (
     RadioConfig,
     UeEvent,
     UeSighting,
+    classify_rnti,
     mono_ns,
     utc_iso,
 )
@@ -118,6 +119,11 @@ def parse_csv_row(cols: list[str]) -> Optional[dict]:
     if dci_format is None and fmt_int is not None:
         dci_format = str(fmt_int)
     harq_id = _to_int(cols[13])
+    # Promote ndi (col 11) and histval (col 17) to first-class fields.
+    # ndi drives HARQ-aware throughput (new-data grants only); histval
+    # is FalconEye's per-decode confidence — the dashboard surfaces both.
+    ndi = _to_int(cols[11])
+    histval = _to_int(cols[17])
     out: dict = {
         "c_rnti": rnti,
         "direction": direction,
@@ -126,6 +132,8 @@ def parse_csv_row(cols: list[str]) -> Optional[dict]:
         "n_prb": n_prb,
         "tbs_bytes": tbs_sum,
         "harq_id": harq_id,
+        "ndi": ndi,
+        "confidence": histval,
         "raw": {
             "sfn":      cols[1],
             "subframe": cols[2],
@@ -174,6 +182,9 @@ def _make_record(args, clock_ns: Callable[[], int],
         n_prb=fields.get("n_prb"),
         harq_id=fields.get("harq_id"),
         tbs_bytes=fields.get("tbs_bytes"),
+        rnti_kind=classify_rnti(int(c_rnti)),
+        ndi=fields.get("ndi"),
+        confidence=fields.get("confidence"),
         ul_rssi_dbm=fields.get("ul_rssi_dbm"),
         ta_n_steps=fields.get("ta_n_steps"),
         raw=fields.get("raw", {}),
