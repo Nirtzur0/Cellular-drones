@@ -1,7 +1,7 @@
 """Tests for sniffer.survey — the multi-cell sweep orchestrator.
 
 We never actually spawn FalconEye here. Instead we monkey-patch
-`_spawn_decoder` to return a stub subprocess and let the FALCON CSV
+`_spawn_falcon` to return a stub subprocess and let the FALCON CSV
 tailer read from a file we write to ourselves. That gives us
 end-to-end coverage of the cycling logic, dwell timing, status
 broadcasts, and subprocess cleanup, without depending on real radio.
@@ -9,11 +9,8 @@ broadcasts, and subprocess cleanup, without depending on real radio.
 
 from __future__ import annotations
 
-import os
-import subprocess
 import threading
 import time
-from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -62,20 +59,19 @@ def test_run_survey_loop_visits_each_cell_per_cycle(monkeypatch, tmp_path):
     least once and broadcast a survey-status payload for each."""
     visited: list[tuple[int, int]] = []
 
-    def spawn(decoder, cell, *_a, **_kw):
+    def spawn(cell, csv_path):
         visited.append((cell.earfcn, cell.pci))
-        # Touch the CSV so tail_csv finds it immediately.
-        from sniffer import falcon  # noqa
         return _FakeProc()
 
-    monkeypatch.setattr(survey, "_spawn_decoder", spawn)
-    # Replace the consume step with a no-op so dwell is purely timer-driven.
-    monkeypatch.setattr(survey, "_consume_cell_dwell",
-                        lambda *a, **kw: kw["dwell_stop"].wait())
+    monkeypatch.setattr(survey, "_spawn_falcon", spawn)
+    # Replace tail_csv so the dwell is purely timer-driven.
+    monkeypatch.setattr(survey, "tail_csv",
+                        lambda *a, **kw: iter(()))
 
     state = State()
     survey_events: list[dict] = []
     orig_broadcast = state._broadcast
+
     def capture(ev):
         if ev.get("type") == "survey":
             survey_events.append(ev.get("survey"))
@@ -86,7 +82,7 @@ def test_run_survey_loop_visits_each_cell_per_cycle(monkeypatch, tmp_path):
     cells = [_cell(1850, 271), _cell(1851, 88)]
     survey.run_survey_loop(state, cells=cells,
                            dwell_seconds=0.2, total_seconds=0.5,
-                           decoder="falcon", mission_id="t",
+                           mission_id="t",
                            out_dir=str(tmp_path), stop=stop)
 
     # Both cells were visited at least once.
@@ -94,24 +90,25 @@ def test_run_survey_loop_visits_each_cell_per_cycle(monkeypatch, tmp_path):
     assert 271 in pcis_visited
     assert 88 in pcis_visited
 
-    # Survey-status events landed for each visit (and a "done" status
-    # broadcast as a regular status, not a 'survey' event).
-    payloads_with_a_pci = [p for p in survey_events if p and p.get("current_pci")]
+    # Survey-status events landed for each visit.
+    payloads_with_a_pci = [p for p in survey_events
+                           if p and p.get("current_pci")]
     assert len(payloads_with_a_pci) >= 2
 
 
 def test_run_survey_loop_exits_when_stop_fires(monkeypatch, tmp_path):
     """User kills the dashboard mid-survey → loop returns promptly."""
 
-    def spawn(*_a, **_kw):
+    def spawn(cell, csv_path):
         return _FakeProc()
 
-    monkeypatch.setattr(survey, "_spawn_decoder", spawn)
-    # Block forever in the dwell consumer — only the parent stop should
-    # unblock us.
+    monkeypatch.setattr(survey, "_spawn_falcon", spawn)
+
+    # Block forever in tail_csv — only the parent stop should unblock us.
     def block(*a, **kw):
-        kw["dwell_stop"].wait()
-    monkeypatch.setattr(survey, "_consume_cell_dwell", block)
+        kw["stop"].wait()
+        return iter(())
+    monkeypatch.setattr(survey, "tail_csv", block)
 
     state = State()
     stop = threading.Event()
@@ -125,37 +122,37 @@ def test_run_survey_loop_exits_when_stop_fires(monkeypatch, tmp_path):
     t0 = time.monotonic()
     survey.run_survey_loop(state, cells=cells,
                            dwell_seconds=60.0, total_seconds=60.0,
-                           decoder="falcon", mission_id="t",
+                           mission_id="t",
                            out_dir=str(tmp_path), stop=stop)
     elapsed = time.monotonic() - t0
     # Should exit within a fraction of a second after stop fires.
     assert elapsed < 2.0
 
 
-def test_run_survey_loop_terminates_subprocess_on_dwell_end(monkeypatch, tmp_path):
+def test_run_survey_loop_terminates_subprocess_on_dwell_end(monkeypatch,
+                                                             tmp_path):
     """Every spawned subprocess must be terminated before we move to
     the next cell. No leaked decoders."""
     spawned: list[_FakeProc] = []
 
-    def spawn(*_a, **_kw):
+    def spawn(cell, csv_path):
         p = _FakeProc()
         spawned.append(p)
         return p
 
-    monkeypatch.setattr(survey, "_spawn_decoder", spawn)
-    monkeypatch.setattr(survey, "_consume_cell_dwell",
-                        lambda *a, **kw: kw["dwell_stop"].wait())
+    monkeypatch.setattr(survey, "_spawn_falcon", spawn)
+    monkeypatch.setattr(survey, "tail_csv",
+                        lambda *a, **kw: iter(()))
 
     state = State()
     stop = threading.Event()
     cells = [_cell(1850, 271), _cell(1851, 88), _cell(1852, 42)]
     survey.run_survey_loop(state, cells=cells,
                            dwell_seconds=0.1, total_seconds=0.4,
-                           decoder="falcon", mission_id="t",
+                           mission_id="t",
                            out_dir=str(tmp_path), stop=stop)
 
-    # All but possibly the very last spawned process should be terminated.
-    # In practice every one should be, since terminate runs in finally.
+    # All spawned processes should be terminated (terminate runs in finally).
     for p in spawned:
         assert p.poll() == 0  # i.e. not alive
 
@@ -164,6 +161,7 @@ def test_run_survey_loop_handles_empty_cell_list(tmp_path):
     state = State()
     errors: list[str] = []
     orig = state.set_status
+
     def capture(phase, **kw):
         errors.append(phase + ":" + kw.get("message", ""))
         return orig(phase, **kw)
@@ -171,28 +169,28 @@ def test_run_survey_loop_handles_empty_cell_list(tmp_path):
     stop = threading.Event()
     survey.run_survey_loop(state, cells=[],
                            dwell_seconds=1.0, total_seconds=1.0,
-                           decoder="falcon", mission_id="t",
+                           mission_id="t",
                            out_dir=str(tmp_path), stop=stop)
     assert any("empty cell list" in e for e in errors)
 
 
-def test_run_survey_loop_unknown_decoder_raises_during_spawn(monkeypatch,
-                                                              tmp_path):
-    """_spawn_decoder rejects unknown decoders; survey surfaces the
-    error via State.set_status and returns rather than looping forever."""
-    # Use the real _spawn_decoder so we hit its ValueError path. To
-    # avoid actually trying to find the binary, monkey out subprocess.Popen.
-    monkeypatch.setattr(survey.subprocess, "Popen",
-                        lambda *a, **kw: _FakeProc())
+def test_run_survey_loop_surfaces_spawn_failure(monkeypatch, tmp_path):
+    """If FalconEye isn't on PATH, _spawn_falcon raises FileNotFoundError;
+    survey surfaces the error via State.set_status and returns rather
+    than looping forever."""
+    def fail_spawn(cell, csv_path):
+        raise FileNotFoundError("FalconEye not found")
+
+    monkeypatch.setattr(survey, "_spawn_falcon", fail_spawn)
     state = State()
     errors: list[str] = []
+
     def capture_status(phase, **kw):
         errors.append(phase + ":" + str(kw.get("message", "")))
     state.set_status = capture_status
     stop = threading.Event()
     survey.run_survey_loop(state, cells=[_cell()],
                            dwell_seconds=0.5, total_seconds=1.0,
-                           decoder="not-a-real-decoder",
                            mission_id="t", out_dir=str(tmp_path),
                            stop=stop)
     assert any("spawn failed" in e for e in errors)
@@ -204,6 +202,7 @@ def test_state_set_survey_status_broadcasts_and_clears():
     state = State()
     seen: list[Optional[dict]] = []
     orig = state._broadcast
+
     def cap(ev):
         if ev.get("type") == "survey":
             seen.append(ev.get("survey"))

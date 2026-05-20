@@ -3,8 +3,11 @@
 We can't plug a USRP into a CI runner, so this module produces text
 streams that look like:
 
-  • LTESniffer `DECODED key=value` lines (parsed by `sniffer.parse_ltesniffer`)
-  • `gpspipe -w` JSON stream (parsed by `sniffer.parse_gpsd`)
+  • FalconEye TSV rows (parsed by `sniffer.falcon`), with the two
+    optional simulator extension columns `ul_rssi_dbm` and
+    `ta_n_steps` filled in on UL rows so positioning estimators can
+    converge in the simulator.
+  • `gpspipe -w` JSON stream (parsed by `sniffer.parse_gpsd`).
 
 …for a configurable eNB + UE roster + drone trajectory under a
 log-distance path-loss model with optional shadow fading.
@@ -92,7 +95,7 @@ class SimulationConfig:
     waypoints: list[Waypoint] = field(default_factory=list)
     ues: list[UeProfile] = field(default_factory=list)
     gps_period_s: float = 0.1     # one gpsd TPV every 0.1 s
-    ltesniffer_period_s: float = 0.05  # PDCCH decode tick (20 Hz)
+    falcon_period_s: float = 0.05  # PDCCH decode tick (20 Hz)
     shadow_fading_db: float = 1.5
     seed: int = 0
     # eNB-DL is the gate: if the drone can't even hear the cell, no PDCCH
@@ -266,21 +269,72 @@ def _default_ues(emitter: Emitter) -> list[UeProfile]:
     return [ue_a, ue_b, ue_c]
 
 
-def ltesniffer_lines(cfg: SimulationConfig) -> Iterator[str]:
-    """Yield DECODED key=value lines as if from `LTESniffer --dl-only`.
+# DCI format codes used by the FALCON CSV. We invert the table that the
+# parser uses (sniffer.falcon._DCI_FORMAT_NAMES) so the simulator picks
+# the right integer for each named format.
+_DCI_FORMAT_CODE = {
+    "0":  0,    # UL grant
+    "1":  1,
+    "1A": 2,
+    "1B": 3,
+    "1C": 4,
+    "1D": 5,
+    "2":  6,
+    "2A": 7,
+    "2B": 8,
+    "2C": 9,
+    "2D": 10,
+}
 
-    Each tick (`ltesniffer_period_s`), every UE *may* be granted a PDCCH DCI
-    according to its activity rate. UL grants carry `ul_rssi_dbm` (UE energy
-    at the drone). DL grants carry `dl_rsrp_dbm` (eNB energy at the drone)
-    and are mostly informational — DL energy is the same for all UEs on this
-    cell, so it doesn't help per-UE positioning.
+
+def _falcon_row(*, ts: float, sfn: int, sf: int, rnti: int, direction: int,
+                mcs: int, n_prb: int, tbs: int, fmt: int, harq: int,
+                ul_rssi_dbm: float | None = None,
+                ta_n_steps: int | None = None) -> str:
+    """Format one FalconEye-shaped TSV row (20 stock cols + optional sim cols)."""
+    base = [
+        f"{ts:.6f}",          # 0  timestamp
+        f"{sfn:04d}",         # 1  sfn
+        str(sf),              # 2  subframe
+        str(rnti),            # 3  rnti
+        str(direction),       # 4  direction (1=DL, 0=UL)
+        str(mcs),             # 5  mcs_idx
+        str(n_prb),           # 6  nof_prb
+        str(tbs),             # 7  tbs_sum
+        "-1",                 # 8  tbs_0
+        "-1",                 # 9  tbs_1
+        str(fmt),             # 10 format
+        "0",                  # 11 ndi
+        "-1",                 # 12 ndi_1
+        str(harq),            # 13 harq_process
+        "0",                  # 14 ncce
+        "1",                  # 15 L
+        "1",                  # 16 cfi
+        "16",                 # 17 histval (well above false-positive floor)
+        "39",                 # 18 nof_bits
+        "00",                 # 19 hex
+    ]
+    if ul_rssi_dbm is not None or ta_n_steps is not None:
+        base.append(f"{ul_rssi_dbm:.2f}" if ul_rssi_dbm is not None else "-1")
+        base.append(str(ta_n_steps) if ta_n_steps is not None else "-1")
+    return "\t".join(base) + "\n"
+
+
+def falcon_lines(cfg: SimulationConfig) -> Iterator[str]:
+    """Yield FalconEye-shaped TSV rows from the simulator.
+
+    Each tick (`falcon_period_s`), every UE *may* be granted a PDCCH DCI
+    according to its activity rate. UL rows include the two simulator
+    extension columns (`ul_rssi_dbm`, `ta_n_steps`) so positioning
+    estimators can converge — real FalconEye output omits these and
+    the dashboard correctly flips into "DL-only" mode in that case.
     """
     rng = random.Random(cfg.seed + 3)
     em = cfg.emitter
     if not cfg.waypoints:
         return
     ues = cfg.ues if cfg.ues else _default_ues(em)
-    yield f"# simulated LTESniffer stream for mission {cfg.mission_id}\n"
+    yield f"# simulated FalconEye stream for mission {cfg.mission_id}\n"
     yield (f"# target cell PCI={em.pci} EARFCN={em.earfcn} "
            f"@ {em.center_hz/1e6:.1f} MHz\n")
     t = cfg.waypoints[0].t_offset_s
@@ -288,13 +342,14 @@ def ltesniffer_lines(cfg: SimulationConfig) -> Iterator[str]:
     frame = 0
     subframe = 0
     while t <= t_end:
-        # A simulated-clock marker on every tick. Parser ignores comment
-        # lines; the test driver picks these up to advance its simulated
-        # mono_ns clock so GPS↔UE timestamp joins line up.
+        # A simulated-clock marker on every tick. The Falcon parser
+        # ignores comment lines; the test driver picks these up to
+        # advance its simulated mono_ns clock so GPS↔UE timestamp joins
+        # line up.
         yield f"# TICK t={t:.6f}\n"
         drone = _interp_waypoint(cfg.waypoints, t)
         if drone is None:
-            t += cfg.ltesniffer_period_s
+            t += cfg.falcon_period_s
             subframe = (subframe + 1) % 10
             if subframe == 0:
                 frame = (frame + 1) % 1024
@@ -303,7 +358,7 @@ def ltesniffer_lines(cfg: SimulationConfig) -> Iterator[str]:
         dl_rsrp = _rsrp_dbm(em, drone, rng, cfg.shadow_fading_db)
         # Cell unreachable from the drone in this position — no PDCCH decode.
         if dl_rsrp < cfg.detect_threshold_rsrp_dbm:
-            t += cfg.ltesniffer_period_s
+            t += cfg.falcon_period_s
             subframe = (subframe + 1) % 10
             if subframe == 0:
                 frame = (frame + 1) % 1024
@@ -311,7 +366,7 @@ def ltesniffer_lines(cfg: SimulationConfig) -> Iterator[str]:
 
         for ue in ues:
             # Bernoulli scheduling per tick.
-            p_grant = ue.activity_rate_hz * cfg.ltesniffer_period_s
+            p_grant = ue.activity_rate_hz * cfg.falcon_period_s
             if rng.random() >= p_grant:
                 continue
             ue_pos = _ue_position(ue, t)
@@ -333,26 +388,23 @@ def ltesniffer_lines(cfg: SimulationConfig) -> Iterator[str]:
                 )
                 ta_n = max(0, min(_TA_N_STEPS_MAX,
                                   round(slant_m / TA_STEP_METERS)))
-                yield (
-                    f"DECODED frame={frame} subframe={subframe} "
-                    f"pci={em.pci} c_rnti={ue.c_rnti:#06x} "
-                    f"format=0 direction=UL "
-                    f"mcs={mcs} prb={n_prb} tbs={tbs} "
-                    f"ul_rssi_dbm={rssi:.2f} ta_n_steps={ta_n}\n"
+                yield _falcon_row(
+                    ts=t, sfn=frame, sf=subframe, rnti=ue.c_rnti,
+                    direction=0, mcs=mcs, n_prb=n_prb, tbs=tbs,
+                    fmt=_DCI_FORMAT_CODE["0"], harq=rng.randint(0, 7),
+                    ul_rssi_dbm=rssi, ta_n_steps=ta_n,
                 )
             else:
                 mcs = rng.randint(4, 27)
                 n_prb = rng.choice([2, 4, 8, 16, 25, 50])
                 tbs = 80 + mcs * n_prb * 10
-                yield (
-                    f"DECODED frame={frame} subframe={subframe} "
-                    f"pci={em.pci} c_rnti={ue.c_rnti:#06x} "
-                    f"format=1A direction=DL "
-                    f"mcs={mcs} prb={n_prb} tbs={tbs} "
-                    f"dl_rsrp_dbm={dl_rsrp:.2f}\n"
+                yield _falcon_row(
+                    ts=t, sfn=frame, sf=subframe, rnti=ue.c_rnti,
+                    direction=1, mcs=mcs, n_prb=n_prb, tbs=tbs,
+                    fmt=_DCI_FORMAT_CODE["1A"], harq=rng.randint(0, 7),
                 )
 
-        t += cfg.ltesniffer_period_s
+        t += cfg.falcon_period_s
         subframe = (subframe + 1) % 10
         if subframe == 0:
             frame = (frame + 1) % 1024

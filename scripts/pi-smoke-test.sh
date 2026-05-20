@@ -107,10 +107,8 @@ note "python: $(python3 --version 2>&1)"
 phase "1. Code sanity — imports + CLI parse"
 if python3 -c "
 import sniffer.cli, sniffer.live, sniffer.scan, sniffer.sib1, sniffer.survey
-import sniffer.falcon, sniffer.parse_ltesniffer, sniffer.parse_gpsd
-import sniffer.parse_droneid, sniffer.droneid_hackrf, sniffer.spectrum
-import sniffer.localize, sniffer.ta_multilateration
-import sniffer.simulate, sniffer.schema, sniffer.lte_bands
+import sniffer.falcon, sniffer.parse_gpsd, sniffer.spectrum, sniffer.uhd_sweep
+import sniffer.localize, sniffer.simulate, sniffer.schema, sniffer.lte_bands
 " 2>&1; then
   pass "all sniffer.* modules import"
 else
@@ -191,7 +189,7 @@ fi
 # --- phase 5: decoder binaries on PATH ------------------------------------
 
 phase "5. Decoder binaries"
-for bin in srsran_cell_search FalconEye LTESniffer hackrf_sweep; do
+for bin in srsran_cell_search FalconEye hackrf_sweep; do
   if command -v "$bin" >/dev/null 2>&1; then
     pass "$bin -> $(command -v $bin)"
   else
@@ -252,7 +250,7 @@ fi
 
 # --- phase 8: C-RNTI extraction (single cell) — THE CORE TEST -------------
 
-phase "8. C-RNTI extraction (single cell) — sniffer live --decoder falcon"
+phase "8. C-RNTI extraction (single cell) — sniffer live (FalconEye)"
 if $SKIP_RADIO; then
   skip "--no-radio set"
 elif [[ -z "$EARFCN_PIN" || -z "$PCI_PIN" ]]; then
@@ -260,7 +258,7 @@ elif [[ -z "$EARFCN_PIN" || -z "$PCI_PIN" ]]; then
 elif ! command -v FalconEye >/dev/null 2>&1; then
   fail "FalconEye not installed — this is the working decoder. \`sniffer install\` should build it; if it fails, see scripts/install-linux.sh phase 3.5."
 else
-  LIVE_PID=$(start_bg "python3 -m sniffer.cli live --decoder falcon \
+  LIVE_PID=$(start_bg "python3 -m sniffer.cli live \
                        --earfcn $EARFCN_PIN --pci $PCI_PIN --port $PORT \
                        --out-dir /tmp/sniffer-live" "live" 30 || true)
   if [[ -z "${LIVE_PID:-}" ]]; then

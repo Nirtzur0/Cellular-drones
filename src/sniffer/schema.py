@@ -40,7 +40,7 @@ class Attitude:
 
 @dataclass
 class RadioConfig:
-    backend: str  # ltesniffer | srsran | sim
+    backend: str  # falcon | sim
     device: str  # e.g. usrp-b210-0000...
     earfcn: Optional[int] = None
     center_hz: Optional[float] = None
@@ -75,8 +75,10 @@ class UeEvent:
     # Round-trip Timing Advance. Encodes UE-to-drone (or UE-to-eNB) distance.
     #   ta_n_steps  → raw LTE TA step count (0–1282; 1 step ≈ 78.125 m one-way)
     #   ta_meters   → one-way distance derived from ta_n_steps via __post_init__.
-    # Both null on PDCCH-only paths (LTESniffer's published build doesn't
-    # emit TA; TA lives in RAR / MAC CE on PDSCH).
+    # Both null on real-radio PDCCH-only paths (FalconEye CSV doesn't
+    # emit TA; TA lives in RAR / MAC CE on PDSCH). The simulator emits
+    # them in extension columns so positioning estimators converge in
+    # the hardware-free path.
     ta_n_steps: Optional[int] = None
     ta_meters: Optional[float] = None
     raw: dict[str, Any] = field(default_factory=dict)

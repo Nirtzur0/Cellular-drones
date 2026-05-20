@@ -1,12 +1,13 @@
-"""HackRF live spectrum scanner.
+"""USRP live spectrum scanner.
 
-Drives `hackrf_sweep` as a long-running subprocess, parses its CSV output,
-maintains a rolling (frequency → power_dBFS) snapshot, and pushes those
-snapshots to live.State so the dashboard can render a waterfall.
+Drives `sniffer.uhd_sweep` as a long-running subprocess, parses its CSV
+output (same schema hackrf_sweep emits), and maintains a rolling
+(frequency → power_dBFS) snapshot. The dashboard renders the snapshots
+as a waterfall.
 
-Only one process can hold the HackRF at a time, so this scanner is mutually
-exclusive with the LTESniffer path. The dashboard auto-disables it when
-real-radio LTE sniffing is active.
+Only one process can hold a USRP at a time, so this scanner is mutually
+exclusive with the FALCON path. The dashboard auto-disables it when
+real-radio LTE sniffing is active (FalconEye holds the radio).
 """
 
 from __future__ import annotations
@@ -16,13 +17,14 @@ import csv
 import io
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional
 
 
 class SpectrumScanner:
-    """Background thread that runs `hackrf_sweep` and reports per-bin power."""
+    """Background thread that runs the UHD sweeper and reports per-bin power."""
 
     def __init__(
         self,
@@ -31,19 +33,15 @@ class SpectrumScanner:
         freq_start_mhz: int = 700,
         freq_end_mhz: int = 2700,
         bin_width_hz: int = 1_000_000,
-        lna_gain: int = 32,
-        vga_gain: int = 32,
-        amp_enable: bool = True,
         history_seconds: int = 60,
+        gain_db: float = 60.0,
     ) -> None:
         self._on_snapshot = on_snapshot
         self._freq_start_mhz = freq_start_mhz
         self._freq_end_mhz = freq_end_mhz
         self._bin_width_hz = bin_width_hz
-        self._lna = lna_gain
-        self._vga = vga_gain
-        self._amp = amp_enable
-        # One snapshot per completed sweep — keyed by start time.
+        self._gain_db = gain_db
+        # One snapshot per ~1 s of accumulated sweep rows.
         self._history: collections.deque[dict] = collections.deque(
             maxlen=history_seconds
         )
@@ -59,8 +57,8 @@ class SpectrumScanner:
     def start(self) -> None:
         if self._running:
             return
-        if shutil.which("hackrf_sweep") is None:
-            self._error = "hackrf_sweep not on PATH"
+        if shutil.which(sys.executable) is None:
+            self._error = "no python interpreter on PATH"
             return
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -101,17 +99,14 @@ class SpectrumScanner:
     # --- main loop ----------------------------------------------------
 
     def _run(self) -> None:
-        """Run hackrf_sweep until stop() is called. One CSV line per bin
-        chunk; we aggregate per sweep cycle (when frequency wraps)."""
+        """Run `python -m sniffer.uhd_sweep` until stop() is called.
+        uhd_sweep emits CSV rows in the same schema hackrf_sweep emits;
+        we aggregate across rows at a fixed publish cadence."""
         cmd = [
-            "hackrf_sweep",
+            sys.executable, "-m", "sniffer.uhd_sweep",
             "-f", f"{self._freq_start_mhz}:{self._freq_end_mhz}",
-            "-w", str(self._bin_width_hz),
-            "-l", str(self._lna),
-            "-g", str(self._vga),
+            "--gain", str(self._gain_db),
         ]
-        if self._amp:
-            cmd += ["-a", "1"]
         while self._running:
             try:
                 self._proc = subprocess.Popen(
@@ -122,7 +117,7 @@ class SpectrumScanner:
                     bufsize=1,
                 )
             except Exception as exc:  # noqa: BLE001
-                self._error = f"failed to spawn hackrf_sweep: {exc}"
+                self._error = f"failed to spawn uhd_sweep: {exc}"
                 return
             self._consume_csv(self._proc.stdout)
             try:
@@ -131,16 +126,12 @@ class SpectrumScanner:
                 pass
             if not self._running:
                 return
-            # If hackrf_sweep died, wait a bit and respawn — HackRF USB
-            # hiccups happen sporadically and re-attaching usually works.
             time.sleep(2.0)
 
     def _consume_csv(self, stream) -> None:
-        """Parse hackrf_sweep CSV stream; publish a snapshot at a fixed
-        cadence rather than per-sweep — hackrf_sweep's frequency-hop
-        order is not strictly increasing so wrap detection is unreliable.
-        Instead, accumulate all rows for ~1 s of wall clock, then publish
-        whatever we have."""
+        """Parse CSV stream; publish a snapshot every ~1 s. Decay older
+        peaks 6 dB per refresh so the waterfall doesn't get pinned by a
+        one-time spike."""
         if stream is None:
             return
         cur: dict[int, float] = {}
@@ -166,8 +157,6 @@ class SpectrumScanner:
             now = time.time()
             if now - last_publish_t >= publish_interval_s and cur:
                 self._publish(cur)
-                # Keep a fading copy: start fresh but seed with current values
-                # 6 dB lower so old peaks decay rather than vanish.
                 cur = {k: v - 6.0 for k, v in cur.items()}
                 last_publish_t = now
 

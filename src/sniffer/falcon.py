@@ -1,17 +1,16 @@
 """FalconEye DCI CSV → `ue_sighting` JSONL.
 
 `FalconEye -f <hz> -D /tmp/dci.csv` writes one tab-separated row per
-decoded DCI. Unlike LTESniffer (which only writes PCAP), FALCON
-emits text designed for tailing — exactly the input shape our pipeline
-already consumes from `parse_ltesniffer`. This module is the tail +
-parser; `live.py:run_falcon_loop` is the subprocess + sink wiring.
+decoded DCI. Each row is text designed for tailing, which is what
+`live.py:run_falcon_loop` does. This module is the parser; the live
+loop is the subprocess + sink wiring.
 
 CSV format (verified against
 `src/eye/phy/SubframeInfoConsumer.cc` in falkenber9/falcon@master):
 
   - No header row.
   - Tab-separated.
-  - 20 columns:
+  - 20 columns from FalconEye itself:
       0  timestamp     (float, e.g. "1700000123.456789")
       1  sfn           (zero-padded 4-digit int)
       2  subframe      (int 0..9)
@@ -32,6 +31,10 @@ CSV format (verified against
      17  histval       (int — RNTI histogram bucket count)
      18  nof_bits      (int)
      19  hex           (hex string, the raw DCI payload)
+  - Optional extension columns from the simulator only (real FalconEye
+    never emits these, so positioning is "DL-only" on real hardware):
+     20  ul_rssi_dbm   (float, UL grants only — UE→drone RSSI estimate)
+     21  ta_n_steps    (int, UL grants only — LTE timing-advance steps)
 
 FalconEye locks to one cell at a time — there's no PCI column. The
 caller passes the PCI it asked the decoder to target; we stamp every
@@ -132,6 +135,18 @@ def parse_csv_row(cols: list[str]) -> Optional[dict]:
             "histval":  cols[17],
         },
     }
+    # Simulator-only extension columns: real FalconEye never emits
+    # them, but the simulator appends `ul_rssi_dbm` (col 20) and
+    # `ta_n_steps` (col 21) on UL rows so positioning estimators
+    # have something to integrate against.
+    if len(cols) >= 21:
+        ul_rssi = _to_float(cols[20])
+        if ul_rssi is not None:
+            out["ul_rssi_dbm"] = ul_rssi
+    if len(cols) >= 22:
+        ta_n = _to_int(cols[21])
+        if ta_n is not None and ta_n >= 0:
+            out["ta_n_steps"] = ta_n
     # FALCON's `histval` is the RNTI histogram bucket count — when it's
     # very small the decode is more likely a false positive (per the
     # paper). Stash for downstream filtering; not exposed in the schema.
@@ -159,6 +174,8 @@ def _make_record(args, clock_ns: Callable[[], int],
         n_prb=fields.get("n_prb"),
         harq_id=fields.get("harq_id"),
         tbs_bytes=fields.get("tbs_bytes"),
+        ul_rssi_dbm=fields.get("ul_rssi_dbm"),
+        ta_n_steps=fields.get("ta_n_steps"),
         raw=fields.get("raw", {}),
     )
     return UeSighting(
@@ -182,9 +199,8 @@ def parse_stream(
 ) -> int:
     """Consume FalconEye CSV lines; write UeSighting JSONL.
 
-    Mirrors `parse_ltesniffer.parse_stream` contract. `pci` is mandatory
-    because FALCON locks to one cell and never writes the PCI itself —
-    the caller knows it from the `-f <hz>` it passed.
+    `pci` is mandatory because FALCON locks to one cell and never writes
+    the PCI itself — the caller knows it from the `-f <hz>` it passed.
 
     Returns the number of records emitted.
     """
@@ -208,7 +224,7 @@ def parse_stream(
 
 def tail_csv(path: str, *, stop: threading.Event,
              poll_interval_s: float = 0.1,
-             startup_wait_s: float = 30.0) -> Iterator[str]:
+             startup_wait_s: float = 600.0) -> Iterator[str]:
     """Tail a CSV file as it grows. Robust to:
 
       - File not existing yet (FalconEye creates it on first DCI).
@@ -220,9 +236,11 @@ def tail_csv(path: str, *, stop: threading.Event,
     Yields complete lines (with trailing `\\n` stripped). Partial
     lines are buffered until a newline arrives.
     """
-    # Wait for the file to appear. FalconEye on a quiet cell may not
-    # create it for a while; bail after `startup_wait_s` to surface a
-    # clear failure rather than blocking the dashboard forever.
+    # Wait for the file to appear. FalconEye on a quiet cell can take
+    # 4+ minutes to emit the first DCI on a Pi-class host (cell search +
+    # MIB + SIB1 + PDCCH brute-force), so the default is 10 min. Bail
+    # eventually so a wrong frequency / silent cell surfaces clearly
+    # rather than blocking the dashboard forever.
     waited = 0.0
     while not os.path.exists(path):
         if stop.is_set():

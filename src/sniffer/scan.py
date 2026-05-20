@@ -7,9 +7,8 @@ This module spawns it, parses its stdout permissively, optionally
 enriches each found cell with PLMN/TAC/CGI via `sib1.decode_sib1`, and
 emits a table or JSONL.
 
-Output format drifts between srsRAN versions; the parser is built like
-`parse_ltesniffer.normalize_line` — pull `key=value` pairs out of any
-recognisable line and ignore the rest.
+Output format drifts between srsRAN versions; the parser is permissive
+— pull `key=value` pairs out of any recognisable line and ignore the rest.
 """
 
 from __future__ import annotations

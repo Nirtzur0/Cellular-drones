@@ -1,9 +1,9 @@
 """End-to-end pipeline test.
 
 Drives the simulator through the same modules the live dashboard uses
-(`simulate.ltesniffer_lines` → `parse_ltesniffer.parse_stream` →
-JSONL → `weighted_centroid_ue`) and asserts that stationary UEs
-localize to within tolerance of the synthetic ground truth.
+(`simulate.falcon_lines` → `falcon.parse_stream` → JSONL →
+`weighted_centroid_ue`) and asserts that stationary UEs localize to
+within tolerance of the synthetic ground truth.
 
 This is the live path, not a separate batch path — there is no
 geotag / report / demo module in between.
@@ -20,10 +20,9 @@ from collections import defaultdict
 from pyproj import Geod
 
 from sniffer import simulate
+from sniffer.falcon import parse_stream as parse_falcon_stream
 from sniffer.localize import weighted_centroid_ue
 from sniffer.parse_gpsd import parse_stream as parse_gpsd_stream
-from sniffer.parse_ltesniffer import parse_stream as parse_ltesniffer_stream
-from sniffer.ta_multilateration import ta_multilateration_ue
 
 GEOD = Geod(ellps="WGS84")
 _TICK_RE = re.compile(r"^#\s*TICK\s+t=([-\d.]+)")
@@ -77,7 +76,7 @@ def _run_pipeline(cfg: simulate.SimulationConfig) -> list[dict]:
     ue_buf = _JsonlBuf()
 
     def ue_clocked():
-        for line in simulate.ltesniffer_lines(cfg):
+        for line in simulate.falcon_lines(cfg):
             m = _TICK_RE.match(line)
             if m:
                 sim_clock_ns["value"] = int(float(m.group(1)) * 1e9)
@@ -87,7 +86,8 @@ def _run_pipeline(cfg: simulate.SimulationConfig) -> list[dict]:
     args = Namespace(mission_id=cfg.mission_id, backend="sim",
                      device="sim", center_hz=cfg.emitter.center_hz,
                      sample_rate_sps=23.04e6, rx_gain_db=0.0)
-    parse_ltesniffer_stream(ue_clocked(), args, ue_buf, clock_ns=clock_ns)
+    parse_falcon_stream(ue_clocked(), args, ue_buf,
+                        pci=cfg.emitter.pci, clock_ns=clock_ns)
 
     # Join: for each UE sighting, attach the nearest GPS fix within 500 ms.
     # This is the same rule `live.State._nearest_gps_locked` enforces.
@@ -141,19 +141,6 @@ def test_e2e_pipeline_localizes_stationary_ues() -> None:
         _, _, err = GEOD.inv(truth.lon, truth.lat, cent.lon, cent.lat)
         assert err < 100.0, (
             f"stationary UE {rnti:#06x} centroid error {err:.1f} m too large"
-        )
-
-        # TA multilateration runs alongside the centroid (independent estimator,
-        # not a fallback). For stationary UEs with the simulator's range-banded
-        # TA, it should beat the centroid comfortably.
-        ta = ta_multilateration_ue(recs)
-        assert ta is not None, (
-            f"TA multilateration refused on stationary UE {rnti:#06x} "
-            f"(got {len(recs)} UL records, all with ta_meters)"
-        )
-        _, _, ta_err = GEOD.inv(truth.lon, truth.lat, ta.lon, ta.lat)
-        assert ta_err < 50.0, (
-            f"stationary UE {rnti:#06x} TA error {ta_err:.1f} m too large"
         )
 
     # Mobile UE: produces a result, but bias is allowed.

@@ -1,9 +1,9 @@
 """Multi-cell sweep + dwell orchestrator.
 
-C-RNTI is cell-scoped — a single-cell sniffer (LTESniffer / FalconEye)
-only enumerates UEs on that one PCI. To get a *census* of UEs visible
-from the airspace, you have to visit each cell in turn. This module is
-the "visit each cell in turn" loop.
+C-RNTI is cell-scoped — FalconEye only enumerates UEs on the one cell
+it's locked to. To get a *census* of UEs visible from the airspace,
+you have to visit each cell in turn. This module is the "visit each
+cell in turn" loop.
 
 Architecture:
 
@@ -24,17 +24,11 @@ The accumulated dashboard State carries every C-RNTI we've ever seen
 across every cell visited. The simulator's single-cell model degenerates
 this loop to one entry — useful for unit testing the orchestrator
 without real hardware.
-
-LTESniffer support is structurally present but practically a no-op:
-LTESniffer writes PCAP files, not the line-oriented CSV/text our parser
-consumes. FalconEye is the working decoder for this flow.
 """
 
 from __future__ import annotations
 
-import io
 import os
-import shlex
 import subprocess
 import tempfile
 import threading
@@ -43,13 +37,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from sniffer.falcon import parse_stream as parse_falcon_stream, tail_csv
-from sniffer.parse_ltesniffer import (
-    normalize_stream,
-    parse_stream as parse_ltesniffer_stream,
-)
 
 if TYPE_CHECKING:
-    from sniffer.live import State, _UeSightingSink, _ParseArgs
+    from sniffer.live import State
 
 
 @dataclass(frozen=True)
@@ -60,69 +50,20 @@ class SurveyCell:
     center_hz: int
 
 
-def _spawn_decoder(decoder: str, cell: SurveyCell, antennas: int,
-                   threads: int, csv_path: Optional[str]) -> subprocess.Popen:
-    """Build and launch the decoder subprocess for one cell."""
-    if decoder == "falcon":
-        binname = os.environ.get("FALCON_BIN", "FalconEye")
-        cmd = [binname, "-f", str(int(cell.center_hz)), "-D", str(csv_path)]
-        return subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT, text=True, bufsize=1,
-        )
-    if decoder == "ltesniffer":
-        binname = os.environ.get("LTESNIFFER_BIN", "LTESniffer")
-        cmd = [binname,
-               "-A", str(antennas), "-W", str(threads),
-               "-f", str(int(cell.center_hz)),
-               "-I", str(cell.pci),
-               "-m", "0",
-               "-a", "num_recv_frames=512"]
-        return subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-    raise ValueError(f"unknown decoder: {decoder!r}")
-
-
-def _consume_cell_dwell(decoder: str, cell: SurveyCell, *,
-                        proc: subprocess.Popen,
-                        csv_path: Optional[str],
-                        sink: "_UeSightingSink",
-                        parse_args: "_ParseArgs",
-                        dwell_stop: threading.Event) -> None:
-    """Parse the decoder's output into `sink` until `dwell_stop` fires.
-
-    Returns when the dwell timer ends or the decoder exits. Caller is
-    responsible for terminating the subprocess.
-    """
-    if decoder == "falcon":
-        assert csv_path is not None
-        stream = tail_csv(csv_path, stop=dwell_stop, poll_interval_s=0.05)
-        parse_falcon_stream(stream, parse_args, sink, pci=cell.pci)
-        return
-    if decoder == "ltesniffer":
-        # LTESniffer's stdout statistics aren't per-DCI text — we
-        # consume it to keep the pipe from filling, but no records
-        # will land. PCAP tailing is a separate task.
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            if dwell_stop.is_set():
-                return
-            # Pass through the normalize stage in case a custom
-            # build does emit DECODED key=value lines.
-            _ = normalize_stream(iter([line]))
-        return
-    raise ValueError(f"unknown decoder: {decoder!r}")
+def _spawn_falcon(cell: SurveyCell, csv_path: str) -> subprocess.Popen:
+    """Build and launch the FalconEye subprocess for one cell."""
+    binname = os.environ.get("FALCON_BIN", "FalconEye")
+    cmd = [binname, "-f", str(int(cell.center_hz)), "-D", csv_path]
+    return subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
 
 
 def run_survey_loop(state: "State", *,
                     cells: list[SurveyCell],
                     dwell_seconds: float,
                     total_seconds: float,
-                    decoder: str = "falcon",
-                    antennas: int = 2,
-                    threads: int = 4,
                     mission_id: str,
                     out_dir: str,
                     stop: threading.Event) -> None:
@@ -158,7 +99,7 @@ def run_survey_loop(state: "State", *,
             this_dwell = min(dwell_seconds, remaining)
             state.set_survey_status({
                 "phase": "dwelling",
-                "decoder": decoder,
+                "decoder": "falcon",
                 "cycle": cycle,
                 "cell_idx": i + 1,
                 "cells_total": len(cells),
@@ -171,8 +112,8 @@ def run_survey_loop(state: "State", *,
             })
             parse_args = _ParseArgs(
                 mission_id=mission_id,
-                backend=decoder,
-                device=f"survey-{decoder}",
+                backend="falcon",
+                device="survey-falcon",
                 rx_gain_db=50.0,
                 center_hz=cell.center_hz,
                 sample_rate_sps=23.04e6,
@@ -189,15 +130,13 @@ def run_survey_loop(state: "State", *,
             )
             parent_watch.start()
 
-            csv_path: Optional[str] = None
-            tmpdir = None
+            tmpdir: Optional[tempfile.TemporaryDirectory] = None
+            proc: Optional[subprocess.Popen] = None
             try:
-                if decoder == "falcon":
-                    tmpdir = tempfile.TemporaryDirectory(prefix="falcon_survey_")
-                    csv_path = os.path.join(tmpdir.name, "dci.csv")
-                proc = _spawn_decoder(decoder, cell, antennas, threads,
-                                      csv_path)
-            except (FileNotFoundError, ValueError) as exc:
+                tmpdir = tempfile.TemporaryDirectory(prefix="falcon_survey_")
+                csv_path = os.path.join(tmpdir.name, "dci.csv")
+                proc = _spawn_falcon(cell, csv_path)
+            except FileNotFoundError as exc:
                 state.set_status("error",
                                  message=f"survey decoder spawn failed: {exc}")
                 t_dwell.cancel()
@@ -208,24 +147,25 @@ def run_survey_loop(state: "State", *,
             try:
                 with open(out_path, "a", encoding="utf-8") as jsonl_fh:
                     sink = _UeSightingSink(state, jsonl_out=jsonl_fh)
-                    _consume_cell_dwell(decoder, cell, proc=proc,
-                                        csv_path=csv_path, sink=sink,
-                                        parse_args=parse_args,
-                                        dwell_stop=dwell_stop)
+                    stream = tail_csv(csv_path, stop=dwell_stop,
+                                      poll_interval_s=0.05)
+                    parse_falcon_stream(stream, parse_args, sink,
+                                        pci=cell.pci)
             except Exception as exc:  # noqa: BLE001
                 state.set_status("error",
                                  message=f"survey parse failed: {exc}")
             finally:
                 t_dwell.cancel()
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
-                try:
-                    proc.wait(timeout=3.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                if proc is not None:
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        proc.wait(timeout=3.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
                 if tmpdir is not None:
                     tmpdir.cleanup()
     state.set_status("survey_done", cycles=cycle, cells=len(cells))

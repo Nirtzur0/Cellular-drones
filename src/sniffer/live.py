@@ -1,12 +1,14 @@
 """Realtime browser dashboard for C-RNTI sniffing + per-UE positioning.
 
-LTESniffer feeds DCI events; gpsd feeds positions. The aggregator joins
-them in monotonic time, runs the per-UE localizer, and pushes per-UE
-state to connected browsers over Server-Sent Events. Stdlib HTTP only.
+FalconEye feeds DCI events (real radio) or the simulator does (no
+hardware). gpsd feeds positions. The aggregator joins them in
+monotonic time, runs the per-UE localizer, and pushes per-UE state to
+connected browsers over Server-Sent Events. Stdlib HTTP only.
 
 Run:
-    python -m sniffer.live --simulate                # no radio needed
-    python -m sniffer.live --ltesniffer-cmd "..."    # real LTESniffer
+    python -m sniffer.live --simulate                    # no radio needed
+    python -m sniffer.live --falcon-cmd "FalconEye -f 2650000000" \
+                           --falcon-pci 275              # real radio
 
 Open http://127.0.0.1:8000/ in a browser.
 """
@@ -31,14 +33,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterator, Optional
 
 from sniffer.localize import weighted_centroid_ue
-from sniffer.ta_multilateration import ta_multilateration_ue
 from sniffer.falcon import parse_stream as parse_falcon_stream, tail_csv
-from sniffer.parse_droneid import parse_stream as parse_droneid_stream
 from sniffer.parse_gpsd import parse_stream as parse_gpsd_stream
-from sniffer.parse_ltesniffer import (
-    normalize_stream,
-    parse_stream as parse_ltesniffer_stream,
-)
 from sniffer.schema import (
     GpsFix,
     RadioConfig,
@@ -51,8 +47,8 @@ from sniffer.simulate import (
     Emitter,
     SimulationConfig,
     box_trajectory,
+    falcon_lines,
     gpsd_lines,
-    ltesniffer_lines,
 )
 from sniffer.spectrum import SpectrumScanner
 
@@ -65,13 +61,14 @@ RSSI_HISTORY_MAX = 120         # rolling sparkline points
 GPS_TRAIL_MAX = 600            # drone trail points sent in /state snapshot
 
 # How many UE-sightings to observe before concluding "this upstream isn't
-# emitting UE transmit energy at all". The DL-only path (HackRF + DL-only
-# LTESniffer / FalconEye) sees every C-RNTI on PDCCH but never measures
-# `ul_rssi_dbm` — only an actual UL listener (2× USRP or X310) tuned to
-# the UL band can. After this many grants with zero UL-energy hits, we
-# flip a flag so the dashboard can stop promising positioning that will
-# never arrive. 50 is a conservative threshold — at ~10 grants/sec on a
-# busy cell that's ~5 seconds of evidence.
+# emitting UE transmit energy at all". FalconEye on the real radio sees
+# every C-RNTI on PDCCH but never measures `ul_rssi_dbm` — only an actual
+# UL listener (2× USRP or X310) tuned to the UL band can. After this many
+# grants with zero UL-energy hits, we flip a flag so the dashboard can
+# stop promising positioning that will never arrive. 50 is a conservative
+# threshold — at ~10 grants/sec on a busy cell that's ~5 seconds of
+# evidence. The simulator emits synthetic ul_rssi_dbm in extension
+# columns, so it never trips this.
 DL_ONLY_DETECTION_THRESHOLD = 50
 
 
@@ -170,9 +167,7 @@ class State:
                     "dci_formats": [],
                     "ul_rssi_history": deque(maxlen=RSSI_HISTORY_MAX),
                     "geo_history": deque(maxlen=UE_HISTORY_MAX),
-                    "ta_geo_history": deque(maxlen=UE_HISTORY_MAX),
                     "est_position": None,
-                    "est_position_ta": None,
                 }
                 self._ues[key] = entry
 
@@ -223,16 +218,6 @@ class State:
                                    "ul_rssi_dbm": ue.ul_rssi_dbm},
                         })
                         _recompute_ue_position(entry)
-                    if ue.ta_meters is not None:
-                        entry["ta_geo_history"].append({
-                            "kind": "ue_sighting",
-                            "ts_mono_ns": sighting.ts_mono_ns,
-                            "gps": gps_with_age,
-                            "ue": {"pci": pci, "c_rnti": c_rnti,
-                                   "direction": "ul",
-                                   "ta_meters": ue.ta_meters},
-                        })
-                        _recompute_ue_position_ta(entry)
 
             payload = _entry_to_dict_ue(entry)
             dl_only = self._dl_only
@@ -263,8 +248,7 @@ class State:
             ues = [_entry_to_dict_ue(e) for e in self._ues.values()]
             ues.sort(
                 key=lambda u: (
-                    (u.get("est_position") is None
-                     and u.get("est_position_ta") is None),
+                    u.get("est_position") is None,
                     -(u.get("ul_count") or 0),
                     -(u.get("ul_rssi_dbm") or -1e9),
                 )
@@ -288,9 +272,10 @@ class State:
                                 "started_ns": self._started_mono_ns},
                 "spectrum": spectrum,
                 # None until we've seen enough grants to know.
-                # True = DL-only upstream (HackRF / FalconEye / DL-only
-                # LTESniffer). False = UL energy is arriving, positioning
-                # estimators can do their job.
+                # True = DL-only upstream (FalconEye on real radio).
+                # False = UL energy is arriving (simulator, or future
+                # UL-sniffing 2×USRP setup), positioning estimators
+                # can do their job.
                 "dl_only": self._dl_only,
                 # Survey orchestrator progress (None outside survey mode).
                 "survey": (dict(self._survey_status)
@@ -331,12 +316,10 @@ class State:
             for entry in self._ues.values():
                 past = [g for g in entry["geo_history"]
                         if g["ts_mono_ns"] <= at_ts_mono_ns]
-                past_ta = [g for g in entry["ta_geo_history"]
-                           if g["ts_mono_ns"] <= at_ts_mono_ns]
-                if not past and not past_ta:
+                if not past:
                     continue
-                last_g = past[-1] if past else past_ta[-1]
-                cent = weighted_centroid_ue(past) if past else None
+                last_g = past[-1]
+                cent = weighted_centroid_ue(past)
                 est_pos = None
                 if cent is not None:
                     est_pos = {
@@ -346,17 +329,6 @@ class State:
                         "n_samples": cent.n_samples,
                         "altitude_estimated": cent.altitude_estimated,
                     }
-                ta_res = (ta_multilateration_ue(past_ta)
-                          if len(past_ta) >= 4 else None)
-                est_pos_ta = None
-                if ta_res is not None:
-                    est_pos_ta = {
-                        "lat": ta_res.lat, "lon": ta_res.lon,
-                        "alt_m": ta_res.alt_m, "cep95_m": ta_res.cep95_m,
-                        "method": "ta_multilateration",
-                        "n_samples": ta_res.n_samples,
-                        "altitude_estimated": ta_res.altitude_estimated,
-                    }
                 ues_out.append({
                     "key": entry["key"],
                     "pci": entry["pci"],
@@ -365,8 +337,8 @@ class State:
                     "center_hz": entry["center_hz"],
                     "first_seen": entry["first_seen"],
                     "last_seen": last_g.get("ts_utc", entry["first_seen"]),
-                    "count": len(past) or len(past_ta),
-                    "ul_count": len(past) or len(past_ta),
+                    "count": len(past),
+                    "ul_count": len(past),
                     "dl_count": 0,
                     "dci_formats": entry.get("dci_formats", []),
                     "mcs": None, "n_prb": None, "tbs_bytes": None,
@@ -374,17 +346,14 @@ class State:
                     "dl_rsrp_dbm": None,
                     "ul_rssi_history": [],
                     "n_geo_samples": len(past),
-                    "n_ta_samples": len(past_ta),
                     "trail": [{"lat": g["gps"]["lat"],
                                "lon": g["gps"]["lon"],
                                "ul_rssi_dbm": g["ue"]["ul_rssi_dbm"]}
                               for g in past[-40:]],
                     "est_position": est_pos,
-                    "est_position_ta": est_pos_ta,
                 })
             ues_out.sort(
-                key=lambda u: ((u.get("est_position") is None
-                                and u.get("est_position_ta") is None),
+                key=lambda u: (u.get("est_position") is None,
                                -(u.get("ul_count") or 0)),
             )
             return {
@@ -430,10 +399,9 @@ class State:
 
 def _entry_to_dict_ue(entry: dict[str, Any]) -> dict[str, Any]:
     out = {k: v for k, v in entry.items()
-           if k not in ("ul_rssi_history", "geo_history", "ta_geo_history")}
+           if k not in ("ul_rssi_history", "geo_history")}
     out["ul_rssi_history"] = list(entry["ul_rssi_history"])
     out["n_geo_samples"] = len(entry["geo_history"])
-    out["n_ta_samples"] = len(entry["ta_geo_history"])
     trail = list(entry["geo_history"])[-40:]
     out["trail"] = [{"lat": g["gps"]["lat"], "lon": g["gps"]["lon"],
                      "ul_rssi_dbm": g["ue"]["ul_rssi_dbm"]} for g in trail]
@@ -456,36 +424,13 @@ def _recompute_ue_position(entry: dict[str, Any]) -> None:
     }
 
 
-def _recompute_ue_position_ta(entry: dict[str, Any]) -> None:
-    """Mirror of `_recompute_ue_position` for the TA estimator.
-
-    Independent estimator (TA range-based multilateration), not a fallback —
-    runs alongside the centroid when TA-bearing UL grants are available and
-    is rendered as a separately labelled position. Stays None until the
-    solver has enough geometry to refuse-or-converge.
-    """
-    records = list(entry["ta_geo_history"])
-    if len(records) < 4:
-        return
-    res = ta_multilateration_ue(records)
-    if res is None:
-        return
-    entry["est_position_ta"] = {
-        "lat": res.lat, "lon": res.lon,
-        "alt_m": res.alt_m, "cep95_m": res.cep95_m,
-        "method": "ta_multilateration",
-        "n_samples": res.n_samples,
-        "altitude_estimated": res.altitude_estimated,
-    }
-
-
 # --------------------------------------------------------------------------
 # Sinks: bridge parse_stream's JSONL output into the State aggregator
 # --------------------------------------------------------------------------
 
 
 class _UeSightingSink(io.TextIOBase):
-    """parse_ltesniffer writes JSONL strings here; we decode + push to State."""
+    """falcon.parse_stream writes JSONL strings here; we decode + push to State."""
 
     def __init__(self, state: State, jsonl_out: Optional[io.TextIOBase] = None):
         super().__init__()
@@ -582,67 +527,6 @@ class _ParseArgs:
         self.rx_gain_db = rx_gain_db
         self.center_hz = center_hz
         self.sample_rate_sps = sample_rate_sps
-
-
-def run_ltesniffer_loop(state: State, *, ltesniffer_cmd: list[str],
-                        mission_id: str, out_dir: str,
-                        center_hz: Optional[float], rx_gain_db: float,
-                        stop: threading.Event,
-                        normalize: bool = False) -> None:
-    """Spawn LTESniffer, stream its DECODED stdout through parse_ltesniffer.
-
-    The user provides a fully-formed argv via `--ltesniffer-cmd`: this gives
-    them control over which binary, mode, frequency, gain, etc. The process
-    is restarted on exit until `stop` is set.
-
-    Set `normalize=True` when the binary emits human-readable text rather
-    than canonical `DECODED key=value` lines: raw stdout is piped through
-    `normalize_stream` in-process before parsing.
-    """
-    if not ltesniffer_cmd:
-        state.set_status("error", message="no --ltesniffer-cmd provided")
-        return
-    if (shutil.which(ltesniffer_cmd[0]) is None
-            and not os.path.exists(ltesniffer_cmd[0])):
-        state.set_status(
-            "error",
-            message=(f"`{ltesniffer_cmd[0]}` not found. Build LTESniffer "
-                     f"(see scripts/install-linux.sh) and pass --ltesniffer-cmd."),
-        )
-        return
-
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"ue-{mission_id}.jsonl")
-    parse_args = _ParseArgs(mission_id, "ltesniffer", "usrp-b210-0",
-                            rx_gain_db=rx_gain_db, center_hz=center_hz,
-                            sample_rate_sps=23.04e6)
-
-    while not stop.is_set():
-        state.set_status("sniffing", center_hz=center_hz,
-                         gain_db=rx_gain_db, out=out_path)
-        proc = subprocess.Popen(
-            ltesniffer_cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        try:
-            with open(out_path, "a", encoding="utf-8") as jsonl_fh:
-                sink = _UeSightingSink(state, jsonl_out=jsonl_fh)
-                assert proc.stdout is not None
-                stream = (normalize_stream(proc.stdout) if normalize
-                          else proc.stdout)
-                parse_ltesniffer_stream(stream, parse_args, sink)
-        except Exception as exc:  # noqa: BLE001
-            state.set_status("error", message=f"ltesniffer parse failed: {exc}")
-        finally:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            proc.wait()
-        if stop.is_set():
-            return
-        time.sleep(1.0)
 
 
 def run_falcon_loop(state: State, *, falcon_cmd: list[str], pci: int,
@@ -743,75 +627,18 @@ def run_gpsd_loop(state: State, *, mission_id: str,
         time.sleep(1.0)
 
 
-def run_droneid_loop(state: State, *, droneid_cmd: list[str],
-                     mission_id: str, stop: threading.Event,
-                     serial_filter: Optional[str] = None) -> None:
-    """Spawn a DroneID decoder, feed its JSON into State as a GPS source.
-
-    `droneid_cmd` is the full argv to a DroneID decoder that prints one
-    JSON object per decoded frame on stdout. Two known-supported shapes:
-
-      * `RUB-SysSec/DroneSecurity` (USRP B2xx, 50 MSPS) — its live
-        receiver emits the JSON natively, so the cmd is roughly
-        `["python", ".../droneid_receiver_live.py", "-g", "40"]`.
-
-      * `anarkiwi/samples2djidroneid` (HackRF, 15.36 MSPS) — file-based,
-        wrap with `python -m sniffer.droneid_hackrf --decoder-cmd "..."`
-        to get a continuous JSON stream from the HackRF capture loop.
-
-    `serial_filter` restricts to frames matching that serial (substring),
-    useful when several drones are airborne and only one is yours.
-
-    The decoded position lands on State as a GpsFix with fix='droneid'
-    — same code path as gpsd. Use multiple producers (one per HackRF /
-    one per band) by starting the loop multiple times.
-    """
-    if not droneid_cmd:
-        return
-    if (shutil.which(droneid_cmd[0]) is None
-            and not os.path.exists(droneid_cmd[0])):
-        state.set_status(
-            "error",
-            message=(f"`{droneid_cmd[0]}` not found. Build the decoder "
-                     f"(scripts/install-linux.sh) or pass --droneid-cmd."),
-        )
-        return
-    while not stop.is_set():
-        proc = subprocess.Popen(
-            droneid_cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        try:
-            sink = _GpsSink(state)
-            assert proc.stdout is not None
-            parse_droneid_stream(proc.stdout, mission_id, sink,
-                                 serial_filter=serial_filter)
-        except Exception:  # noqa: BLE001
-            pass
-        finally:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            proc.wait()
-        if stop.is_set():
-            return
-        time.sleep(1.0)
-
-
 _SIM_TICK_RE = re.compile(r"^#\s*TICK\s+t=([-\d.]+)")
 
 
 def _paced_tick(line_iter: Iterator[str],
                 stop: threading.Event) -> Iterator[str]:
-    """Wall-clock-pace a `simulate.ltesniffer_lines` stream.
+    """Wall-clock-pace a `simulate.falcon_lines` stream.
 
     The simulator interleaves `# TICK t=X` markers (in simulated seconds)
     with content lines. We sleep until wall-clock matches each TICK, then
     pass the content lines through verbatim. Comment lines are swallowed
-    here so the downstream parser only sees the same DECODED text that
-    LTESniffer itself would emit on the wire.
+    here so the downstream parser only sees the same TSV that FalconEye
+    itself would emit on the wire.
     """
     t_start = time.monotonic()
     for line in line_iter:
@@ -869,22 +696,28 @@ def run_simulator(state: State, *, mission_id: str, out_dir: str,
                   stop: threading.Event) -> None:
     """Hardware-free producer for the dashboard.
 
-    This is the same code path as `run_ltesniffer_loop` + `run_gpsd_loop`,
-    just with synthetic upstreams instead of LTESniffer/gpspipe subprocesses:
+    Same code path as `run_falcon_loop` + `run_gpsd_loop`, with
+    synthetic upstreams instead of FalconEye/gpspipe subprocesses:
 
-        simulate.ltesniffer_lines → parse_ltesniffer.parse_stream → _UeSightingSink → State
-        simulate.gpsd_lines       → parse_gpsd.parse_stream       → _GpsSink         → State
+        simulate.falcon_lines → falcon.parse_stream → _UeSightingSink → State
+        simulate.gpsd_lines   → parse_gpsd.parse_stream → _GpsSink → State
 
     The wall-clock pacers below replay the simulated trajectory in real
     time so SSE clients see events arrive at the cadence they would in a
     real flight. The trajectory is looped indefinitely.
+
+    The simulator emits FalconEye-shaped TSV with two extension columns
+    (ul_rssi_dbm and ta_n_steps) past the standard 20 — the Falcon
+    parser tolerates extras and reads them when present, so the
+    simulator can still light up the positioning estimators that real
+    DL-only FalconEye output cannot.
     """
     state.set_status("simulating", mission_id=mission_id)
     os.makedirs(out_dir, exist_ok=True)
     ue_path = os.path.join(out_dir, f"ue-{mission_id}.jsonl")
 
     cfg = _build_sim_config(mission_id)
-    parse_args = _ParseArgs(mission_id, "sim", "sim-ltesniffer",
+    parse_args = _ParseArgs(mission_id, "sim", "sim-falcon",
                             rx_gain_db=0.0, center_hz=cfg.emitter.center_hz,
                             sample_rate_sps=23.04e6)
 
@@ -893,8 +726,9 @@ def run_simulator(state: State, *, mission_id: str, out_dir: str,
             with open(ue_path, "a", encoding="utf-8") as fh:
                 sink = _UeSightingSink(state, jsonl_out=fh)
                 stream = _looped(
-                    lambda: _paced_tick(ltesniffer_lines(cfg), stop), stop)
-                parse_ltesniffer_stream(stream, parse_args, sink)
+                    lambda: _paced_tick(falcon_lines(cfg), stop), stop)
+                parse_falcon_stream(stream, parse_args, sink,
+                                    pci=cfg.emitter.pci)
         except Exception as exc:  # noqa: BLE001
             state.set_status("error",
                              message=f"simulator parse failed: {exc}")
@@ -1145,8 +979,6 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
 .legend .row:hover  { color: var(--txt); }
 .legend .row.has-pos::after { content: 'LOC'; color: var(--green); margin-left: auto;
                               font-size: 9px; letter-spacing: 0.1em; }
-.legend .row.has-pos-ta::after { content: 'TA'; color: var(--yellow); margin-left: auto;
-                                 font-size: 9px; letter-spacing: 0.1em; }
 .legend .row.no-pos::after  { content: '---'; color: var(--dim-2); margin-left: auto;
                               font-size: 9px; letter-spacing: 0.1em; }
 .legend .sw { width: 8px; height: 8px; flex-shrink: 0; }
@@ -1543,7 +1375,7 @@ footer .row b { color: var(--accent); font-weight: 600; }
 </div>
 <div id="dl-only-banner" class="banner banner-mode" style="display:none">
   <strong>DL-ONLY MODE.</strong>
-  <span class="dim">Upstream emits PDCCH only (HackRF / DL-only decoder) — no UE transmit energy observable. Positioning estimators inactive; C-RNTI surface still live. Positioning needs UL sniffing hardware (2× USRP + GPSDO, or X310).</span>
+  <span class="dim">FalconEye emits PDCCH only — no UE transmit energy observable. Positioning estimators inactive; C-RNTI surface still live. Positioning needs UL sniffing hardware (2× USRP + GPSDO, or X310).</span>
 </div>
 <div id="survey-banner" class="banner banner-survey" style="display:none">
   <strong>SURVEYING.</strong>
@@ -1723,16 +1555,12 @@ function updateDroneMarker() {
 function updateUeLayer(u) {
   if (!map) return;
   const p = u.est_position;
-  const pTa = u.est_position_ta;
   const color = colorFor(u.key);
   let layer = ueLayers.get(u.key);
-  if (!p && !pTa) {
-    // No estimate of either kind — drop any stale layer.
+  if (!p) {
     if (layer) {
       if (layer.marker) map.removeLayer(layer.marker);
       if (layer.accuracy) map.removeLayer(layer.accuracy);
-      if (layer.markerTa) map.removeLayer(layer.markerTa);
-      if (layer.accuracyTa) map.removeLayer(layer.accuracyTa);
       ueLayers.delete(u.key);
     }
     return;
@@ -1742,73 +1570,30 @@ function updateUeLayer(u) {
     ueLayers.set(u.key, layer);
   }
   const selected = (u.key === selectedKey);
-
-  // --- Centroid estimate (filled marker) ---------------------------------
-  if (p) {
-    const markerOpts = {
-      radius: selected ? 10 : 7,
-      color: color, weight: selected ? 3 : 2,
-      fillColor: color, fillOpacity: selected ? 0.75 : 0.55,
-    };
-    if (!layer.marker) {
-      layer.marker = L.circleMarker([p.lat, p.lon], markerOpts).addTo(map);
-      layer.marker.bindTooltip(u.c_rnti_hex,
-        {permanent: true, direction: 'right', offset: [10, 0], className: 'ue-tip'});
-      layer.marker.on('click', () => selectUe(u.key, true));
-      layer.accuracy = L.circle([p.lat, p.lon], {
-        radius: Math.max(2, p.cep95_m || 5),
-        color: color, weight: 1, opacity: 0.5,
-        fillColor: color, fillOpacity: 0.06,
-        dashArray: '4 3',
-      }).addTo(map);
-    } else {
-      layer.marker.setLatLng([p.lat, p.lon]);
-      layer.marker.setStyle(markerOpts);
-      layer.accuracy.setLatLng([p.lat, p.lon]);
-      layer.accuracy.setRadius(Math.max(2, p.cep95_m || 5));
-      layer.accuracy.setStyle({color: color, fillColor: color,
-                               opacity: selected ? 0.85 : 0.5,
-                               fillOpacity: selected ? 0.12 : 0.06});
-    }
-  } else if (layer.marker) {
-    map.removeLayer(layer.marker); delete layer.marker;
-    map.removeLayer(layer.accuracy); delete layer.accuracy;
-  }
-
-  // --- TA estimate (hollow dashed marker) --------------------------------
-  // Rendered alongside, not in place of, the centroid. The two estimators
-  // are independent; the dashboard does not pick a winner.
-  if (pTa) {
-    const taOpts = {
-      radius: selected ? 9 : 6,
-      color: color, weight: selected ? 3 : 2,
-      fillOpacity: 0,
-      dashArray: '3 3',
-    };
-    if (!layer.markerTa) {
-      layer.markerTa = L.circleMarker([pTa.lat, pTa.lon], taOpts).addTo(map);
-      // Anchor the C-RNTI tooltip to the centroid marker when both are
-      // present; only label the TA marker if it's standing alone.
-      if (!layer.marker) {
-        layer.markerTa.bindTooltip(u.c_rnti_hex + ' · TA',
-          {permanent: true, direction: 'right', offset: [10, 0], className: 'ue-tip'});
-        layer.markerTa.on('click', () => selectUe(u.key, true));
-      }
-      layer.accuracyTa = L.circle([pTa.lat, pTa.lon], {
-        radius: Math.max(2, pTa.cep95_m || 5),
-        color: color, weight: 1, opacity: 0.4,
-        fill: false,
-        dashArray: '2 4',
-      }).addTo(map);
-    } else {
-      layer.markerTa.setLatLng([pTa.lat, pTa.lon]);
-      layer.markerTa.setStyle(taOpts);
-      layer.accuracyTa.setLatLng([pTa.lat, pTa.lon]);
-      layer.accuracyTa.setRadius(Math.max(2, pTa.cep95_m || 5));
-    }
-  } else if (layer.markerTa) {
-    map.removeLayer(layer.markerTa); delete layer.markerTa;
-    map.removeLayer(layer.accuracyTa); delete layer.accuracyTa;
+  const markerOpts = {
+    radius: selected ? 10 : 7,
+    color: color, weight: selected ? 3 : 2,
+    fillColor: color, fillOpacity: selected ? 0.75 : 0.55,
+  };
+  if (!layer.marker) {
+    layer.marker = L.circleMarker([p.lat, p.lon], markerOpts).addTo(map);
+    layer.marker.bindTooltip(u.c_rnti_hex,
+      {permanent: true, direction: 'right', offset: [10, 0], className: 'ue-tip'});
+    layer.marker.on('click', () => selectUe(u.key, true));
+    layer.accuracy = L.circle([p.lat, p.lon], {
+      radius: Math.max(2, p.cep95_m || 5),
+      color: color, weight: 1, opacity: 0.5,
+      fillColor: color, fillOpacity: 0.06,
+      dashArray: '4 3',
+    }).addTo(map);
+  } else {
+    layer.marker.setLatLng([p.lat, p.lon]);
+    layer.marker.setStyle(markerOpts);
+    layer.accuracy.setLatLng([p.lat, p.lon]);
+    layer.accuracy.setRadius(Math.max(2, p.cep95_m || 5));
+    layer.accuracy.setStyle({color: color, fillColor: color,
+                             opacity: selected ? 0.85 : 0.5,
+                             fillOpacity: selected ? 0.12 : 0.06});
   }
 }
 function refreshAllLayers() {
@@ -1827,7 +1612,7 @@ function renderMapOverlay() {
   }
   const g = latestGps.gps;
   const positioned = [...ues.values()]
-    .filter(u => u.est_position || u.est_position_ta).length;
+    .filter(u => u.est_position).length;
   mapOverlay.innerHTML =
     `<div><strong>drone</strong> ${g.lat.toFixed(5)}, ${g.lon.toFixed(5)}</div>` +
     `<div>trail ${droneTrail.length} pts · ${positioned}/${ues.size} positioned</div>`;
@@ -1838,11 +1623,7 @@ function renderLegend() {
   const items = [...ues.values()].sort((a, b) => (b.ul_count || 0) - (a.ul_count || 0));
   legendRows.innerHTML = items.map(u => {
     const c = colorFor(u.key);
-    // 'has-pos' wins when both estimates are present; falls back to
-    // 'has-pos-ta' for TA-only UEs so they still register as positioned.
-    const posCls = u.est_position ? 'has-pos'
-                 : u.est_position_ta ? 'has-pos-ta'
-                 : 'no-pos';
+    const posCls = u.est_position ? 'has-pos' : 'no-pos';
     const cls = ['row', posCls,
                  u.key === selectedKey ? 'active' : ''].join(' ');
     return `<div class="${cls}" data-key="${u.key}">
@@ -1906,21 +1687,9 @@ function sparkSvg(history, color) {
 }
 function positionBlock(u) {
   const p = u.est_position;
-  const pTa = u.est_position_ta;
-  function row(label, est) {
-    const cep = est.cep95_m != null ? `±${est.cep95_m.toFixed(1)} m` : '';
-    const alt = est.alt_m != null ? `, ${est.alt_m.toFixed(0)} m AGL` : '';
-    return `<div class="row1">
-              <span class="latlon">${label}${est.lat.toFixed(6)}, ${est.lon.toFixed(6)}</span>
-              <span class="cep">${cep}</span>
-            </div>
-            <div class="meta-row">${est.method} · ${est.n_samples} samples${alt}</div>`;
-  }
-  if (!p && !pTa) {
+  if (!p) {
     let why;
     if (dlOnly === true) {
-      // We've confirmed the upstream emits no UE-side energy. Don't keep
-      // claiming "wait for more grants" — the wait never ends.
       why = 'DL-only mode · no UL energy to integrate';
     } else if (!latestGps) {
       why = 'no GPS fix yet';
@@ -1936,11 +1705,15 @@ function positionBlock(u) {
               <div class="meta-row">${why}</div>
             </div>`;
   }
-  let body = '';
-  // Two independent estimators, each labelled; not a primary/fallback.
-  if (p) body += row(p && pTa ? 'RSSI · ' : '', p);
-  if (pTa) body += row('TA · ', pTa);
-  return `<div class="position">${body}</div>`;
+  const cep = p.cep95_m != null ? `±${p.cep95_m.toFixed(1)} m` : '';
+  const alt = p.alt_m != null ? `, ${p.alt_m.toFixed(0)} m AGL` : '';
+  return `<div class="position">
+            <div class="row1">
+              <span class="latlon">${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}</span>
+              <span class="cep">${cep}</span>
+            </div>
+            <div class="meta-row">${p.method} · ${p.n_samples} samples${alt}</div>
+          </div>`;
 }
 function renderCard(u) {
   const color = colorFor(u.key);
@@ -1996,8 +1769,8 @@ function renderCard(u) {
 }
 function sortCards() {
   const sorted = [...ues.values()].sort((a, b) => {
-    const ap = (a.est_position || a.est_position_ta) ? 0 : 1;
-    const bp = (b.est_position || b.est_position_ta) ? 0 : 1;
+    const ap = a.est_position ? 0 : 1;
+    const bp = b.est_position ? 0 : 1;
     if (ap !== bp) return ap - bp;
     if ((b.ul_count || 0) !== (a.ul_count || 0))
       return (b.ul_count || 0) - (a.ul_count || 0);
@@ -2061,7 +1834,7 @@ function logLine(html) {
 
 function updateSummary() {
   let positioned = 0;
-  ues.forEach(u => { if (u.est_position || u.est_position_ta) positioned += 1; });
+  ues.forEach(u => { if (u.est_position) positioned += 1; });
   nUesEl.textContent = ues.size;
   nPosEl.textContent = positioned;
   nGrantsEl.textContent = totalUeSightings;
@@ -2137,7 +1910,7 @@ function applyEvent(ev) {
     [...cardsEl.querySelectorAll('.card')].forEach(c => c.remove());
     ueLayers.forEach(layer => {
       if (!map) return;
-      ['marker', 'accuracy', 'markerTa', 'accuracyTa'].forEach(k => {
+      ['marker', 'accuracy'].forEach(k => {
         if (layer[k]) map.removeLayer(layer[k]);
       });
     });
@@ -2160,10 +1933,9 @@ function applyEvent(ev) {
     updateUeLayer(u);
     setDlOnly(ev.dl_only);
     totalUeSightings += 1;
-    const est = u.est_position || u.est_position_ta;
-    const tag = u.est_position ? 'rssi' : (u.est_position_ta ? 'ta' : '');
+    const est = u.est_position;
     const pos = est
-      ? ` · ${tag} ${est.lat.toFixed(5)},${est.lon.toFixed(5)} ±${est.cep95_m.toFixed(0)}m`
+      ? ` · ${est.lat.toFixed(5)},${est.lon.toFixed(5)} ±${est.cep95_m.toFixed(0)}m`
       : '';
     logLine(`<b>${u.c_rnti_hex}</b> PCI ${u.pci} · UL ${fmt(u.ul_rssi_dbm, ' dBm')}${pos}`);
   } else if (ev.type === 'gps') {
@@ -2372,10 +2144,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--ltesniffer-cmd", default=None,
-                   help="argv (space-split) for LTESniffer / wrapper script.")
     p.add_argument("--center-hz", type=float, default=1_842_500_000,
-                   help="target cell DL carrier frequency for LTESniffer")
+                   help="target cell DL carrier frequency for FalconEye")
     p.add_argument("--rx-gain-db", type=float, default=50.0)
     p.add_argument("--mission-id",
                    default=time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime()))
@@ -2384,15 +2154,10 @@ def main() -> int:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--simulate", action="store_true",
                    help="generate fake UEs + GPS (no hardware needed)")
-    p.add_argument("--normalize-ltesniffer", action="store_true",
-                   help="pipe LTESniffer stdout through normalize_stream "
-                        "(use when the binary emits human-readable lines, "
-                        "not canonical DECODED key=value)")
     p.add_argument("--falcon-cmd", default=None,
                    help="argv (space-split) for falkenber9/falcon's "
                         "FalconEye. We append `-D <tmpdir>/dci.csv` and "
-                        "tail the file. Mutually exclusive with "
-                        "--ltesniffer-cmd.")
+                        "tail the file.")
     p.add_argument("--falcon-pci", type=int, default=None,
                    help="target PCI to stamp on FALCON-decoded grants. "
                         "FALCON's CSV has no PCI column; the caller "
@@ -2407,43 +2172,30 @@ def main() -> int:
                         "(default 15s)")
     p.add_argument("--survey-total-seconds", type=float, default=1800.0,
                    help="total survey duration before exiting (default 30 min)")
-    p.add_argument("--survey-decoder", choices=("falcon", "ltesniffer"),
-                   default="falcon",
-                   help="which decoder to spawn per cell during survey "
-                        "(default falcon — only one whose stdout we "
-                        "currently consume)")
-    p.add_argument("--droneid-cmd", action="append", default=None,
-                   help="argv (space-split) for a DJI DroneID decoder that "
-                        "prints one JSON object per decoded frame. Repeat "
-                        "the flag for multiple radios (e.g. one HackRF per "
-                        "band). Alternative GPS source — coexists with gpsd.")
-    p.add_argument("--droneid-serial", default=None,
-                   help="restrict DroneID frames to those whose serial "
-                        "(substring-match) equals this value. Use when "
-                        "several drones may be airborne and you only want "
-                        "yours feeding the geotag stream.")
     p.add_argument("--spectrum", action="store_true",
-                   help="run hackrf_sweep in a background thread and push "
-                        "live RF spectrum to the dashboard. Mutually "
-                        "exclusive with --ltesniffer-cmd (the HackRF can "
-                        "only be held by one process at a time).")
+                   help="run a UHD-based background spectrum sweep on a "
+                        "spare USRP and push live RF spectrum to the "
+                        "dashboard. The sweep needs its own SDR — usable "
+                        "alongside --falcon-cmd only when a second radio "
+                        "is plugged in (one SDR = one process at a time).")
     p.add_argument("--spectrum-freq-mhz", default="700:2700",
-                   help="hackrf_sweep range as start:end MHz (default 700:2700)")
+                   help="sweep range as start:end MHz (default 700:2700)")
+    p.add_argument("--spectrum-gain-db", type=float, default=60.0,
+                   help="USRP RX gain for the spectrum sweep")
     args = p.parse_args()
 
-    # Exactly one upstream producer must be selected. LTESniffer, FALCON,
-    # and survey-mode are mutually exclusive — all want exclusive radio.
+    # Exactly one upstream producer must be selected. FALCON live mode
+    # and survey-mode are mutually exclusive — both want exclusive radio.
     producers = sum(bool(x) for x in
-                    (args.simulate, args.ltesniffer_cmd,
-                     args.falcon_cmd, args.survey_cells))
+                    (args.simulate, args.falcon_cmd, args.survey_cells))
     if producers > 1:
         print("sniffer.live: pick exactly one producer "
-              "(--simulate | --ltesniffer-cmd | --falcon-cmd | "
-              "--survey-cells).", file=sys.stderr)
+              "(--simulate | --falcon-cmd | --survey-cells).",
+              file=sys.stderr)
         return 2
     if producers == 0:
-        print("sniffer.live needs --simulate, --ltesniffer-cmd, "
-              "--falcon-cmd, or --survey-cells.", file=sys.stderr)
+        print("sniffer.live needs --simulate, --falcon-cmd, "
+              "or --survey-cells.", file=sys.stderr)
         return 2
     if args.falcon_cmd and args.falcon_pci is None:
         print("sniffer.live: --falcon-cmd requires --falcon-pci "
@@ -2479,8 +2231,6 @@ def main() -> int:
                 state=state, cells=cells,
                 dwell_seconds=args.survey_dwell_seconds,
                 total_seconds=args.survey_total_seconds,
-                decoder=args.survey_decoder,
-                antennas=2, threads=4,
                 mission_id=args.mission_id, out_dir=args.out_dir,
                 stop=stop,
             ),
@@ -2491,17 +2241,6 @@ def main() -> int:
             kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
             daemon=True,
         ))
-        for droneid_cmd_str in (args.droneid_cmd or []):
-            cmd = droneid_cmd_str.split()
-            threads.append(threading.Thread(
-                target=run_droneid_loop,
-                kwargs=dict(
-                    state=state, droneid_cmd=cmd,
-                    mission_id=args.mission_id, stop=stop,
-                    serial_filter=args.droneid_serial,
-                ),
-                daemon=True,
-            ))
     elif args.falcon_cmd:
         cmd = args.falcon_cmd.split()
         threads.append(threading.Thread(
@@ -2518,47 +2257,8 @@ def main() -> int:
             kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
             daemon=True,
         ))
-        for droneid_cmd_str in (args.droneid_cmd or []):
-            cmd = droneid_cmd_str.split()
-            threads.append(threading.Thread(
-                target=run_droneid_loop,
-                kwargs=dict(
-                    state=state, droneid_cmd=cmd,
-                    mission_id=args.mission_id, stop=stop,
-                    serial_filter=args.droneid_serial,
-                ),
-                daemon=True,
-            ))
-    else:
-        cmd = args.ltesniffer_cmd.split()
-        threads.append(threading.Thread(
-            target=run_ltesniffer_loop,
-            kwargs=dict(
-                state=state, ltesniffer_cmd=cmd,
-                mission_id=args.mission_id, out_dir=args.out_dir,
-                center_hz=args.center_hz, rx_gain_db=args.rx_gain_db,
-                stop=stop, normalize=args.normalize_ltesniffer,
-            ),
-            daemon=True,
-        ))
-        threads.append(threading.Thread(
-            target=run_gpsd_loop,
-            kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
-            daemon=True,
-        ))
-        for droneid_cmd_str in (args.droneid_cmd or []):
-            cmd = droneid_cmd_str.split()
-            threads.append(threading.Thread(
-                target=run_droneid_loop,
-                kwargs=dict(
-                    state=state, droneid_cmd=cmd,
-                    mission_id=args.mission_id, stop=stop,
-                    serial_filter=args.droneid_serial,
-                ),
-                daemon=True,
-            ))
-    # Spectrum scanner — only when HackRF is otherwise idle.
-    if args.spectrum and not args.ltesniffer_cmd:
+    # Spectrum scanner — needs its own SDR (mutually exclusive with FALCON).
+    if args.spectrum:
         try:
             f_start, f_end = (int(x) for x in args.spectrum_freq_mhz.split(":"))
         except ValueError:
@@ -2569,6 +2269,7 @@ def main() -> int:
             on_snapshot=lambda payload: state._broadcast(
                 {"type": "spectrum", "spectrum": payload}),
             freq_start_mhz=f_start, freq_end_mhz=f_end,
+            gain_db=args.spectrum_gain_db,
         )
         state.attach_spectrum_scanner(scanner)
         scanner.start()
@@ -2590,10 +2291,14 @@ def main() -> int:
     print(f"live dashboard: {url}   (mission {args.mission_id})", flush=True)
     if args.simulate:
         print("mode: simulate (synthetic UEs + GPS, via the standard "
-              "parse_ltesniffer + parse_gpsd pipeline)", flush=True)
+              "falcon + parse_gpsd pipeline)", flush=True)
+    elif args.survey_cells:
+        print(f"mode: survey · {args.survey_dwell_seconds}s/cell × "
+              f"{args.survey_total_seconds/60:.1f}min total", flush=True)
+        print("GPS: gpspipe -w (only ingested if gpsd is running)", flush=True)
     else:
-        print(f"mode: LTESniffer · cmd={args.ltesniffer_cmd!r} "
-              f"@ {args.center_hz/1e6:.2f} MHz gain {args.rx_gain_db} dB",
+        print(f"mode: FalconEye · cmd={args.falcon_cmd!r} "
+              f"@ {args.center_hz/1e6:.2f} MHz · PCI {args.falcon_pci}",
               flush=True)
         print("GPS: gpspipe -w (only ingested if gpsd is running)", flush=True)
     try:
