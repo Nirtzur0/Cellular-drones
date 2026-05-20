@@ -2,11 +2,15 @@ __pycache__/
 *.pyc
 *.egg-info/
 .venv/
+.venv-mac/
 .env
 data/
 *.iq
 *.bin
 *.pcap
 *.log
+*.png
 .DS_Store
 build/
+.claude/
+.playwright-mcp/

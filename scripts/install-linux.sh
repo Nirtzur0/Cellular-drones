@@ -80,9 +80,51 @@ if [[ ! -d "$SRC_DIR/falcon" ]]; then
   git clone --depth 1 https://github.com/falkenber9/falcon.git \
     "$SRC_DIR/falcon"
 fi
+# Apply the cellular-drones patches. Two touch the FALCON tree directly
+# (apply BEFORE cmake); one touches srsLTE (apply AFTER cmake downloads
+# it, BEFORE make builds against it). All idempotent via --check.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+apply_patch() {  # apply_patch <tree-root> <patch-file> <label>
+  local tree="$1" patch="$2" label="$3"
+  [[ -f "$patch" ]] || return 0
+  ( cd "$tree"
+    if git apply --check "$patch" 2>/dev/null; then
+      git apply "$patch"
+      echo "applied $label"
+    else
+      echo "$label already applied (or conflicts) — skipping"
+    fi
+  )
+}
+
+# FALCON-tree patches (apply before cmake so the CMakeLists picks up new files).
+apply_patch "$SRC_DIR/falcon" \
+  "$REPO_ROOT/patches/falcon-spectrum-tap.patch" \
+  "falcon-spectrum-tap.patch (SpectrumTap CSV output + early-configure)"
+apply_patch "$SRC_DIR/falcon" \
+  "$REPO_ROOT/patches/falcon-skip-master-clock.patch" \
+  "falcon-skip-master-clock.patch (Pi 4 + B210 post-PBCH hang fix)"
+
 mkdir -p "$SRC_DIR/falcon/build"
+# Run cmake first — this clones srsLTE into build/srsLTE-src so the next
+# patch can apply against it.
 ( cd "$SRC_DIR/falcon/build"
   cmake .. -DUSE_GUI=False -DUSE_CAPTURE_PROBE=False
+)
+# srsLTE-tree patch (vendored as a build artifact under falcon/build/srsLTE-src).
+SRSLTE_TREE="$SRC_DIR/falcon/build/srsLTE-src"
+if [[ -d "$SRSLTE_TREE/.git" ]]; then
+  apply_patch "$SRSLTE_TREE" \
+    "$REPO_ROOT/patches/srslte-rf-sample-observer.patch" \
+    "srslte-rf-sample-observer.patch (always-on spectrum tap hook)"
+else
+  echo "WARNING: $SRSLTE_TREE not found or not a git repo; "
+  echo "  the always-on spectrum patch will not be applied. "
+  echo "  Re-run after cmake completes the srsLTE clone."
+fi
+
+( cd "$SRC_DIR/falcon/build"
   make -j"$(nproc)" FalconEye
 )
 sudo ln -sfv "$SRC_DIR/falcon/build/src/FalconEye" \

@@ -604,11 +604,14 @@ def _recompute_ue_position(entry: dict[str, Any]) -> None:
 class _UeSightingSink(io.TextIOBase):
     """falcon.parse_stream writes JSONL strings here; we decode + push to State."""
 
-    def __init__(self, state: State, jsonl_out: Optional[io.TextIOBase] = None):
+    def __init__(self, state: State, jsonl_out: Optional[io.TextIOBase] = None,
+                 on_lock: Optional[Callable[[], None]] = None):
         super().__init__()
         self._state = state
         self._jsonl_out = jsonl_out
         self._buf = ""
+        self._on_lock = on_lock
+        self._lock_fired = False
 
     def write(self, s: str) -> int:
         if self._jsonl_out is not None:
@@ -632,6 +635,12 @@ class _UeSightingSink(io.TextIOBase):
             self._jsonl_out.flush()
 
     def _ingest_record(self, rec: dict[str, Any]) -> None:
+        if self._on_lock is not None and not self._lock_fired:
+            self._lock_fired = True
+            try:
+                self._on_lock()
+            except Exception:  # noqa: BLE001
+                pass
         radio = rec.get("radio") or {}
         ue = rec.get("ue") or {}
         sighting = UeSighting(
@@ -692,13 +701,15 @@ class _ParseArgs:
     def __init__(self, mission_id: str, backend: str, device: str,
                  rx_gain_db: float = 50.0,
                  center_hz: Optional[float] = None,
-                 sample_rate_sps: Optional[float] = None):
+                 sample_rate_sps: Optional[float] = None,
+                 earfcn: Optional[int] = None):
         self.mission_id = mission_id
         self.backend = backend
         self.device = device
         self.rx_gain_db = rx_gain_db
         self.center_hz = center_hz
         self.sample_rate_sps = sample_rate_sps
+        self.earfcn = earfcn
 
 
 def _parse_falcon_argv(cmd: list[str]) -> dict[str, Any]:
@@ -762,13 +773,62 @@ def run_falcon_loop(state: State, *, falcon_cmd: list[str], pci: int,
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"ue-{mission_id}.jsonl")
+    # FALCON's stdout+stderr → a log file so we can diagnose lock failures.
+    # FalconEye writes "Searching for cell...", "Found Cell_id", "Entering
+    # main loop" and decode errors to stderr; without this we run blind.
+    falcon_log_path = os.path.join(out_dir, f"falcon-{mission_id}.log")
+    # Extract real gain from the FalconEye argv (-g flag) and derive EARFCN
+    # from the center frequency so RadioConfig records carry accurate metadata.
+    _cmd_meta = _parse_falcon_argv(falcon_cmd)
+    _rx_gain = _cmd_meta.get("gain_db", 50.0)
+    _earfcn: Optional[int] = None
+    if center_hz is not None:
+        try:
+            from sniffer.lte_bands import hz_to_earfcn_dl
+            _earfcn = hz_to_earfcn_dl(center_hz)
+        except (ValueError, ImportError):
+            pass
     parse_args = _ParseArgs(mission_id, "falcon", "usrp-falcon-0",
-                            rx_gain_db=50.0, center_hz=center_hz,
-                            sample_rate_sps=23.04e6)
+                            rx_gain_db=_rx_gain, center_hz=center_hz,
+                            sample_rate_sps=23.04e6, earfcn=_earfcn)
+
+    # Write a "live-lock" record to the known-cells store on the first
+    # successfully decoded DCI — proof that FalconEye actually locked.
+    _lock_logged = threading.Event()
+
+    def _on_lock() -> None:
+        if _lock_logged.is_set():
+            return
+        _lock_logged.set()
+        try:
+            from sniffer.cells import KnownCell, append_cell
+            import time as _t
+            append_cell(KnownCell(
+                source="live-lock",
+                ts_utc=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+                earfcn=_earfcn, center_hz=center_hz, pci=pci,
+            ))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Stable path for FALCON's per-DCI CSV — survives FALCON respawns so
+    # the tail-and-parse loop can replay anything FalconEye managed to
+    # write before it died. The old TemporaryDirectory approach destroyed
+    # the file every respawn cycle, so any unparsed rows were lost.
+    persistent_csv_path = os.path.join(out_dir, f"dci-{mission_id}.csv")
+
+    # Two-phase stall threshold. Cell-search (PSS sweep + SSS + PBCH + RF
+    # rate switch) on Pi-class hardware can chew 2-3 min before the FIRST
+    # DCI lands. After the first DCI we're "locked" — if the file then
+    # goes quiet, the cell is lost and we should respawn.
+    FALCON_INITIAL_GRACE_SECONDS = 360.0   # before any DCI ever (PBCH+rate
+                                            # switch on Pi can be 4-5 min)
+    FALCON_POST_LOCK_STALL_SECONDS = 45.0  # after we've seen DCIs
 
     while not stop.is_set():
-        with tempfile.TemporaryDirectory(prefix="falcon_dci_") as td:
-            csv_path = os.path.join(td, "dci.csv")
+        td = None  # tempdir no longer needed for the CSV path
+        if True:  # keep indentation level same as the old `with` block
+            csv_path = persistent_csv_path
             full_cmd = list(falcon_cmd) + ["-D", csv_path]
             # Cellular-drones SpectrumTap: ask FALCON to publish per-cell
             # FFT rows so the dashboard waterfall reflects the actual cell
@@ -776,29 +836,106 @@ def run_falcon_loop(state: State, *, falcon_cmd: list[str], pci: int,
             if spectrum_tap_path:
                 os.makedirs(os.path.dirname(spectrum_tap_path), exist_ok=True)
                 full_cmd += ["-X", spectrum_tap_path]
+            # Per-iteration stall flag: when set, breaks the parse loop so the
+            # outer `while` can respawn FALCON. FALCON's PSS-search hang ("alive
+            # but stuck") would otherwise wedge the dashboard forever.
+            iter_stop = threading.Event()
             cell_extras = _parse_falcon_argv(full_cmd)
             state.set_status("sniffing", center_hz=center_hz,
                              decoder="falcon", out=out_path,
-                             pci=pci, **cell_extras)
+                             pci=pci, falcon_log=falcon_log_path,
+                             **cell_extras)
+            falcon_log_fh = open(falcon_log_path, "a", encoding="utf-8")
             proc = subprocess.Popen(
                 full_cmd,
-                stdout=subprocess.DEVNULL,   # FalconEye stdout is verbose status
+                stdout=falcon_log_fh,
                 stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
             )
+            # Stall watchdog. Two phases:
+            #   * Initial grace (FALCON_INITIAL_GRACE_SECONDS): cell-search +
+            #     PBCH + RF rate switch can chew 2-3 min on Pi before the
+            #     first DCI lands. Don't restart during this — kill the run
+            #     only if FALCON itself dies or grace runs out completely.
+            #   * Post-lock (FALCON_POST_LOCK_STALL_SECONDS): once at least
+            #     one DCI has been written, dci.csv stopping = cell lost.
+            #     Short threshold here so the dashboard self-heals.
+            def _watchdog() -> None:
+                # "Alive" = EITHER dci.csv grows (decoded grants) OR the
+                # spectrum tap file grows (FALCON in main loop + producing
+                # FFTs). Only BOTH-silent = real hang. A quiet cell that
+                # produces no PDCCH for a while is still healthy as long
+                # as the SpectrumTap is firing.
+                last_dci = -1
+                last_spec = -1
+                last_change = time.time()
+                spawn_started = last_change
+                ever_dci = False
+                while not iter_stop.is_set() and not stop.is_set():
+                    if proc.poll() is not None:
+                        iter_stop.set()
+                        return
+                    try:
+                        dci_sz = os.path.getsize(csv_path)
+                    except OSError:
+                        dci_sz = -1
+                    spec_sz = -1
+                    if spectrum_tap_path:
+                        try:
+                            spec_sz = os.path.getsize(spectrum_tap_path)
+                        except OSError:
+                            spec_sz = -1
+                    now = time.time()
+                    if dci_sz > last_dci:
+                        last_dci = dci_sz
+                        last_change = now
+                        if dci_sz > 0:
+                            ever_dci = True
+                    if spec_sz > last_spec:
+                        last_spec = spec_sz
+                        last_change = now
+                    threshold = (FALCON_POST_LOCK_STALL_SECONDS if ever_dci
+                                 else FALCON_INITIAL_GRACE_SECONDS)
+                    elapsed = now - last_change
+                    if elapsed > threshold:
+                        reason = ("post-DCI stall — cell may be lost" if ever_dci
+                                  else "no DCI AND no spectrum-tap growth — "
+                                       "FALCON wedged")
+                        state.set_status(
+                            "sniffing",
+                            message=f"FALCON {reason} after {int(elapsed)}s — restarting",
+                            pci=pci, center_hz=center_hz, decoder="falcon",
+                        )
+                        try:
+                            proc.terminate()
+                        except ProcessLookupError:
+                            pass
+                        iter_stop.set()
+                        return
+                    time.sleep(3.0)
+
+            watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+            watchdog_thread.start()
             try:
                 with open(out_path, "a", encoding="utf-8") as jsonl_fh:
-                    sink = _UeSightingSink(state, jsonl_out=jsonl_fh)
-                    stream = tail_csv(csv_path, stop=stop)
+                    sink = _UeSightingSink(state, jsonl_out=jsonl_fh,
+                                          on_lock=_on_lock)
+                    stream = tail_csv(csv_path, stop=iter_stop)
                     parse_falcon_stream(stream, parse_args, sink, pci=pci)
             except Exception as exc:  # noqa: BLE001
                 state.set_status("error", message=f"falcon parse failed: {exc}")
             finally:
+                iter_stop.set()
                 try:
                     proc.terminate()
                 except ProcessLookupError:
                     pass
                 proc.wait()
+                watchdog_thread.join(timeout=2.0)
+                try:
+                    falcon_log_fh.close()
+                except Exception:  # noqa: BLE001
+                    pass
         if stop.is_set():
             return
         time.sleep(1.0)
@@ -965,12 +1102,19 @@ def run_simulator(state: State, *, mission_id: str, out_dir: str,
 # --------------------------------------------------------------------------
 
 
-_INDEX_HTML = """<!doctype html>
+_INDEX_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><title>UE tracker · cellular drones</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Leaflet: loaded async so a slow/blocked tile server doesn't hang page
+     render. If the script never loads (offline Pi field deployment), we
+     fall back to the "MAP UNAVAILABLE" placeholder after a 5 s grace. -->
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      crossorigin=""/>
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin="" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+        crossorigin="" defer></script>
 <style>
 :root {
   color-scheme: dark;
@@ -1185,6 +1329,12 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
   background: var(--panel);
   min-height: 380px;
 }
+/* When leaflet was never loaded (Pi offline), collapse the map area so
+   the scrubber + footer aren't pushed off-screen on narrow viewports. */
+.map-wrap:has(#map.unavailable) { min-height: 80px; height: auto; }
+@media (max-width: 1100px) {
+  .map-wrap:has(#map.unavailable) { height: auto; min-height: 80px; }
+}
 .map-wrap::before, .map-wrap::after,
 .map-wrap > .br-tl, .map-wrap > .br-tr,
 .map-wrap > .br-bl, .map-wrap > .br-br {
@@ -1197,9 +1347,10 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
 .map-wrap > .br-bl { bottom: -1px; left: -1px; border-right: none; border-top: none; }
 .map-wrap > .br-br { bottom: -1px; right: -1px; border-left: none; border-top: none; }
 #map { position: absolute; inset: 0; }
-#map.unavailable { display: flex; align-items: center; justify-content: center;
-                   color: var(--dim); font-size: 12px; padding: 16px;
-                   font-family: ui-monospace, monospace; }
+#map.unavailable { position: static; display: flex; align-items: center;
+                   justify-content: center; color: var(--dim); font-size: 12px;
+                   padding: 16px; font-family: ui-monospace, monospace;
+                   min-height: 60px; }
 .map-overlay {
   position: absolute; top: 10px; right: 10px; z-index: 500;
   display: flex; flex-direction: column; gap: 3px;
@@ -1660,6 +1811,7 @@ footer .row b { color: var(--accent); font-weight: 600; }
     <span class="pill spec-unknown" id="spec-pill"><span class="led"></span><span id="spec-pill-text">FFT —</span></span>
     <span class="pill gps-unknown" id="gps"><span class="led"></span><span id="gps-text">NAV —</span></span>
     <span class="pill status-idle" id="status"><span class="led"></span><span id="status-text">IDLE</span></span>
+    <span class="pill" id="sse-pill" style="color: var(--dim);"><span class="led"></span><span id="sse-text">SSE —</span></span>
   </div>
 </header>
 <div class="banner">
@@ -1740,7 +1892,7 @@ footer .row b { color: var(--accent); font-weight: 600; }
   <span class="time" id="scrub-time">—</span>
 </div>
 <footer id="log"></footer>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<!-- leaflet script removed: see CSS removal note above. Map calls guard on typeof L !== 'undefined'. -->
 <script>
 const cardsEl     = document.getElementById('cards');
 const emptyEl     = document.getElementById('empty');
@@ -1914,13 +2066,19 @@ setInterval(renderSurveyCountdown, 200);
 let map = null;
 let droneMarker = null;
 let droneTrailLine = null;
+let firstGpsFix = true;          // snap once, then track without re-centering
 const droneTrail = [];
 const ueLayers = new Map();   // key -> {marker, accuracy, label}
 
-function initMapIfReady(centerLat, centerLon) {
+// Default view when no GPS yet — Tel Aviv area, the testing locale.
+// First real GPS fix snaps to that location and clears the placeholder.
+const DEFAULT_CENTER = [32.0853, 34.7818];
+const DEFAULT_ZOOM   = 13;
+
+function initMapIfReady(centerLat, centerLon, zoom) {
   if (map || typeof L === 'undefined') return;
   map = L.map(mapEl, { zoomControl: true, attributionControl: true })
-        .setView([centerLat, centerLon], 17);
+        .setView([centerLat, centerLon], zoom || DEFAULT_ZOOM);
   L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
     maxZoom: 19, subdomains: 'abc',
     attribution: '© OpenStreetMap, © CARTO',
@@ -1931,9 +2089,23 @@ function initMapIfReady(centerLat, centerLon) {
 function leafletUnavailable() {
   if (typeof L !== 'undefined' || mapEl.classList.contains('unavailable')) return;
   mapEl.classList.add('unavailable');
-  mapEl.textContent = 'map needs internet for tiles · positions still listed on the right';
+  mapEl.innerHTML = '<div style="padding:24px;color:var(--dim);font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.7;">// MAP UNAVAILABLE<br><span style="color:var(--dim-2);">leaflet tiles need internet · running offline</span><br><br>positions for tracked UEs are still being computed and shown in the right-hand panel when GPS is fixed.</div>';
 }
-setTimeout(leafletUnavailable, 4000);
+// Try to bring up the map with default view immediately. If Leaflet hasn't
+// loaded yet (deferred script still parsing), poll briefly; if still missing
+// after 5 s assume offline and show the placeholder.
+function tryBootMap() {
+  if (typeof L !== 'undefined') {
+    initMapIfReady(DEFAULT_CENTER[0], DEFAULT_CENTER[1], DEFAULT_ZOOM);
+    return;
+  }
+  if ((tryBootMap.elapsed = (tryBootMap.elapsed || 0) + 100) > 5000) {
+    leafletUnavailable();
+    return;
+  }
+  setTimeout(tryBootMap, 100);
+}
+setTimeout(tryBootMap, 0);
 
 function updateDroneMarker() {
   if (!map || !latestGps) return;
@@ -1942,9 +2114,13 @@ function updateDroneMarker() {
     droneMarker = L.circleMarker([g.lat, g.lon], {
       radius: 5, color:'#5dd5ff', weight:2, fillColor:'#04070a', fillOpacity:1,
     }).addTo(map).bindTooltip('SELF', {permanent:false, direction:'top', className:'ue-tip'});
-    map.setView([g.lat, g.lon], Math.max(map.getZoom(), 17));
   } else {
     droneMarker.setLatLng([g.lat, g.lon]);
+  }
+  // Snap once on the first real fix — pan/zoom from the default-view start.
+  if (firstGpsFix) {
+    firstGpsFix = false;
+    map.setView([g.lat, g.lon], 17, { animate: true });
   }
   const last = droneTrail[droneTrail.length - 1];
   if (!last || last[0] !== g.lat || last[1] !== g.lon) {
@@ -2008,7 +2184,7 @@ function focusUeOnMap(key) {
 }
 function renderMapOverlay() {
   if (!latestGps) {
-    mapOverlay.innerHTML = 'map · <span style="color:var(--dim)">waiting for GPS</span>';
+    mapOverlay.innerHTML = 'map · <span style="color:var(--dim)">default view · waiting for GPS fix</span>';
     return;
   }
   const g = latestGps.gps;
@@ -2614,15 +2790,45 @@ liveBtnEl.addEventListener('click', async () => {
 
 // SSE: skip live events while we're scrubbing through history.
 const es = new EventSource('/events');
+window.__sseEvents = 0;
+window.__sseErrors = 0;
+window.__sseLastError = null;
+const ssePill = document.getElementById('sse-pill');
+const sseText = document.getElementById('sse-text');
+function updateSsePill() {
+  if (!sseText) return;
+  if (es.readyState === 1) {
+    sseText.textContent = `SSE ${window.__sseEvents} ev` + (window.__sseErrors ? ` (${window.__sseErrors} err)` : '');
+    ssePill.style.color = window.__sseErrors ? 'var(--red)' : 'var(--green)';
+  } else if (es.readyState === 0) {
+    sseText.textContent = 'SSE connecting';
+    ssePill.style.color = 'var(--yellow)';
+  } else {
+    sseText.textContent = 'SSE CLOSED';
+    ssePill.style.color = 'var(--red)';
+  }
+}
+setInterval(updateSsePill, 1000);
+es.onopen = () => { updateSsePill(); };
 es.onmessage = (e) => {
+  window.__sseEvents++;
   try {
     const ev = JSON.parse(e.data);
     if (replayMode && (ev.type === 'gps' || ev.type === 'ue_sighting'
                        || (ev.type === 'snapshot' && !ev.replay))) return;
     applyEvent(ev);
-  } catch (_) {}
+  } catch (err) {
+    window.__sseErrors++;
+    window.__sseLastError = String(err) + ' :: ' + (err && err.stack ? err.stack : '');
+    if (window.__sseErrors <= 3) {
+      console.error('SSE applyEvent threw:', err, 'event:', e.data && e.data.slice(0, 300));
+    }
+  }
 };
-es.onerror = () => logLine('<span style="color:var(--red)">stream disconnected</span> — browser will retry');
+es.onerror = () => {
+  logLine('<span style="color:var(--red)">stream disconnected</span> — browser will retry');
+  updateSsePill();
+};
 </script></body></html>
 """
 
@@ -2630,17 +2836,44 @@ es.onerror = () => logLine('<span style="color:var(--red)">stream disconnected</
 class _Handler(BaseHTTPRequestHandler):
     state: State  # set on class before serving
 
+    # Chromium on some configurations refuses to render the page when
+    # served via HTTP/1.0 (the BaseHTTPServer default) — we end up with
+    # an empty DOM even though curl gets a valid 200 response. Bump to
+    # HTTP/1.1 so Chromium parses the response.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         return
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/" or self.path.startswith("/index"):
-            body = _INDEX_HTML.encode("utf-8")
+            # HTML hot-reload: if <repo>/data/dashboard.html exists, serve
+            # IT instead of the embedded _INDEX_HTML. This lets us edit the
+            # dashboard layout without restarting sniffer.live (which would
+            # reset FALCON's cell lock and force a 3-5 min re-acquire).
+            html_override = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "..", "data", "dashboard.html",
+            )
+            if os.path.exists(html_override):
+                try:
+                    with open(html_override, "rb") as f:
+                        body = f.read()
+                except OSError:
+                    body = _INDEX_HTML.encode("utf-8")
+            else:
+                body = _INDEX_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            # Without explicit close, BaseHTTPServer holds the connection
+            # open after the response and chromium sees a truncated body.
+            self.send_header("Connection", "close")
+            self.send_header("Cache-Control", "no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(body)
+            self.wfile.flush()
+            self.close_connection = True
             return
         if self.path == "/state":
             body = json.dumps(self.state.snapshot()).encode("utf-8")

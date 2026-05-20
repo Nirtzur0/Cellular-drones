@@ -1,0 +1,36 @@
+--- a/src/eye/EyeCore.cc
++++ b/src/eye/EyeCore.cc
+@@ -166,7 +166,21 @@ bool EyeCore::run() {
+       cell_detect_config.init_agc = static_cast<float>(srslte_rf_get_rx_gain(&rf));
+     }
+
+-    srslte_rf_set_master_clock_rate(&rf, 30.72e6);
++    // cellular-drones: pre-set the master clock to the cell's expected rate
++    // when the caller supplied -p <nof_prb>. The default 30.72 MHz forces a
++    // second set_master_clock_rate after PBCH (see line ~214) — and that
++    // second change is what hangs on Pi 4 + B210 USB3 between "Stopping RF
++    // and flushing buffer..." and "Entering main loop..." (FALCON appears
++    // stuck for minutes). If the master clock is already at the cell's
++    // target rate, UHD treats the post-PBCH call as idempotent.
++    double initial_master = 30.72e6;
++    if (args.input_file_name == "" && args.file_nof_prb > 0) {
++      int target_srate = srslte_sampling_freq_hz(args.file_nof_prb);
++      initial_master = target_srate < 10e6 ? 4.0*target_srate : (double)target_srate;
++      cout << "[cellular-drones] pre-set master clock to "
++           << initial_master/1e6 << " MHz (from -p " << args.file_nof_prb << ")" << endl;
++    }
++    srslte_rf_set_master_clock_rate(&rf, initial_master);
+
+     /* set receiver frequency */
+     double rf_freq = args.rf_freq;
+@@ -219,6 +233,11 @@ bool EyeCore::run() {
+     }
+
+     cout << "Stopping RF and flushing buffer..." << endl;
++    // cellular-drones: Pi 4 USB3 + B210 sometimes wedges on the next
++    // srslte_rf_start_rx_stream if we don't give the radio time to
++    // settle after the rate change above. A 1-second pause is enough.
++    usleep(1000000);
++    cout << "[cellular-drones] post-flush settle done — starting stream" << endl;
+   }
+ #endif

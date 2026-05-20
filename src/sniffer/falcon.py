@@ -169,6 +169,7 @@ def _make_record(args, clock_ns: Callable[[], int],
     radio = RadioConfig(
         backend=args.backend,
         device=args.device,
+        earfcn=getattr(args, "earfcn", None),
         center_hz=getattr(args, "center_hz", None),
         sample_rate_sps=getattr(args, "sample_rate_sps", None),
         rx_gain_db=getattr(args, "rx_gain_db", None),

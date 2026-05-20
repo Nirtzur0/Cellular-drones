@@ -1,0 +1,46 @@
+diff --git a/lib/include/srslte/phy/rf/rf.h b/lib/include/srslte/phy/rf/rf.h
+index 9adea96..8146f4d 100644
+--- a/lib/include/srslte/phy/rf/rf.h
++++ b/lib/include/srslte/phy/rf/rf.h
+@@ -213,3 +213,7 @@ SRSLTE_API int srslte_rf_send_multi(srslte_rf_t *rf,
+ 
+ #endif // SRSLTE_RF_H
+ 
++
++/* cellular-drones SpectrumTap observer hook (added by patch). */
++typedef void (*srslte_rf_sample_observer_t)(const void *iq, uint32_t nsamples);
++SRSLTE_API void srslte_rf_set_sample_observer(srslte_rf_sample_observer_t obs);
+diff --git a/lib/src/phy/rf/rf_imp.c b/lib/src/phy/rf/rf_imp.c
+index bc7ac59..980129e 100644
+--- a/lib/src/phy/rf/rf_imp.c
++++ b/lib/src/phy/rf/rf_imp.c
+@@ -28,6 +28,16 @@
+ 
+ #include "srslte/phy/rf/rf.h"
+ #include "srslte/srslte.h"
++
++/* cellular-drones SpectrumTap: optional callback fired after every
++ * receive — lets the dashboard tap raw IQ continuously, including
++ * during pre-MIB cell search where falcon_rf_recv_wrapper is bypassed. */
++typedef void (*srslte_rf_sample_observer_t)(const void *iq, uint32_t nsamples);
++static srslte_rf_sample_observer_t g_sample_observer = (srslte_rf_sample_observer_t)0;
++void srslte_rf_set_sample_observer(srslte_rf_sample_observer_t obs) {
++  g_sample_observer = obs;
++}
++
+ #include "rf_dev.h"
+ 
+ int rf_get_available_devices(char **devnames, int max_strlen) {
+@@ -260,7 +270,11 @@ int srslte_rf_recv_with_time_multi(srslte_rf_t *rf,
+                                     time_t *secs,
+                                     double *frac_secs) 
+ {
+-  return ((rf_dev_t*) rf->dev)->srslte_rf_recv_with_time_multi(rf->handler, data, nsamples, blocking, secs, frac_secs);  
++  int ret = ((rf_dev_t*) rf->dev)->srslte_rf_recv_with_time_multi(rf->handler, data, nsamples, blocking, secs, frac_secs);
++  if (g_sample_observer && ret > 0 && data && data[0]) {
++    g_sample_observer(data[0], (uint32_t)ret);
++  }
++  return ret;
+ }
+ 
+ double srslte_rf_set_tx_gain(srslte_rf_t *rf, double gain)

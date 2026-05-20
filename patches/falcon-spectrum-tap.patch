@@ -1,0 +1,383 @@
+diff --git a/src/eye/ArgManager.cc b/src/eye/ArgManager.cc
+index dd16dc3..b2c193a 100644
+--- a/src/eye/ArgManager.cc
++++ b/src/eye/ArgManager.cc
+@@ -71,6 +71,10 @@ void ArgManager::defaultArgs(Args& args) {
+   args.skip_secondary_meta_formats = false;
+   args.enable_shortcut_discovery = true;
+   args.rnti_histogram_threshold = DEFAULT_RNTI_HISTOGRAM_THRESHOLD;
++
++  // cellular-drones SpectrumTap defaults (off unless -X is passed).
++  args.spectrum_tap_file_name = "";
++  args.spectrum_tap_period_subframes = 10;
+ }
+ 
+ void ArgManager::usage(Args& args, const std::string& prog) {
+@@ -115,6 +119,9 @@ void ArgManager::usage(Args& args, const std::string& prog) {
+   printf("\t-S split ratio for primary/secondary DCI formats [0.0..1.0, Default %f]\n", args.dci_format_split_ratio);
+   printf("\t-T interval to perform dci format split [Default %d ms]\n", args.dci_format_split_update_interval_ms);
+   printf("\t-v [set srslte_verbose to debug, default none]\n");
++  printf("\t-X spectrum-tap CSV output file (cellular-drones; off if absent)\n");
++  printf("\t-x spectrum-tap publish period in subframes [Default %u → 10 Hz]\n",
++         args.spectrum_tap_period_subframes);
+   //printf("\t-z filename of the output reporting one int per rnti (tot length 64k entries)\n");
+   //printf("\t-Z filename of the input reporting one int per rnti (tot length 64k entries)\n");
+ }
+@@ -122,7 +129,7 @@ void ArgManager::usage(Args& args, const std::string& prog) {
+ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
+   int opt;
+   defaultArgs(args);
+-  while ((opt = getopt(argc, argv, "aAcCDEfghHilLnpPrRsStTvwWyY")) != -1) {
++  while ((opt = getopt(argc, argv, "aAcCDEfghHilLnpPrRsStTvwWXxyY")) != -1) {
+     switch (opt) {
+       case 'a':
+         args.rf_args = argv[optind];
+@@ -196,6 +203,15 @@ void ArgManager::parseArgs(Args& args, int argc, char **argv) {
+       case 'Y':
+         args.decimate = atoi(argv[optind]);
+         break;
++      case 'X':
++        // cellular-drones SpectrumTap CSV output path.
++        args.spectrum_tap_file_name = argv[optind];
++        break;
++      case 'x':
++        // cellular-drones SpectrumTap publish period in subframes (1ms each).
++        args.spectrum_tap_period_subframes =
++            static_cast<uint32_t>(strtoul(argv[optind], nullptr, 0));
++        break;
+       case 'n':
+         args.nof_subframes = static_cast<uint32_t>(strtoul(argv[optind], nullptr, 0));
+         break;
+diff --git a/src/eye/ArgManager.h b/src/eye/ArgManager.h
+index 8724a50..0208c99 100644
+--- a/src/eye/ArgManager.h
++++ b/src/eye/ArgManager.h
+@@ -55,6 +55,11 @@ struct Args {
+   bool skip_secondary_meta_formats;
+   bool enable_shortcut_discovery;
+   uint32_t rnti_histogram_threshold;
++
++  // cellular-drones SpectrumTap addition: path the CSV is written to
++  // (empty = disabled), and how often (in subframes; 100 = 10 Hz).
++  std::string spectrum_tap_file_name = "";
++  uint32_t spectrum_tap_period_subframes = 10;
+ };
+ 
+ class ArgManager {
+diff --git a/src/eye/EyeCore.cc b/src/eye/EyeCore.cc
+index 910f72e..cfa34a4 100644
+--- a/src/eye/EyeCore.cc
++++ b/src/eye/EyeCore.cc
+@@ -28,6 +28,7 @@
+ #include "falcon/common/SubframeBuffer.h"
+ #include "falcon/phy/falcon_ue/BufferPool.h"
+ #include "falcon/phy/falcon_rf/rf_imp.h"
++#include "phy/SpectrumTap.h"
+ 
+ #include "falcon/prof/Lifetime.h"
+ 
+@@ -173,6 +174,17 @@ bool EyeCore::run() {
+     srslte_rf_set_rx_freq(&rf, rf_freq);
+     srslte_rf_rx_wait_lo_locked(&rf);
+ 
++    // cellular-drones SpectrumTap: early-configure with cell-search
++    // defaults (1.92 MHz / 1024-pt FFT) so the dashboard waterfall is
++    // populated from the moment the SDR opens, before PSS/SSS lock.
++    // The post-MIB block below reconfigures to the cell's actual rate.
++    SpectrumTap::instance().configure(args.spectrum_tap_file_name,
++                                      args.rf_freq,
++                                      1920000.0,
++                                      1024,
++                                      args.spectrum_tap_period_subframes);
++
++
+     uint32_t ntrial=0;
+     uint32_t max_trial = 3;
+     do {
+@@ -367,6 +379,23 @@ bool EyeCore::run() {
+ 
+   srslte_pbch_decode_reset(&ue_mib.pbch);
+ 
++  // cellular-drones SpectrumTap: dump per-cell FFT to a CSV the dashboard
++  // tails. fft_size capped by the subframe length so narrow-PRB cells still
++  // publish something useful.
++  {
++    int srate_for_tap = srslte_sampling_freq_hz(cell.nof_prb);
++    uint32_t sf_len_samples = static_cast<uint32_t>(srate_for_tap / 1000);
++    uint32_t fft_size = 2048;
++    if (sf_len_samples > 0 && fft_size > sf_len_samples) {
++      fft_size = sf_len_samples;
++    }
++    SpectrumTap::instance().configure(args.spectrum_tap_file_name,
++                                      args.rf_freq,
++                                      static_cast<double>(srate_for_tap),
++                                      fft_size,
++                                      args.spectrum_tap_period_subframes);
++  }
++
+   //PrintLifetime lt("###>> Search took: ");
+   cout << "Entering main loop..." << endl;
+   /* Main loop */
+diff --git a/src/eye/phy/SpectrumTap.cc b/src/eye/phy/SpectrumTap.cc
+new file mode 100644
+index 0000000..21574bd
+--- /dev/null
++++ b/src/eye/phy/SpectrumTap.cc
+@@ -0,0 +1,184 @@
++/*
++ * SpectrumTap implementation. See SpectrumTap.h.
++ *
++ * Added by the cellular-drones project; not part of upstream FALCON.
++ */
++#include "SpectrumTap.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <ctime>
++#include <iostream>
++
++extern "C" {
++#include "srslte/phy/rf/rf.h"
++}
++#undef I
++
++SpectrumTap& SpectrumTap::instance() {
++  static SpectrumTap inst;
++  return inst;
++}
++
++/* C-callable wrapper registered with srslte_rf_set_sample_observer; routes
++ * raw IQ from every recv (cell search AND main loop) into the singleton. */
++extern "C" void spectrum_tap_observer_c(const void *iq, uint32_t nsamples) {
++  SpectrumTap::instance().on_subframe(static_cast<const cf_t*>(iq), nsamples);
++}
++
++SpectrumTap::~SpectrumTap() {
++  if (plan_initialized_) {
++    srslte_dft_plan_free(&plan_);
++    plan_initialized_ = false;
++  }
++}
++
++void SpectrumTap::configure(const std::string& out_path,
++                            double center_hz,
++                            double sample_rate_hz,
++                            uint32_t fft_size,
++                            uint32_t subframes_per_publish) {
++  std::lock_guard<std::mutex> lock(mu_);
++  if (out_path.empty()) {
++    enabled_ = false;
++    return;
++  }
++  bool reuse_file = out_.is_open() && out_path == out_path_;
++  out_path_ = out_path;
++  center_hz_ = center_hz;
++  sample_rate_hz_ = sample_rate_hz;
++  bool fft_changed = (fft_size != fft_size_);
++  fft_size_ = fft_size;
++  subframes_per_publish_ = subframes_per_publish > 0 ? subframes_per_publish : 100;
++
++  fft_in_.assign(fft_size_, cf_t{});
++  fft_out_.assign(fft_size_, cf_t{});
++
++  // Rebuild FFT plan if size changed (cell search uses 1.92 MHz / smaller
++  // FFT; post-MIB switches to the cell's actual rate / 2048 FFT).
++  if (plan_initialized_ && fft_changed) {
++    srslte_dft_plan_free(&plan_);
++    plan_initialized_ = false;
++  }
++  if (!plan_initialized_) {
++    if (srslte_dft_plan(&plan_, static_cast<int>(fft_size_),
++                        SRSLTE_DFT_FORWARD, SRSLTE_DFT_COMPLEX) != 0) {
++      std::cerr << "SpectrumTap: srslte_dft_plan failed (size=" << fft_size_
++                << ")" << std::endl;
++      enabled_ = false;
++      return;
++    }
++    srslte_dft_plan_set_norm(&plan_, true);
++    plan_initialized_ = true;
++  }
++
++  if (!reuse_file) {
++    if (out_.is_open()) out_.close();
++    out_.open(out_path_, std::ios::out | std::ios::trunc);
++    if (!out_.is_open()) {
++      std::cerr << "SpectrumTap: cannot open " << out_path_ << std::endl;
++      enabled_ = false;
++      return;
++    }
++  }
++  enabled_ = true;
++  // Register the global RF observer so every srslte_rf_recv* call feeds us
++  // raw IQ — including during pre-MIB cell search where the falcon
++  // wrapper is bypassed. Idempotent.
++  srslte_rf_set_sample_observer(&spectrum_tap_observer_c);
++  std::cerr << "SpectrumTap: enabled — out=" << out_path_
++            << " center=" << center_hz_ / 1e6 << " MHz"
++            << " rate=" << sample_rate_hz_ / 1e6 << " MHz"
++            << " fft=" << fft_size_
++            << " period=" << subframes_per_publish_ << " subframes"
++            << std::endl;
++}
++
++void SpectrumTap::on_subframe(const cf_t* iq_samples, uint32_t n_samples) {
++  if (!enabled_ || iq_samples == nullptr) return;
++  ++subframes_seen_;
++  if (subframes_seen_ % subframes_per_publish_ != 0) return;
++  if (n_samples < fft_size_) return;
++
++  std::lock_guard<std::mutex> lock(mu_);
++
++  // Apply Hann window into fft_in_.
++  const float pi2 = 2.0f * static_cast<float>(M_PI);
++  const float denom = static_cast<float>(fft_size_ - 1);
++  for (uint32_t i = 0; i < fft_size_; ++i) {
++    float w = 0.5f * (1.0f - std::cos(pi2 * static_cast<float>(i) / denom));
++    cf_t s = iq_samples[i];
++    __real__(fft_in_[i]) = __real__(s) * w;
++    __imag__(fft_in_[i]) = __imag__(s) * w;
++  }
++
++  srslte_dft_run_c(&plan_, fft_in_.data(), fft_out_.data());
++
++  // fftshift + magnitude-squared → dB.
++  std::vector<float> db(fft_size_);
++  uint32_t half = fft_size_ / 2;
++  for (uint32_t i = 0; i < fft_size_; ++i) {
++    cf_t z = fft_out_[i];
++    float re = __real__(z);
++    float im = __imag__(z);
++    float mag2 = re * re + im * im;
++    uint32_t k = (i + half) % fft_size_;
++    db[k] = 10.0f * std::log10(mag2 + 1e-12f);
++  }
++
++  emit_csv_row(db.data(), fft_size_);
++}
++
++void SpectrumTap::emit_csv_row(const float* db, uint32_t n_bins) {
++  // hackrf_sweep schema:
++  //   YYYY-MM-DD, HH:MM:SS.uuuuuu, hz_low, hz_high, bin_hz, n_bins, db, db, ...
++  // Peak-hold downsample to ~100 kHz bins to keep rows compact.
++  const double bin_hz_native = sample_rate_hz_ / static_cast<double>(n_bins);
++  const double target_bin_hz = 100000.0;
++  uint32_t bins_per_target = static_cast<uint32_t>(
++      std::max(1.0, std::round(target_bin_hz / bin_hz_native)));
++  uint32_t out_bins = n_bins / bins_per_target;
++  if (out_bins == 0) return;
++  double out_bin_hz = bin_hz_native * static_cast<double>(bins_per_target);
++
++  std::vector<float> down(out_bins, -200.0f);
++  for (uint32_t i = 0; i < out_bins; ++i) {
++    float peak = -1e9f;
++    for (uint32_t j = 0; j < bins_per_target; ++j) {
++      float v = db[i * bins_per_target + j];
++      if (v > peak) peak = v;
++    }
++    down[i] = peak;
++  }
++
++  double low_hz = center_hz_ - sample_rate_hz_ / 2.0;
++  double high_hz = center_hz_ + sample_rate_hz_ / 2.0;
++
++  struct timespec ts;
++  clock_gettime(CLOCK_REALTIME, &ts);
++  std::tm tm_local{};
++  std::time_t now_t = ts.tv_sec;
++  localtime_r(&now_t, &tm_local);
++  char date[16], time_[16];
++  std::strftime(date, sizeof(date), "%Y-%m-%d", &tm_local);
++  std::strftime(time_, sizeof(time_), "%H:%M:%S", &tm_local);
++
++  char head[256];
++  std::snprintf(head, sizeof(head), "%s, %s.%06ld, %lld, %lld, %.2f, %u",
++                date, time_,
++                static_cast<long>(ts.tv_nsec / 1000),
++                static_cast<long long>(low_hz),
++                static_cast<long long>(high_hz),
++                out_bin_hz, out_bins);
++
++  out_ << head;
++  char buf[16];
++  for (uint32_t i = 0; i < out_bins; ++i) {
++    std::snprintf(buf, sizeof(buf), ", %.2f", down[i]);
++    out_ << buf;
++  }
++  out_ << "\n";
++  out_.flush();
++}
+diff --git a/src/eye/phy/SpectrumTap.h b/src/eye/phy/SpectrumTap.h
+new file mode 100644
+index 0000000..1473f76
+--- /dev/null
++++ b/src/eye/phy/SpectrumTap.h
+@@ -0,0 +1,67 @@
++/*
++ * SpectrumTap — taps the time-domain IQ that FALCON is already receiving,
++ * runs an FFT every N subframes, and writes a hackrf_sweep-schema CSV row
++ * to a file. sniffer.spectrum.SpectrumScanner consumes that file (file-tail
++ * mode) so the dashboard waterfall shows the actual cell FALCON is
++ * decoding, not a separate wideband sweep.
++ *
++ * Disabled unless --spectrum-tap <path> is passed to FalconEye.
++ *
++ * Added by the cellular-drones project; not part of upstream FALCON.
++ */
++#pragma once
++
++#include <cstdint>
++#include <fstream>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++#include "srslte/phy/common/phy_common.h"
++#include "srslte/phy/dft/dft.h"
++#ifdef __cplusplus
++}
++#undef I
++#endif
++
++class SpectrumTap {
++ public:
++  static SpectrumTap& instance();
++
++  void configure(const std::string& out_path,
++                 double center_hz,
++                 double sample_rate_hz,
++                 uint32_t fft_size,
++                 uint32_t subframes_per_publish);
++
++  void on_subframe(const cf_t* iq_samples, uint32_t n_samples);
++
++  bool enabled() const { return enabled_; }
++
++ private:
++  SpectrumTap() = default;
++  ~SpectrumTap();
++  SpectrumTap(const SpectrumTap&) = delete;
++  SpectrumTap& operator=(const SpectrumTap&) = delete;
++
++  void emit_csv_row(const float* db, uint32_t n_bins);
++
++  bool enabled_ = false;
++  std::string out_path_;
++  double center_hz_ = 0.0;
++  double sample_rate_hz_ = 0.0;
++  uint32_t fft_size_ = 0;
++  uint32_t subframes_per_publish_ = 10;
++
++  srslte_dft_plan_t plan_{};
++  bool plan_initialized_ = false;
++  std::vector<cf_t> fft_in_;
++  std::vector<cf_t> fft_out_;
++
++  uint64_t subframes_seen_ = 0;
++  std::ofstream out_;
++  std::mutex mu_;
++};

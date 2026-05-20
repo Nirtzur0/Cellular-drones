@@ -77,6 +77,24 @@ def earfcn_to_hz_dl(earfcn: int) -> int:
     )
 
 
+def hz_to_earfcn_dl(freq_hz: float) -> int:
+    """Return the EARFCN for a DL center frequency in Hz.
+
+    Inverse of earfcn_to_hz_dl. Raises ValueError if the frequency
+    doesn't fall within any known band.
+    """
+    freq_mhz = freq_hz / 1e6
+    for b in _BANDS:
+        dl_hi_mhz = b.dl_low_mhz + 0.1 * (b.dl_earfcn_hi - b.dl_n_offs)
+        if b.dl_low_mhz - 0.05 <= freq_mhz <= dl_hi_mhz + 0.05:
+            earfcn = b.dl_n_offs + int(round((freq_mhz - b.dl_low_mhz) / 0.1))
+            earfcn = max(b.dl_earfcn_lo, min(b.dl_earfcn_hi, earfcn))
+            return earfcn
+    raise ValueError(
+        f"{freq_hz:.0f} Hz doesn't match any known LTE DL band."
+    )
+
+
 def band_of_earfcn(earfcn: int) -> int:
     """Return the LTE band number for a DL EARFCN.
 

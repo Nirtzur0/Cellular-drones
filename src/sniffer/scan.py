@@ -195,9 +195,83 @@ def _print_table(cells: list[Cell], *, fh=sys.stdout) -> None:
             print("  ".join("-" * w for w in widths), file=fh)
 
 
+def _log_neighbors(neighbors: list[dict]) -> None:
+    """Append SIB3/SIB5 neighbor cells to the known-cells store."""
+    try:
+        from sniffer.cells import KnownCell, append_cell
+        from sniffer.lte_bands import earfcn_to_hz_dl
+    except Exception:  # noqa: BLE001
+        return
+    import time as _time
+    ts = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+    for nb in neighbors:
+        earfcn = nb.get("earfcn")
+        pci = nb.get("pci")
+        if earfcn is None or pci is None:
+            continue
+        try:
+            center_hz: Optional[float] = float(earfcn_to_hz_dl(earfcn))
+        except Exception:  # noqa: BLE001
+            center_hz = None
+        try:
+            append_cell(KnownCell(
+                source="sib-neighbor", ts_utc=ts,
+                earfcn=earfcn, pci=pci, center_hz=center_hz,
+            ))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _log_to_known_cells(cells: list[Cell]) -> None:
+    """Append every (earfcn, pci) we just discovered to known_cells.jsonl.
+    Errors here must never break the user-facing scan output."""
+    try:
+        from sniffer.cells import KnownCell, append_cell
+        from sniffer.lte_bands import earfcn_to_hz_dl
+    except Exception:  # noqa: BLE001 — running outside our venv
+        return
+    import time as _time
+    ts = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+    for c in cells:
+        if c.pci is None:
+            continue
+        center_hz: Optional[float] = None
+        if c.earfcn is not None:
+            try:
+                center_hz = float(earfcn_to_hz_dl(c.earfcn))
+            except Exception:  # noqa: BLE001
+                center_hz = None
+        enrich = c.enrichment or {}
+        mcc = _safe_int(enrich.get("mcc"))
+        mnc = _safe_int(enrich.get("mnc"))
+        tac = _safe_int(enrich.get("tac"))
+        eci = _safe_int(enrich.get("eci") or enrich.get("cgi"))
+        operator = None
+        if mcc is not None and mnc is not None:
+            from sniffer.cells import OPERATOR_BY_MCC_MNC
+            operator = OPERATOR_BY_MCC_MNC.get((mcc, mnc))
+        try:
+            append_cell(KnownCell(
+                source="scan", ts_utc=ts,
+                earfcn=c.earfcn, pci=c.pci, center_hz=center_hz,
+                rsrp_dbm=c.rsrp_dbm, cfo_hz=c.cfo_hz,
+                mcc=mcc, mnc=mnc, tac=tac, eci=eci, operator=operator,
+            ))
+        except Exception:  # noqa: BLE001 — disk full, perms, whatever
+            pass
+
+
+def _safe_int(v) -> Optional[int]:
+    try:
+        return int(v) if v not in (None, "") else None
+    except (ValueError, TypeError):
+        return None
+
+
 def run_scan(*, band: Optional[int] = None,
              earfcn_range: Optional[tuple[int, int]] = None,
              decode_sib1: bool = False,
+             decode_neighbors: bool = False,
              binary: str = DEFAULT_BINARY,
              sib_binary: str = DEFAULT_SIB_BINARY,
              json_out: bool = False,
@@ -233,14 +307,25 @@ def run_scan(*, band: Optional[int] = None,
               file=sys.stderr)
         return 5
     cells = list(parse_stream(proc.stdout.splitlines()))
-    if decode_sib1:
-        from sniffer.sib1 import decode_sib1 as _decode_sib1
+    if decode_sib1 or decode_neighbors:
+        from sniffer.sib1 import (decode_sib1 as _decode_sib1,
+                                  decode_neighbors as _decode_neighbors)
         for c in cells:
             if c.earfcn is None or c.pci is None:
                 continue
-            info = _decode_sib1(c.earfcn, c.pci, binary=sib_binary)
-            if info is not None:
-                c.enrichment.update(info)
+            if decode_sib1:
+                info = _decode_sib1(c.earfcn, c.pci, binary=sib_binary)
+                if info is not None:
+                    c.enrichment.update(info)
+            if decode_neighbors:
+                neighbors = _decode_neighbors(c.earfcn, c.pci, binary=sib_binary)
+                if neighbors:
+                    print(f"  SIB3/5: {len(neighbors)} neighbor(s) from "
+                          f"EARFCN={c.earfcn} PCI={c.pci}", file=sys.stderr)
+                    _log_neighbors(neighbors)
+    # Side-effect: log every found cell to the known-cells store so future
+    # sniffer live/survey runs can reuse this discovery.
+    _log_to_known_cells(cells)
     if json_out:
         for c in cells:
             print(json.dumps(c.to_dict(), separators=(",", ":")), file=fh)
