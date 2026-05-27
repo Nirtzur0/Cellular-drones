@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterator, Optional
 
@@ -736,208 +737,383 @@ def _parse_falcon_argv(cmd: list[str]) -> dict[str, Any]:
     return out
 
 
-def run_falcon_loop(state: State, *, falcon_cmd: list[str], pci: int,
-                    mission_id: str, out_dir: str, center_hz: Optional[float],
+@dataclass
+class FalconTarget:
+    """One cell the FALCON loop should lock onto.
+
+    `falcon_cmd` is the full FalconEye argv minus the `-D`/`-X` we append.
+    `center_hz`/`earfcn` ride along for display + RadioConfig metadata;
+    FalconEye itself only needs the `-f <hz>` already inside `falcon_cmd`.
+    """
+    falcon_cmd: list[str]
+    pci: int
+    center_hz: Optional[float] = None
+    earfcn: Optional[int] = None
+
+
+class RadioController:
+    """Owns the *desired* FALCON target and arbitrates the single SDR between
+    the FALCON live loop and one-shot cell scans.
+
+    Only one process can hold a USRP at a time, and re-locking a cell costs
+    2-5 min on Pi-class hardware — so historically the target was frozen at
+    process launch and the dashboard was read-only. This controller lets the
+    dashboard retarget at runtime: `run_falcon_loop` re-reads `current()`
+    each iteration and watches `generation()`; any retarget / pause / scan
+    bumps the generation, the running FalconEye subprocess is torn down, and
+    the loop re-reads. The re-acquire cost is unavoidable, but it's now a
+    click instead of an SSH round-trip.
+    """
+
+    def __init__(self, initial: Optional[FalconTarget] = None) -> None:
+        self._lock = threading.Lock()
+        self._target = initial
+        self._active = initial is not None
+        self._scanning = False
+        self._gen = 0
+        # Set on any state change so the FALCON loop can wake from an idle
+        # wait immediately instead of polling on a fixed tick.
+        self._wake = threading.Event()
+
+    def generation(self) -> int:
+        with self._lock:
+            return self._gen
+
+    def current(self) -> "tuple[Optional[FalconTarget], bool, int]":
+        """(target, should_run, generation). should_run is False while paused
+        or while a scan owns the radio."""
+        with self._lock:
+            run = (self._active and not self._scanning
+                   and self._target is not None)
+            return self._target, run, self._gen
+
+    def is_scanning(self) -> bool:
+        with self._lock:
+            return self._scanning
+
+    def set_target(self, target: FalconTarget) -> int:
+        with self._lock:
+            self._target = target
+            self._active = True
+            self._gen += 1
+            gen = self._gen
+        self._wake.set()
+        return gen
+
+    def pause(self) -> None:
+        """Stop locking but remember the target, so the UI can show what was
+        last tried and offer a re-tune."""
+        with self._lock:
+            self._active = False
+            self._gen += 1
+        self._wake.set()
+
+    def begin_scan(self) -> None:
+        with self._lock:
+            self._scanning = True
+            self._gen += 1
+        self._wake.set()
+
+    def end_scan(self, *, resume: bool = False) -> None:
+        with self._lock:
+            self._scanning = False
+            if not resume:
+                # Default: leave the radio idle so the operator deliberately
+                # picks a cell from the fresh scan results.
+                self._active = False
+            self._gen += 1
+        self._wake.set()
+
+    def wait(self, timeout: float) -> None:
+        """Block until something changes (retarget/pause/scan) or timeout."""
+        self._wake.wait(timeout)
+        self._wake.clear()
+
+
+def build_falcon_cmd(*, center_hz: float, pci: int, gain_db: float,
+                     antennas: int = 1,
+                     binname: Optional[str] = None) -> list[str]:
+    """Build a FalconEye argv for one cell — the runtime twin of the argv
+    `sniffer.cli._cmd_live` builds at launch, kept in sync with it. `-l pci%3`
+    skips FALCON's N_id_2 brute force; `-W 4` matches a Pi's core count.
+    """
+    binname = binname or os.environ.get("FALCON_BIN", "FalconEye")
+    return [binname,
+            "-f", str(int(center_hz)),
+            "-A", str(int(antennas)),
+            "-g", str(gain_db),
+            "-l", str(int(pci) % 3),
+            "-W", "4"]
+
+
+def _safe_hz_to_earfcn(center_hz: Optional[float]) -> Optional[int]:
+    """Best-effort Hz → EARFCN; None if the band is unknown (don't crash)."""
+    if center_hz is None:
+        return None
+    try:
+        from sniffer.lte_bands import hz_to_earfcn_dl
+        return hz_to_earfcn_dl(center_hz)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def run_falcon_loop(state: State, *, controller: RadioController,
+                    mission_id: str, out_dir: str,
                     stop: threading.Event,
                     spectrum_tap_path: Optional[str] = None) -> None:
-    """Spawn FalconEye, tail its DCI CSV, feed records into State.
+    """Spawn FalconEye for the controller's current target, tail its DCI CSV,
+    feed records into State — and re-spawn against a new cell whenever the
+    dashboard retargets (RadioController bumps its generation).
 
-    FalconEye (falkenber9/falcon, the LTESniffer ancestor) writes a
-    tab-separated per-DCI tracefile via `-D <path>`. Unlike LTESniffer
-    — which writes PCAP only — FALCON's CSV is designed for tailing,
-    which is the entire reason we wire it here.
+    FalconEye writes a tab-separated per-DCI tracefile via `-D <path>` that we
+    tail. PCI is carried on the target because FALCON never writes the PCI in
+    its rows — the caller knows it from the `-f <hz>` it tuned.
 
-    We allocate a fresh temp dir per spawn (so file-rotation logic in
-    the tailer is rarely exercised, but works), append `-D <tmp>/dci.csv`
-    to the user-supplied argv, spawn the binary, and parse rows in a
-    parallel thread. FalconEye's own stdout/stderr is forwarded to ours
-    so build / cell-lock errors are visible.
-
-    PCI is mandatory because FALCON locks to a single cell and never
-    writes the PCI in its rows — the caller knows it because they
-    passed `-f <hz>` for that exact cell.
+    Lock-state — surfaced via State.set_status(lock_state=...) — is the point
+    of this design. We DON'T silently kill+respawn a merely-quiet cell anymore
+    (that thrashed on marginal signal). Instead:
+      * acquiring     — spawned, no DCI/PBCH yet, inside the initial grace.
+      * producing     — DCI rows flowing.
+      * locked-quiet  — locked (SpectrumTap alive, or DCIs seen) but no PDCCH
+                        right now. A healthy idle cell — left running.
+      * lock-lost     — FALCON exited after locking. Transient → respawn.
+      * no-lock       — past the grace with no DCI AND no SpectrumTap growth,
+                        or FALCON died before locking: wrong freq / no signal.
+                        Give up and idle, awaiting an operator retarget.
     """
-    import tempfile
-
-    if not falcon_cmd:
-        state.set_status("error", message="no --falcon-cmd provided")
-        return
-    if (shutil.which(falcon_cmd[0]) is None
-            and not os.path.exists(falcon_cmd[0])):
-        state.set_status(
-            "error",
-            message=(f"`{falcon_cmd[0]}` not found. Build FALCON "
-                     f"(see scripts/install-linux.sh) or set FALCON_BIN."),
-        )
-        return
-
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"ue-{mission_id}.jsonl")
-    # FALCON's stdout+stderr → a log file so we can diagnose lock failures.
-    # FalconEye writes "Searching for cell...", "Found Cell_id", "Entering
-    # main loop" and decode errors to stderr; without this we run blind.
     falcon_log_path = os.path.join(out_dir, f"falcon-{mission_id}.log")
-    # Extract real gain from the FalconEye argv (-g flag) and derive EARFCN
-    # from the center frequency so RadioConfig records carry accurate metadata.
-    _cmd_meta = _parse_falcon_argv(falcon_cmd)
-    _rx_gain = _cmd_meta.get("gain_db", 50.0)
-    _earfcn: Optional[int] = None
-    if center_hz is not None:
-        try:
-            from sniffer.lte_bands import hz_to_earfcn_dl
-            _earfcn = hz_to_earfcn_dl(center_hz)
-        except (ValueError, ImportError):
-            pass
-    parse_args = _ParseArgs(mission_id, "falcon", "usrp-falcon-0",
-                            rx_gain_db=_rx_gain, center_hz=center_hz,
-                            sample_rate_sps=23.04e6, earfcn=_earfcn)
-
-    # Write a "live-lock" record to the known-cells store on the first
-    # successfully decoded DCI — proof that FalconEye actually locked.
-    _lock_logged = threading.Event()
-
-    def _on_lock() -> None:
-        if _lock_logged.is_set():
-            return
-        _lock_logged.set()
-        try:
-            from sniffer.cells import KnownCell, append_cell
-            import time as _t
-            append_cell(KnownCell(
-                source="live-lock",
-                ts_utc=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
-                earfcn=_earfcn, center_hz=center_hz, pci=pci,
-            ))
-        except Exception:  # noqa: BLE001
-            pass
-
-    # Stable path for FALCON's per-DCI CSV — survives FALCON respawns so
-    # the tail-and-parse loop can replay anything FalconEye managed to
-    # write before it died. The old TemporaryDirectory approach destroyed
-    # the file every respawn cycle, so any unparsed rows were lost.
+    # Stable CSV path across respawns so the tailer can replay whatever
+    # FalconEye wrote before a teardown.
     persistent_csv_path = os.path.join(out_dir, f"dci-{mission_id}.csv")
+    # (earfcn, pci) we've already written a live-lock row for, so retargeting
+    # back and forth doesn't spam the known-cells store.
+    _lock_logged: set[tuple[Optional[int], int]] = set()
 
-    # Two-phase stall threshold. Cell-search (PSS sweep + SSS + PBCH + RF
-    # rate switch) on Pi-class hardware can chew 2-3 min before the FIRST
-    # DCI lands. After the first DCI we're "locked" — if the file then
-    # goes quiet, the cell is lost and we should respawn.
-    FALCON_INITIAL_GRACE_SECONDS = 360.0   # before any DCI ever (PBCH+rate
-                                            # switch on Pi can be 4-5 min)
-    FALCON_POST_LOCK_STALL_SECONDS = 45.0  # after we've seen DCIs
+    FALCON_INITIAL_GRACE_SECONDS = 360.0   # PBCH + RF rate switch on a Pi
+    FALCON_POST_LOCK_QUIET_SECONDS = 45.0  # after which "producing" → "quiet"
+
+    # Dedup idle-branch status so we don't re-broadcast (and re-log) the same
+    # "idle"/"paused" line every wait tick.
+    _last_idle: Optional[tuple] = None
 
     while not stop.is_set():
-        td = None  # tempdir no longer needed for the CSV path
-        if True:  # keep indentation level same as the old `with` block
-            csv_path = persistent_csv_path
-            full_cmd = list(falcon_cmd) + ["-D", csv_path]
-            # Cellular-drones SpectrumTap: ask FALCON to publish per-cell
-            # FFT rows so the dashboard waterfall reflects the actual cell
-            # being decoded (vs a separate USRP-wide sweep).
-            if spectrum_tap_path:
-                os.makedirs(os.path.dirname(spectrum_tap_path), exist_ok=True)
-                full_cmd += ["-X", spectrum_tap_path]
-            # Per-iteration stall flag: when set, breaks the parse loop so the
-            # outer `while` can respawn FALCON. FALCON's PSS-search hang ("alive
-            # but stuck") would otherwise wedge the dashboard forever.
-            iter_stop = threading.Event()
-            cell_extras = _parse_falcon_argv(full_cmd)
-            state.set_status("sniffing", center_hz=center_hz,
-                             decoder="falcon", out=out_path,
-                             pci=pci, falcon_log=falcon_log_path,
-                             **cell_extras)
-            falcon_log_fh = open(falcon_log_path, "a", encoding="utf-8")
-            proc = subprocess.Popen(
-                full_cmd,
-                stdout=falcon_log_fh,
-                stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
-            )
-            # Stall watchdog. Two phases:
-            #   * Initial grace (FALCON_INITIAL_GRACE_SECONDS): cell-search +
-            #     PBCH + RF rate switch can chew 2-3 min on Pi before the
-            #     first DCI lands. Don't restart during this — kill the run
-            #     only if FALCON itself dies or grace runs out completely.
-            #   * Post-lock (FALCON_POST_LOCK_STALL_SECONDS): once at least
-            #     one DCI has been written, dci.csv stopping = cell lost.
-            #     Short threshold here so the dashboard self-heals.
-            def _watchdog() -> None:
-                # "Alive" = EITHER dci.csv grows (decoded grants) OR the
-                # spectrum tap file grows (FALCON in main loop + producing
-                # FFTs). Only BOTH-silent = real hang. A quiet cell that
-                # produces no PDCCH for a while is still healthy as long
-                # as the SpectrumTap is firing.
-                last_dci = -1
-                last_spec = -1
-                last_change = time.time()
-                spawn_started = last_change
-                ever_dci = False
-                while not iter_stop.is_set() and not stop.is_set():
-                    if proc.poll() is not None:
-                        iter_stop.set()
-                        return
-                    try:
-                        dci_sz = os.path.getsize(csv_path)
-                    except OSError:
-                        dci_sz = -1
-                    spec_sz = -1
-                    if spectrum_tap_path:
-                        try:
-                            spec_sz = os.path.getsize(spectrum_tap_path)
-                        except OSError:
-                            spec_sz = -1
-                    now = time.time()
-                    if dci_sz > last_dci:
-                        last_dci = dci_sz
-                        last_change = now
-                        if dci_sz > 0:
-                            ever_dci = True
-                    if spec_sz > last_spec:
-                        last_spec = spec_sz
-                        last_change = now
-                    threshold = (FALCON_POST_LOCK_STALL_SECONDS if ever_dci
-                                 else FALCON_INITIAL_GRACE_SECONDS)
-                    elapsed = now - last_change
-                    if elapsed > threshold:
-                        reason = ("post-DCI stall — cell may be lost" if ever_dci
-                                  else "no DCI AND no spectrum-tap growth — "
-                                       "FALCON wedged")
+        target, run, gen = controller.current()
+        if not run or target is None:
+            # Scan owns its own status messages; otherwise surface idle/paused.
+            if not controller.is_scanning():
+                idle_key = (("paused", target.pci) if target is not None
+                            else ("idle", None))
+                if idle_key != _last_idle:
+                    _last_idle = idle_key
+                    if target is not None:
                         state.set_status(
-                            "sniffing",
-                            message=f"FALCON {reason} after {int(elapsed)}s — restarting",
-                            pci=pci, center_hz=center_hz, decoder="falcon",
-                        )
+                            "idle", lock_state="paused",
+                            message="paused — pick a cell to lock",
+                            pci=target.pci, center_hz=target.center_hz,
+                            earfcn=target.earfcn)
+                    else:
+                        state.set_status("idle", lock_state="idle",
+                                         message="idle — no cell selected")
+            controller.wait(1.0)
+            continue
+        _last_idle = None  # entering a run; force a fresh idle line next time
+
+        falcon_cmd = list(target.falcon_cmd)
+        pci = target.pci
+        center_hz = target.center_hz
+        if (shutil.which(falcon_cmd[0]) is None
+                and not os.path.exists(falcon_cmd[0])):
+            state.set_status(
+                "error", lock_state="no-lock",
+                message=(f"`{falcon_cmd[0]}` not found. Build FALCON "
+                         f"(see scripts/install-linux.sh) or set FALCON_BIN."),
+            )
+            controller.pause()
+            controller.wait(2.0)
+            continue
+        _cmd_meta = _parse_falcon_argv(falcon_cmd)
+        _rx_gain = _cmd_meta.get("gain_db", 50.0)
+        _earfcn = target.earfcn
+        if _earfcn is None and center_hz is not None:
+            try:
+                from sniffer.lte_bands import hz_to_earfcn_dl
+                _earfcn = hz_to_earfcn_dl(center_hz)
+            except Exception:  # noqa: BLE001
+                _earfcn = None
+        parse_args = _ParseArgs(mission_id, "falcon", "usrp-falcon-0",
+                                rx_gain_db=_rx_gain, center_hz=center_hz,
+                                sample_rate_sps=23.04e6, earfcn=_earfcn)
+
+        def _on_lock(_e: Optional[int] = _earfcn, _p: int = pci,
+                     _c: Optional[float] = center_hz) -> None:
+            # Proof FalconEye actually decoded a DCI on this cell.
+            key = (_e, _p)
+            if key in _lock_logged:
+                return
+            _lock_logged.add(key)
+            try:
+                from sniffer.cells import KnownCell, append_cell
+                import time as _t
+                append_cell(KnownCell(
+                    source="live-lock",
+                    ts_utc=_t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+                    earfcn=_e, center_hz=_c, pci=_p,
+                ))
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Truncate stale CSV/tap from the previous target so the tailer and
+        # the spectrum waterfall don't replay another cell's rows.
+        for _p in (persistent_csv_path, spectrum_tap_path):
+            if not _p:
+                continue
+            try:
+                os.makedirs(os.path.dirname(_p), exist_ok=True)
+                open(_p, "w").close()
+            except OSError:
+                pass
+
+        csv_path = persistent_csv_path
+        full_cmd = falcon_cmd + ["-D", csv_path]
+        # Cellular-drones SpectrumTap: ask FALCON to publish per-cell FFT rows
+        # so the dashboard waterfall reflects the cell being decoded.
+        if spectrum_tap_path:
+            full_cmd += ["-X", spectrum_tap_path]
+        iter_stop = threading.Event()
+        cell_extras = _parse_falcon_argv(full_cmd)
+        # Stable metadata stamped on every status update for this run so a
+        # lock-state transition never drops gain/antenna/freq from the panel.
+        status_base = dict(decoder="falcon", out=out_path, pci=pci,
+                           earfcn=_earfcn, center_hz=center_hz,
+                           falcon_log=falcon_log_path, **cell_extras)
+        state.set_status("sniffing", lock_state="acquiring", **status_base)
+        falcon_log_fh = open(falcon_log_path, "a", encoding="utf-8")
+        proc = subprocess.Popen(
+            full_cmd, stdout=falcon_log_fh, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+
+        # Emit a status only when the lock-state actually changes — surfacing
+        # transitions, not every 3s tick (which would flood the SSE log).
+        emitted_ls = {"v": "acquiring"}
+
+        def _emit(phase: str, ls: str, msg: Optional[str] = None) -> None:
+            if ls == emitted_ls["v"]:
+                return
+            emitted_ls["v"] = ls
+            extra = dict(status_base)
+            if msg:
+                extra["message"] = msg
+            state.set_status(phase, lock_state=ls, **extra)
+
+        # The watchdog records what should happen after this run ends:
+        #   "respawn" → transient (lock-lost); loop again with same target.
+        #   "pause"   → give up (no-lock); idle until the operator retargets.
+        #   ""        → generation changed (retarget/pause/scan) — re-read.
+        outcome = {"action": ""}
+
+        def _watchdog() -> None:
+            # "Alive" = dci.csv grows (decoded grants) OR the spectrum tap
+            # grows (FALCON in main loop). A quiet cell that produces no PDCCH
+            # is healthy as long as the SpectrumTap fires — so unlike the old
+            # watchdog we do NOT kill+respawn it.
+            last_dci = -1
+            last_spec = -1
+            last_change = time.time()
+            ever_dci = False
+            ever_spec = False
+            while not iter_stop.is_set() and not stop.is_set():
+                if controller.generation() != gen:
+                    iter_stop.set()
+                    return
+                if proc.poll() is not None:
+                    if ever_dci or ever_spec:
+                        outcome["action"] = "respawn"
+                        _emit("sniffing", "lock-lost",
+                              "FALCON exited after locking — relocking")
+                    else:
+                        outcome["action"] = "pause"
+                        _emit("error", "no-lock",
+                              "FALCON exited before locking — check "
+                              "freq/gain/antenna, then pick a cell")
+                    iter_stop.set()
+                    return
+                try:
+                    dci_sz = os.path.getsize(csv_path)
+                except OSError:
+                    dci_sz = -1
+                spec_sz = -1
+                if spectrum_tap_path:
+                    try:
+                        spec_sz = os.path.getsize(spectrum_tap_path)
+                    except OSError:
+                        spec_sz = -1
+                now = time.time()
+                if dci_sz > last_dci:
+                    last_dci = dci_sz
+                    last_change = now
+                    if dci_sz > 0:
+                        ever_dci = True
+                if spec_sz > last_spec:
+                    last_spec = spec_sz
+                    last_change = now
+                    if spec_sz > 0:
+                        ever_spec = True
+                elapsed = now - last_change
+                if not (ever_dci or ever_spec):
+                    if elapsed > FALCON_INITIAL_GRACE_SECONDS:
+                        outcome["action"] = "pause"
+                        _emit("error", "no-lock",
+                              f"no lock after {int(elapsed)}s — wrong freq "
+                              "or no signal. Pick another cell.")
                         try:
                             proc.terminate()
                         except ProcessLookupError:
                             pass
                         iter_stop.set()
                         return
-                    time.sleep(3.0)
+                    _emit("sniffing", "acquiring")
+                elif ever_dci and elapsed <= FALCON_POST_LOCK_QUIET_SECONDS:
+                    _emit("sniffing", "producing")
+                else:
+                    # Locked but no PDCCH right now — healthy idle cell.
+                    _emit("sniffing", "locked-quiet",
+                          "locked — cell idle (no PDCCH right now)")
+                time.sleep(3.0)
 
-            watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
-            watchdog_thread.start()
+        watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+        watchdog_thread.start()
+        try:
+            with open(out_path, "a", encoding="utf-8") as jsonl_fh:
+                sink = _UeSightingSink(state, jsonl_out=jsonl_fh,
+                                       on_lock=_on_lock)
+                stream = tail_csv(csv_path, stop=iter_stop)
+                parse_falcon_stream(stream, parse_args, sink, pci=pci)
+        except Exception as exc:  # noqa: BLE001
+            state.set_status("error", message=f"falcon parse failed: {exc}")
+        finally:
+            iter_stop.set()
             try:
-                with open(out_path, "a", encoding="utf-8") as jsonl_fh:
-                    sink = _UeSightingSink(state, jsonl_out=jsonl_fh,
-                                          on_lock=_on_lock)
-                    stream = tail_csv(csv_path, stop=iter_stop)
-                    parse_falcon_stream(stream, parse_args, sink, pci=pci)
-            except Exception as exc:  # noqa: BLE001
-                state.set_status("error", message=f"falcon parse failed: {exc}")
-            finally:
-                iter_stop.set()
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
-                proc.wait()
-                watchdog_thread.join(timeout=2.0)
-                try:
-                    falcon_log_fh.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            watchdog_thread.join(timeout=2.0)
+            try:
+                falcon_log_fh.close()
+            except Exception:  # noqa: BLE001
+                pass
         if stop.is_set():
             return
+        # Only act on the outcome if no newer retarget/scan superseded this
+        # run; otherwise we'd clobber the operator's fresh selection.
+        if outcome["action"] == "pause" and controller.generation() == gen:
+            controller.pause()
         time.sleep(1.0)
 
 
@@ -1138,7 +1314,7 @@ _INDEX_HTML = r"""<!doctype html>
   --grid: rgba(93, 213, 255, 0.025);
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%;
+html, body { margin: 0;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
   background:
     linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 32px 32px,
@@ -1283,6 +1459,10 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
   display: none;          /* shown by JS when a cell is locked */
   font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
   font-size: 11px;
+  /* Sit above the workspace: at short viewport heights the .cards column
+     overflows downward and, being painted later, would otherwise steal
+     pointer events from this panel's controls. */
+  position: relative; z-index: 1;
 }
 #cell-panel .cp-head {
   display: flex; align-items: center; gap: 14px;
@@ -1297,9 +1477,62 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
                               letter-spacing: 0.12em; font-size: 10px; }
 #cell-panel .cp-field .val { color: var(--txt); font-variant-numeric: tabular-nums; }
 
+/* -------------------------------------------------- radio control panel */
+#ctl-panel {
+  margin: 8px 14px 0; padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  background: var(--panel-2);
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  /* Sit above the workspace so the .cards column (which overflows downward
+     at short viewport heights and paints later) can't intercept clicks on
+     the Tune/Scan/Release buttons. Without this the controls render but are
+     physically unclickable. */
+  position: relative; z-index: 1;
+}
+#ctl-panel .ctl-head { display: flex; align-items: center; gap: 12px; color: var(--dim); margin-bottom: 8px; }
+#ctl-panel .ctl-head strong { color: var(--green); letter-spacing: 0.06em; }
+#ctl-panel .ctl-head #ctl-pause { margin-left: auto; }
+#ctl-panel .ctl-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+#ctl-panel .ctl-right { margin-left: auto; }
+#ctl-panel input[type="number"] {
+  width: 64px; background: #11151b; color: var(--txt);
+  border: 1px solid var(--line-2); border-radius: 4px; padding: 3px 6px;
+  font-family: inherit; font-size: 11px;
+}
+.ctl-btn {
+  background: #161b22; color: var(--txt); border: 1px solid var(--line-2);
+  border-radius: 4px; padding: 3px 10px; font: inherit; font-size: 11px; cursor: pointer;
+}
+.ctl-btn:hover:not(:disabled) { border-color: var(--accent-dim); color: var(--accent); }
+.ctl-btn:disabled { opacity: 0.4; cursor: default; }
+#ctl-cells { max-height: 168px; overflow-y: auto; border-top: 1px solid var(--line-2); }
+.ctl-cell { display: flex; align-items: center; gap: 10px; padding: 5px 4px; border-bottom: 1px solid #1b2128; }
+.ctl-cell.active { background: rgba(88,201,138,0.07); }
+.ctl-cell .cc-id { color: var(--txt); font-variant-numeric: tabular-nums; min-width: 152px; }
+.ctl-cell .cc-op { color: var(--dim); flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctl-cell .cc-rsrp { color: var(--yellow); font-variant-numeric: tabular-nums; min-width: 64px; text-align: right; }
+.ctl-cell .cc-src { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; min-width: 64px; }
+.ctl-cell .cc-tag { color: var(--green); font-size: 10px; letter-spacing: 0.08em; }
+#ctl-lock.ls-producing { color: var(--green); border-color: #1f4a32; }
+#ctl-lock.ls-producing .led { background: var(--green); }
+#ctl-lock.ls-acquiring, #ctl-lock.ls-scanning { color: var(--yellow); border-color: #4a3a17; }
+#ctl-lock.ls-acquiring .led, #ctl-lock.ls-scanning .led { background: var(--yellow); animation: pulse 1.2s infinite; }
+#ctl-lock.ls-locked-quiet { color: var(--accent); border-color: var(--accent-dim); }
+#ctl-lock.ls-locked-quiet .led { background: var(--accent); }
+#ctl-lock.ls-no-lock, #ctl-lock.ls-lock-lost { color: var(--red); border-color: #4a1f1f; }
+#ctl-lock.ls-no-lock .led, #ctl-lock.ls-lock-lost .led { background: var(--red); }
+#ctl-lock.ls-idle, #ctl-lock.ls-paused, #ctl-lock.ls-scan-done { color: var(--dim); }
+#ctl-lock.ls-idle .led, #ctl-lock.ls-paused .led, #ctl-lock.ls-scan-done .led { background: var(--dim); }
+
 /* ---------------------------------------------------------- main grid */
 .workspace {
-  flex: 1 1 auto; min-height: 0;
+  /* grow to fill a tall viewport, but never shrink below the map/side's
+     own height — otherwise the 380px map+cards overflow their crushed box
+     and paint over the panels below. The page scrolls when the stacked
+     panels push total height past one screen. */
+  flex: 1 0 auto;
   display: grid;
   grid-template-columns: minmax(0, 1.05fr) minmax(380px, 0.95fr);
   gap: 10px;
@@ -1873,7 +2106,27 @@ footer .row b { color: var(--accent); font-weight: 600; }
     <div class="cp-field"><span class="lbl">DCI/s</span><span class="val" id="cp-rate-dci">—</span></div>
   </div>
 </section>
-<section id="spectrum-panel" style="margin:8px 14px 0; padding:8px 12px; border:1px solid #2a3038; border-radius:6px; background:#0b0d10;">
+<section id="ctl-panel">
+  <div class="ctl-head">
+    <strong>RADIO CONTROL</strong>
+    <span class="pill" id="ctl-lock"><span class="led"></span><span id="ctl-lock-text">—</span></span>
+    <span id="ctl-active" class="dim">no cell selected</span>
+    <button id="ctl-pause" type="button" class="ctl-btn">Release radio</button>
+  </div>
+  <div class="ctl-row">
+    <span class="dim">SCAN BAND</span>
+    <input id="ctl-band" type="number" min="1" max="88" value="7">
+    <button id="ctl-scan" type="button" class="ctl-btn">Scan</button>
+    <span id="ctl-scan-msg" class="dim"></span>
+    <button id="ctl-refresh" type="button" class="ctl-btn ctl-right">↻ cells</button>
+  </div>
+  <div id="ctl-cells"><div class="dim" style="padding:6px 2px;">loading known cells…</div></div>
+  <div id="ctl-disabled" class="dim" style="display:none; padding:6px 2px;">
+    Control disabled — this dashboard was started in simulate/survey mode.
+    Restart <code>sniffer live</code> without <code>--simulate</code>/<code>--survey-cells</code> to retarget from here.
+  </div>
+</section>
+<section id="spectrum-panel" style="position:relative; z-index:1; margin:8px 14px 0; padding:8px 12px; border:1px solid #2a3038; border-radius:6px; background:#0b0d10;">
   <div style="display:flex; align-items:center; gap:14px; font-size:11px; color:#8a93a0; margin-bottom:6px;">
     <strong style="color:#7ad9a1; letter-spacing:0.06em;">SPECTRUM</strong>
     <span id="spec-source">— mode</span>
@@ -2409,7 +2662,169 @@ function setStatus(s) {
   updateRadioPill(s);
   updateCellPanel(s);
   updateCoach();
+  updateControl(s);
 }
+
+// --- radio control (cellular-drones: scan / pick / retarget from the UI) --
+const ctlPanel    = document.getElementById('ctl-panel');
+const ctlLock     = document.getElementById('ctl-lock');
+const ctlLockText = document.getElementById('ctl-lock-text');
+const ctlActive   = document.getElementById('ctl-active');
+const ctlPauseBtn = document.getElementById('ctl-pause');
+const ctlScanBtn  = document.getElementById('ctl-scan');
+const ctlBandEl   = document.getElementById('ctl-band');
+const ctlScanMsg  = document.getElementById('ctl-scan-msg');
+const ctlRefresh  = document.getElementById('ctl-refresh');
+const ctlCellsEl  = document.getElementById('ctl-cells');
+const ctlDisabled = document.getElementById('ctl-disabled');
+
+// Human label per lock_state. Mirrors run_falcon_loop's vocabulary.
+const LOCK_LABELS = {
+  idle: 'IDLE', paused: 'PAUSED', acquiring: 'ACQUIRING', producing: 'PRODUCING',
+  'locked-quiet': 'LOCKED · QUIET', 'lock-lost': 'LOCK LOST',
+  'no-lock': 'NO LOCK', scanning: 'SCANNING', 'scan-done': 'SCAN DONE',
+};
+let lastLockState = null;
+let controlEnabled = true;     // flipped false if /cells reports control:false
+let activeTarget = null;       // {earfcn, pci} of the live cell, for highlight
+
+function updateControl(s) {
+  if (!ctlPanel) return;
+  const ls = s && s.lock_state ? s.lock_state : (s && s.phase === 'sniffing' ? 'producing' : 'idle');
+  ctlLockText.textContent = LOCK_LABELS[ls] || ls.toUpperCase();
+  ctlLock.className = 'pill ls-' + ls;
+  // Active-target line.
+  if (s && s.pci != null && (s.phase === 'sniffing' || ls === 'paused')) {
+    const mhz = s.center_hz != null ? ` · ${(s.center_hz/1e6).toFixed(2)} MHz` : '';
+    const ea = s.earfcn != null ? `EARFCN ${s.earfcn} · ` : '';
+    ctlActive.textContent = `${ea}PCI ${s.pci}${mhz}`;
+    ctlActive.classList.remove('dim');
+    activeTarget = {earfcn: s.earfcn, pci: s.pci};
+  } else if (ls === 'idle') {
+    ctlActive.textContent = 'no cell selected';
+    ctlActive.classList.add('dim');
+    activeTarget = null;
+  }
+  // Scan transitions: surface the scan message + refresh the cell list when
+  // a scan just finished (new cells may have landed in the store).
+  if (ls === 'scanning') {
+    ctlScanMsg.textContent = s.message || 'scanning…';
+    ctlScanBtn.disabled = true;
+  } else {
+    ctlScanBtn.disabled = false;
+    if (lastLockState === 'scanning' || ls === 'scan-done') {
+      ctlScanMsg.textContent = s.message || '';
+      loadCells();
+    }
+  }
+  highlightActiveCell();
+  lastLockState = ls;
+}
+
+async function loadCells() {
+  if (!ctlCellsEl) return;
+  try {
+    const r = await fetch('/cells');
+    const data = await r.json();
+    controlEnabled = data.control !== false;
+    if (data.active) activeTarget = {earfcn: data.active.earfcn, pci: data.active.pci};
+    renderCells(data.cells || []);
+  } catch (_) {
+    ctlCellsEl.innerHTML = '<div class="dim" style="padding:6px 2px;">could not load cells</div>';
+  }
+  if (!controlEnabled) {
+    ctlDisabled.style.display = '';
+    [ctlPauseBtn, ctlScanBtn, ctlRefresh].forEach(b => b && (b.disabled = true));
+  }
+}
+
+function renderCells(cells) {
+  if (!cells.length) {
+    ctlCellsEl.innerHTML = '<div class="dim" style="padding:6px 2px;">'
+      + 'no tunable cells yet — run a scan to discover some.</div>';
+    return;
+  }
+  ctlCellsEl.innerHTML = '';
+  cells.forEach(c => {
+    const row = document.createElement('div');
+    row.className = 'ctl-cell';
+    row.dataset.earfcn = c.earfcn;
+    row.dataset.pci = c.pci;
+    const mhz = c.center_hz != null ? (c.center_hz/1e6).toFixed(1) : '—';
+    const rsrp = c.rsrp_dbm != null ? c.rsrp_dbm.toFixed(0) + ' dBm' : '—';
+    const op = c.operator || '—';
+    row.innerHTML =
+      `<span class="cc-id">EARFCN ${c.earfcn} · PCI ${c.pci} · ${mhz} MHz</span>`
+      + `<span class="cc-op">${op}</span>`
+      + `<span class="cc-rsrp">${rsrp}</span>`
+      + `<span class="cc-src">${c.source || ''}</span>`
+      + `<button class="ctl-btn" type="button">Tune</button>`
+      + `<span class="cc-tag"></span>`;
+    const btn = row.querySelector('button');
+    btn.disabled = !controlEnabled;
+    btn.addEventListener('click', () => tuneCell(c.earfcn, c.pci, btn));
+    ctlCellsEl.appendChild(row);
+  });
+  highlightActiveCell();
+}
+
+function highlightActiveCell() {
+  if (!ctlCellsEl) return;
+  ctlCellsEl.querySelectorAll('.ctl-cell').forEach(row => {
+    const isActive = activeTarget
+      && Number(row.dataset.earfcn) === Number(activeTarget.earfcn)
+      && Number(row.dataset.pci) === Number(activeTarget.pci);
+    row.classList.toggle('active', !!isActive);
+    const tag = row.querySelector('.cc-tag');
+    if (tag) tag.textContent = isActive ? '● ACTIVE' : '';
+  });
+}
+
+async function tuneCell(earfcn, pci, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try {
+    const r = await fetch('/retarget', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({earfcn, pci}),
+    });
+    const data = await r.json();
+    if (!r.ok) { ctlScanMsg.textContent = 'retarget failed: ' + (data.error || r.status); }
+    else {
+      activeTarget = {earfcn, pci};
+      ctlScanMsg.textContent = `tuning EARFCN ${earfcn} · PCI ${pci} — acquiring…`;
+      highlightActiveCell();
+    }
+  } catch (e) {
+    ctlScanMsg.textContent = 'retarget error: ' + e;
+  } finally {
+    if (btn) { btn.disabled = !controlEnabled; btn.textContent = 'Tune'; }
+  }
+}
+
+async function startScan() {
+  const band = parseInt(ctlBandEl.value, 10);
+  if (!band) { ctlScanMsg.textContent = 'enter a band number'; return; }
+  ctlScanBtn.disabled = true;
+  ctlScanMsg.textContent = 'starting scan…';
+  try {
+    const r = await fetch('/scan', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({band}),
+    });
+    const data = await r.json();
+    if (!r.ok) ctlScanMsg.textContent = 'scan failed: ' + (data.error || r.status);
+  } catch (e) {
+    ctlScanMsg.textContent = 'scan error: ' + e;
+  }
+}
+
+if (ctlScanBtn)  ctlScanBtn.addEventListener('click', startScan);
+if (ctlRefresh)  ctlRefresh.addEventListener('click', loadCells);
+if (ctlPauseBtn) ctlPauseBtn.addEventListener('click', async () => {
+  try { await fetch('/pause', {method: 'POST'}); ctlScanMsg.textContent = 'radio released'; }
+  catch (e) { ctlScanMsg.textContent = 'pause error: ' + e; }
+});
+loadCells();
 
 // --- pills, cell panel, coach (cellular-drones state visibility) ----
 let lastStatus = {phase: 'idle'};
@@ -2833,8 +3248,111 @@ es.onerror = () => {
 """
 
 
+def tunable_cells_payload() -> dict[str, Any]:
+    """Deduped tunable cells (both EARFCN and PCI known) from the known-cells
+    store — what the dashboard picker shows, strongest/newest first.
+
+    Repeated observations of the same (earfcn, pci) merge: keep the best RSRP,
+    the latest timestamp, and fill operator/geo from whichever row has them.
+    OpenCellID-only rows (no earfcn/pci) can't be tuned, so they drop out.
+    """
+    from sniffer.cells import load_all, to_survey_cell_dict
+    best: dict[tuple[int, int], dict[str, Any]] = {}
+    for c in load_all():
+        if c.earfcn is None or c.pci is None:
+            continue
+        key = (int(c.earfcn), int(c.pci))
+        sc = to_survey_cell_dict(c)
+        center = (sc["center_hz"] if sc
+                  else (int(c.center_hz) if c.center_hz else None))
+        row = best.get(key)
+        if row is None:
+            row = {"earfcn": key[0], "pci": key[1], "center_hz": center,
+                   "operator": c.operator, "rsrp_dbm": c.rsrp_dbm,
+                   "source": c.source, "last_seen": c.ts_utc or "",
+                   "observations": 0, "lat": c.lat, "lon": c.lon}
+            best[key] = row
+        row["observations"] += 1
+        if c.ts_utc and c.ts_utc > (row["last_seen"] or ""):
+            row["last_seen"] = c.ts_utc
+            if c.source:
+                row["source"] = c.source
+        if c.rsrp_dbm is not None and (row["rsrp_dbm"] is None
+                                       or c.rsrp_dbm > row["rsrp_dbm"]):
+            row["rsrp_dbm"] = c.rsrp_dbm
+        if not row.get("operator") and c.operator:
+            row["operator"] = c.operator
+        if row.get("center_hz") is None and center is not None:
+            row["center_hz"] = center
+        if row.get("lat") is None and c.lat is not None:
+            row["lat"] = c.lat
+            row["lon"] = c.lon
+    cells = list(best.values())
+    # Stable two-pass sort: recency desc, then known-RSRP-and-strongest first.
+    cells.sort(key=lambda r: r["last_seen"] or "", reverse=True)
+    cells.sort(key=lambda r: (r["rsrp_dbm"] is None,
+                              -(r["rsrp_dbm"] if r["rsrp_dbm"] is not None
+                                else 0.0)))
+    return {"cells": cells, "count": len(cells)}
+
+
+def run_scan_job(state: State, controller: "RadioController", *,
+                 band: Optional[int],
+                 earfcn_range: Optional[tuple[int, int]]) -> None:
+    """Hand the radio off from FALCON to a one-shot `sniffer scan`, then idle.
+
+    Runs in its own thread. `begin_scan()` makes the FALCON loop tear down its
+    subprocess and release the USRP; we then shell out to `sniffer scan` (which
+    appends every cell it finds to the known-cells store the picker reads). On
+    completion we leave the radio idle so the operator deliberately picks a
+    freshly-found cell.
+    """
+    controller.begin_scan()
+    label = (f"band {band}" if band is not None
+             else f"EARFCN {earfcn_range[0]}–{earfcn_range[1]}")
+    state.set_status("scanning", lock_state="scanning",
+                     message=f"scanning {label} — releasing radio…")
+    # One process per USRP: give FALCON a moment to actually drop the device
+    # before srsran_cell_search tries to open it.
+    time.sleep(3.0)
+    cmd = [sys.executable, "-m", "sniffer", "scan"]
+    if band is not None:
+        cmd += ["--band", str(int(band))]
+    else:
+        cmd += ["--earfcn-range", f"{earfcn_range[0]},{earfcn_range[1]}"]
+    err = ""
+    try:
+        state.set_status("scanning", lock_state="scanning",
+                         message=f"scanning {label}…")
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=240, env=os.environ.copy())
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            err = tail[-1] if tail else f"scan exited {proc.returncode}"
+    except subprocess.TimeoutExpired:
+        err = "scan timed out (>240s)"
+    except Exception as exc:  # noqa: BLE001
+        err = f"scan failed: {exc}"
+    try:
+        n = tunable_cells_payload()["count"]
+    except Exception:  # noqa: BLE001
+        n = 0
+    if err:
+        state.set_status("idle", lock_state="scan-done",
+                         message=f"scan error: {err}. {n} tunable cells known.")
+    else:
+        state.set_status("idle", lock_state="scan-done",
+                         message=f"scan complete — {n} tunable cells. Pick one.")
+    controller.end_scan(resume=False)
+
+
 class _Handler(BaseHTTPRequestHandler):
     state: State  # set on class before serving
+    # Set on the handler subclass in main(). None outside live-control mode
+    # (i.e. under --simulate / --survey-cells), which makes POST endpoints 409.
+    controller: "Optional[RadioController]" = None
+    ctl_cfg: dict = {}
+    _stop: "Optional[threading.Event]" = None
 
     # Chromium on some configurations refuses to render the page when
     # served via HTTP/1.0 (the BaseHTTPServer default) — we end up with
@@ -2917,8 +3435,131 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/events":
             self._sse()
             return
+        if self.path == "/cells":
+            try:
+                payload = tunable_cells_payload()
+            except Exception as exc:  # noqa: BLE001
+                payload = {"cells": [], "count": 0, "error": str(exc)}
+            # Echo the live target so the picker can highlight the active cell.
+            payload["active"] = self._active_target_payload()
+            payload["control"] = self.controller is not None
+            self._send_json(200, payload)
+            return
         self.send_response(404)
         self.end_headers()
+
+    # --- control surface --------------------------------------------------
+
+    def _send_json(self, code: int, obj: Any) -> None:
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.close_connection = True
+
+    def _active_target_payload(self) -> Optional[dict[str, Any]]:
+        if self.controller is None:
+            return None
+        target, run, _gen = self.controller.current()
+        if target is None:
+            return None
+        return {"earfcn": target.earfcn, "pci": target.pci,
+                "center_hz": target.center_hz, "running": run,
+                "scanning": self.controller.is_scanning()}
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.controller is None:
+            self._send_json(409, {"error": "dashboard is not in live-control "
+                                  "mode (started with --simulate or "
+                                  "--survey-cells)"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw or b"{}")
+        except (json.JSONDecodeError, ValueError):
+            self._send_json(400, {"error": "request body must be JSON"})
+            return
+        if self.path == "/retarget":
+            self._do_retarget(body)
+        elif self.path == "/scan":
+            self._do_scan(body)
+        elif self.path == "/pause":
+            self.controller.pause()
+            self._send_json(200, {"ok": True, "paused": True})
+        else:
+            self._send_json(404, {"error": f"no POST endpoint {self.path}"})
+
+    def _do_retarget(self, body: dict[str, Any]) -> None:
+        try:
+            earfcn = int(body["earfcn"])
+            pci = int(body["pci"])
+        except (KeyError, TypeError, ValueError):
+            self._send_json(400, {"error": "need integer 'earfcn' and 'pci'"})
+            return
+        if not (0 <= pci <= 503):
+            self._send_json(400, {"error": "pci must be 0–503"})
+            return
+        cfg = self.ctl_cfg or {}
+        gain = float(body.get("gain_db", cfg.get("gain_db", 50.0)))
+        antennas = int(body.get("antennas", cfg.get("antennas", 1)))
+        try:
+            from sniffer.lte_bands import earfcn_to_hz_dl
+            center_hz = float(earfcn_to_hz_dl(earfcn))
+        except ValueError as exc:
+            self._send_json(400, {"error": f"earfcn {earfcn}: {exc}"})
+            return
+        cmd = build_falcon_cmd(center_hz=center_hz, pci=pci, gain_db=gain,
+                               antennas=antennas,
+                               binname=cfg.get("falcon_bin"))
+        gen = self.controller.set_target(FalconTarget(
+            falcon_cmd=cmd, pci=pci, center_hz=center_hz, earfcn=earfcn))
+        self._send_json(200, {"ok": True, "generation": gen,
+                              "target": {"earfcn": earfcn, "pci": pci,
+                                         "center_hz": center_hz,
+                                         "gain_db": gain,
+                                         "antennas": antennas}})
+
+    def _do_scan(self, body: dict[str, Any]) -> None:
+        if self.controller.is_scanning():
+            self._send_json(409, {"error": "a scan is already running"})
+            return
+        band: Optional[int] = None
+        earfcn_range: Optional[tuple[int, int]] = None
+        if body.get("band") not in (None, ""):
+            try:
+                band = int(body["band"])
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "'band' must be an integer"})
+                return
+        elif body.get("earfcn_range"):
+            try:
+                lo, hi = body["earfcn_range"]
+                earfcn_range = (int(lo), int(hi))
+            except (TypeError, ValueError):
+                self._send_json(
+                    400, {"error": "'earfcn_range' must be [lo, hi]"})
+                return
+        else:
+            self._send_json(400, {"error": "need 'band' or 'earfcn_range'"})
+            return
+        threading.Thread(
+            target=run_scan_job,
+            args=(self.state, self.controller),
+            kwargs=dict(band=band, earfcn_range=earfcn_range),
+            daemon=True,
+        ).start()
+        self._send_json(202, {"ok": True, "scanning": True})
 
     def _sse(self) -> None:
         self.send_response(200)
@@ -2953,6 +3594,9 @@ def main() -> int:
     p.add_argument("--center-hz", type=float, default=1_842_500_000,
                    help="target cell DL carrier frequency for FalconEye")
     p.add_argument("--rx-gain-db", type=float, default=50.0)
+    p.add_argument("--antennas", type=int, default=1,
+                   help="default RX antenna count for cells tuned from the "
+                        "dashboard (FalconEye -A). Overridable per /retarget.")
     p.add_argument("--mission-id",
                    default=time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime()))
     p.add_argument("--out-dir", default="data")
@@ -2990,18 +3634,17 @@ def main() -> int:
                    help="USRP RX gain for the spectrum sweep")
     args = p.parse_args()
 
-    # Exactly one upstream producer must be selected. FALCON live mode
-    # and survey-mode are mutually exclusive — both want exclusive radio.
+    # At most one upstream producer. --simulate and --survey-cells each want
+    # the radio exclusively and aren't retargetable, so they're mutually
+    # exclusive with everything. Zero producers is now legal: it starts the
+    # FALCON loop idle (control mode) so the operator picks a cell from the
+    # dashboard — the "full closed loop" entry point.
     producers = sum(bool(x) for x in
                     (args.simulate, args.falcon_cmd, args.survey_cells))
     if producers > 1:
-        print("sniffer.live: pick exactly one producer "
-              "(--simulate | --falcon-cmd | --survey-cells).",
-              file=sys.stderr)
-        return 2
-    if producers == 0:
-        print("sniffer.live needs --simulate, --falcon-cmd, "
-              "or --survey-cells.", file=sys.stderr)
+        print("sniffer.live: pick at most one producer "
+              "(--simulate | --falcon-cmd | --survey-cells), or none for "
+              "dashboard-driven control mode.", file=sys.stderr)
         return 2
     if args.falcon_cmd and args.falcon_pci is None:
         print("sniffer.live: --falcon-cmd requires --falcon-pci "
@@ -3011,6 +3654,10 @@ def main() -> int:
     state = State()
     stop = threading.Event()
     threads: list[threading.Thread] = []
+    # Set in the FALCON-family branch below; the HTTP control endpoints and
+    # the spectrum-source decision both key off these.
+    controller: Optional[RadioController] = None
+    falcon_tap_path: Optional[str] = None
 
     if args.simulate:
         threads.append(threading.Thread(
@@ -3047,13 +3694,23 @@ def main() -> int:
             kwargs=dict(state=state, mission_id=args.mission_id, stop=stop),
             daemon=True,
         ))
-    elif args.falcon_cmd:
-        cmd = args.falcon_cmd.split()
-        # When --spectrum is also set, route the spectrogram through
-        # FALCON's SpectrumTap rather than spawning a parallel uhd_sweep
-        # (impossible anyway on a single radio). FALCON writes per-cell
-        # FFT rows; SpectrumScanner tails the file.
-        falcon_tap_path = None
+    else:
+        # FALCON family: an explicit --falcon-cmd (initial target) or no
+        # producer at all (idle control mode — operator picks a cell from the
+        # dashboard). Both run the same retargetable loop behind a controller.
+        initial: Optional[FalconTarget] = None
+        if args.falcon_cmd:
+            initial = FalconTarget(
+                falcon_cmd=args.falcon_cmd.split(),
+                pci=args.falcon_pci,
+                center_hz=args.center_hz,
+                earfcn=_safe_hz_to_earfcn(args.center_hz),
+            )
+        controller = RadioController(initial=initial)
+        # When --spectrum is set, route the spectrogram through FALCON's
+        # SpectrumTap (a parallel uhd_sweep is impossible on a single radio).
+        # The tap path is allocated even in idle control mode so it's ready
+        # the moment a cell locks.
         if args.spectrum:
             os.makedirs(args.out_dir, exist_ok=True)
             falcon_tap_path = os.path.join(
@@ -3061,10 +3718,9 @@ def main() -> int:
         threads.append(threading.Thread(
             target=run_falcon_loop,
             kwargs=dict(
-                state=state, falcon_cmd=cmd, pci=args.falcon_pci,
+                state=state, controller=controller,
                 mission_id=args.mission_id, out_dir=args.out_dir,
-                center_hz=args.center_hz, stop=stop,
-                spectrum_tap_path=falcon_tap_path,
+                stop=stop, spectrum_tap_path=falcon_tap_path,
             ),
             daemon=True,
         ))
@@ -3074,8 +3730,8 @@ def main() -> int:
             daemon=True,
         ))
     # Spectrum scanner. Two modes:
-    #   * --falcon-cmd + --spectrum → tail FALCON's SpectrumTap CSV (real cell)
-    #   * otherwise + --spectrum    → spawn USRP-wide uhd_sweep (needs idle radio)
+    #   * FALCON family + --spectrum → tail FALCON's SpectrumTap CSV (real cell)
+    #   * --simulate + --spectrum    → spawn USRP-wide uhd_sweep (needs idle radio)
     if args.spectrum:
         try:
             f_start, f_end = (int(x) for x in args.spectrum_freq_mhz.split(":"))
@@ -3083,7 +3739,7 @@ def main() -> int:
             print(f"bad --spectrum-freq-mhz '{args.spectrum_freq_mhz}', want start:end",
                   file=sys.stderr)
             return 2
-        if args.falcon_cmd:
+        if falcon_tap_path is not None:
             scanner = SpectrumScanner(
                 on_snapshot=lambda payload: state._broadcast(
                     {"type": "spectrum", "spectrum": payload}),
@@ -3105,7 +3761,20 @@ def main() -> int:
     for t in threads:
         t.start()
 
-    handler = type("H", (_Handler,), {"state": state})
+    # Config the control endpoints (POST /retarget, /scan) use to build
+    # FalconEye argv at runtime and shell out to `sniffer scan`.
+    ctl_cfg = {
+        "out_dir": args.out_dir,
+        "mission_id": args.mission_id,
+        "gain_db": args.rx_gain_db,
+        "antennas": args.antennas,
+        "spectrum": bool(args.spectrum),
+        "falcon_bin": os.environ.get("FALCON_BIN", "FalconEye"),
+    }
+    handler = type("H", (_Handler,), {"state": state,
+                                      "controller": controller,
+                                      "ctl_cfg": ctl_cfg,
+                                      "_stop": stop})
     httpd = ThreadingHTTPServer((args.host, args.port), handler)
 
     def _shutdown(*_: Any) -> None:
@@ -3124,10 +3793,14 @@ def main() -> int:
         print(f"mode: survey · {args.survey_dwell_seconds}s/cell × "
               f"{args.survey_total_seconds/60:.1f}min total", flush=True)
         print("GPS: gpspipe -w (only ingested if gpsd is running)", flush=True)
-    else:
+    elif args.falcon_cmd:
         print(f"mode: FalconEye · cmd={args.falcon_cmd!r} "
-              f"@ {args.center_hz/1e6:.2f} MHz · PCI {args.falcon_pci}",
-              flush=True)
+              f"@ {args.center_hz/1e6:.2f} MHz · PCI {args.falcon_pci} "
+              f"(retargetable from the dashboard)", flush=True)
+        print("GPS: gpspipe -w (only ingested if gpsd is running)", flush=True)
+    else:
+        print("mode: control (idle) — pick a cell in the dashboard, or "
+              "POST /scan then /retarget", flush=True)
         print("GPS: gpspipe -w (only ingested if gpsd is running)", flush=True)
     try:
         httpd.serve_forever()

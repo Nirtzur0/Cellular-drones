@@ -81,6 +81,32 @@ ssh pi@169.254.1.2 'cd ~/cellular-drones && setsid -f .venv/bin/python \
 dashboard waterfall then shows the **actual ~20 MHz around the locked cell**
 (at 100 kHz resolution), not a wideband sweep. No second SDR needed.
 
+### Control mode (scan + pick cells from the dashboard)
+Start `sniffer.live` with **no producer flag** (no `--simulate`,
+`--falcon-cmd`, or `--survey-cells`) and it boots *idle* with a live
+**RADIO CONTROL** panel — the radio is retargetable from the browser
+instead of frozen at launch:
+```
+ssh pi@169.254.1.2 'cd ~/cellular-drones && setsid -f .venv/bin/python \
+  -m sniffer.live --spectrum --host 0.0.0.0 --port 18901 \
+  --out-dir /tmp/sniffer-live >/tmp/sniffer-live.log 2>&1 </dev/null'
+```
+The panel lists tunable cells from `data/known_cells.jsonl`; click **Tune**
+to retarget, **Scan** (band number) to discover more (releases the radio,
+runs `sniffer scan`, repopulates the list), **Release radio** to idle.
+`--falcon-cmd`/`--earfcn` still work and are *also* retargetable now — the
+initial cell is just pre-loaded. Control endpoints (all POST except
+`/cells`): `GET /cells`, `POST /retarget {earfcn,pci[,gain_db,antennas]}`,
+`POST /scan {band}` (or `{earfcn_range:[lo,hi]}`), `POST /pause`. Under
+`--simulate`/`--survey-cells` the radio isn't retargetable, so these
+return HTTP 409.
+
+Lock-state surfaced per cell (status `lock_state`, shown on the panel
+badge): `acquiring` → `producing` → `locked-quiet` (cell idle, **not**
+restarted anymore) / `lock-lost` (FALCON died after a lock → respawn) /
+`no-lock` (wrong freq/no signal → give up, idle for a retarget). A merely
+quiet cell no longer triggers the kill/respawn thrash the old watchdog had.
+
 ### Cell discovery (no dashboard)
 ```
 ssh pi@169.254.1.2 'cd ~/cellular-drones && .venv/bin/sniffer scan --band 7'
@@ -97,7 +123,7 @@ of LTE cells we know about. Two sources merge into one file:
 |--------------|-----------------------------|---------------------------------|
 | `opencellid` | imported OpenCellID dump    | MCC/MNC/TAC/eci/operator/lat/lon |
 | `scan`       | every `sniffer scan` run    | EARFCN/PCI/RSRP                  |
-| `live-lock`  | reserved for future use     | confirms a (EARFCN, PCI) tunes  |
+| `live-lock`  | first DCI FALCON decodes    | confirms a (EARFCN, PCI) tunes  |
 
 OpenCellID gives geographic prior (where cells are, who operates them);
 `sniffer scan` gives radio-layer specifics (which EARFCN/PCI to tune to).
@@ -160,7 +186,12 @@ Qt GUI parts (qcustomplot, rangewidget) and will fail without Qt headers.
 ## Verifying state
 
 - HTTP: `curl -s http://127.0.0.1:8000/spectrum | python3 -m json.tool | head`
+- Control surface: `curl -s http://127.0.0.1:8000/cells | python3 -m json.tool`
+  lists tunable cells + `active` target; `curl -XPOST .../retarget -d
+  '{"earfcn":3050,"pci":275}'` retunes; `-XPOST .../scan -d '{"band":7}'`
+  scans; `-XPOST .../pause` idles. (409 under `--simulate`/`--survey-cells`.)
 - Dashboard HTML element IDs added by this project: `radio`, `spec-pill`,
-  `cell-panel`, `coach-banner`, `cp-pci`, `cp-fc`, `cp-gain`, `cp-rate-dci`.
+  `cell-panel`, `coach-banner`, `cp-pci`, `cp-fc`, `cp-gain`, `cp-rate-dci`,
+  `ctl-panel`, `ctl-lock`, `ctl-cells`, `ctl-scan`, `ctl-pause`.
 - FalconEye sanity: `FalconEye -h | grep -E "^\s+-[Xx]"` (must show
   `-X spectrum-tap CSV output file ...`).
