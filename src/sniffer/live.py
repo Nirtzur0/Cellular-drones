@@ -615,7 +615,12 @@ class _UeSightingSink(io.TextIOBase):
         self._lock_fired = False
 
     def write(self, s: str) -> int:
-        if self._jsonl_out is not None:
+        # Guard against `.closed`: this sink subclasses io.TextIOBase, so its
+        # finalizer (and a teardown that closes the underlying file via the
+        # `with open(...)` in run_falcon_loop) can call write/flush after
+        # `_jsonl_out` is gone. Without this, a scan/retarget that tears the
+        # FALCON loop down logs "ValueError: I/O operation on closed file."
+        if self._jsonl_out is not None and not self._jsonl_out.closed:
             self._jsonl_out.write(s)
             self._jsonl_out.flush()
         self._buf += s
@@ -632,7 +637,7 @@ class _UeSightingSink(io.TextIOBase):
         return len(s)
 
     def flush(self) -> None:
-        if self._jsonl_out is not None:
+        if self._jsonl_out is not None and not self._jsonl_out.closed:
             self._jsonl_out.flush()
 
     def _ingest_record(self, rec: dict[str, Any]) -> None:
@@ -1615,10 +1620,13 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
                color: var(--dim); padding: 2px 0; letter-spacing: 0.02em; }
 .legend .row.active { color: var(--txt); }
 .legend .row:hover  { color: var(--txt); }
-.legend .row.has-pos::after { content: 'LOC'; color: var(--green); margin-left: auto;
+.legend .row.has-pos::after { content: 'LOC'; color: var(--green);
                               font-size: 9px; letter-spacing: 0.1em; }
-.legend .row.no-pos::after  { content: '---'; color: var(--dim-2); margin-left: auto;
+.legend .row.no-pos::after  { content: '---'; color: var(--dim-2);
                               font-size: 9px; letter-spacing: 0.1em; }
+.legend .row .dist { color: var(--dim-2); font-variant-numeric: tabular-nums;
+                     font-size: 9.5px; margin-left: auto; padding-right: 6px; }
+.legend .row.has-pos .dist { color: var(--green); }
 .legend .sw { width: 8px; height: 8px; flex-shrink: 0; }
 .legend .label { color: var(--accent); font-size: 9.5px; text-transform: uppercase;
                  letter-spacing: 0.18em; margin-bottom: 5px; font-weight: 600; }
@@ -1833,6 +1841,10 @@ header h1 span { color: var(--dim); font-weight: 400; margin-left: 8px;
    "this UE is actually transferring data" signal in a busy card. */
 .chip.tp  { color: var(--green); border-color: #2f5d3e;
             background: rgba(88,201,138,0.08); font-weight: 600; }
+/* Distance-from-drone chip. Cyan-tinted; visually subordinate to throughput. */
+.chip.dist { color: #5dd5ff; border-color: #1d4159;
+             background: rgba(93,213,255,0.06);
+             font-variant-numeric: tabular-nums; }
 /* FalconEye decode confidence indicator (histval). One dot, three colors:
    high (≥8) = trusted, mid (4-7) = borderline, low (<4) = likely noise. */
 .conf-dot { width: 6px; height: 6px; border-radius: 50%;
@@ -2184,6 +2196,105 @@ function colorFor(key) {
   return PALETTE[Math.abs(h) % PALETTE.length];
 }
 
+// --- anchor + distance helpers ------------------------------------------
+// Drone-position fallback chain: real gpsd fix > browser geolocation >
+// hard-coded default. The "drone anchor" feeds both the map center and
+// the halo-marker placement for unpositioned CRNTIs.
+const UE_TX_DBM_ASSUMED = 23;          // LTE class-3 UE max TX
+const TA_STEP_METERS_JS = 78.125;      // mirror of schema.TA_STEP_METERS
+const HALO_FIXED_M = 80;               // visual offset for real CRNTIs
+const HALO_CLAMP_MIN_M = 5;
+const HALO_CLAMP_MAX_M = 500;
+let browserAnchor = null;              // {lat, lon, accuracy_m, ts}
+
+function droneAnchor() {
+  if (latestGps && latestGps.gps) {
+    return {lat: latestGps.gps.lat, lon: latestGps.gps.lon, source: 'gps'};
+  }
+  if (browserAnchor) {
+    return {lat: browserAnchor.lat, lon: browserAnchor.lon,
+            source: 'browser', accuracy_m: browserAnchor.accuracy_m};
+  }
+  return null;
+}
+
+// Deterministic angle [0, 2π) so a CRNTI keeps its halo position across
+// SSE refreshes — no jitter even as new grants land.
+function haloAngleFor(u) {
+  const rnti = (u.c_rnti | 0) || 0;
+  const pci = (u.pci | 0) || 0;
+  const deg = ((rnti * 137 + pci * 211) % 360 + 360) % 360;
+  return deg * Math.PI / 180;
+}
+
+// Best-effort distance estimate for an unpositioned UE. Real FalconEye
+// emits neither RSSI nor TA per UE, so the "unknown" branch is what most
+// live captures hit — the 80 m default is visual placement, not a real
+// measurement. RSSI branch uses a crude free-space-path-loss model.
+function estimateDistanceMeters(u) {
+  if (u.ta_n_steps != null) {
+    const d = u.ta_n_steps * TA_STEP_METERS_JS;
+    return {meters: Math.max(HALO_CLAMP_MIN_M,
+                              Math.min(HALO_CLAMP_MAX_M, d)),
+            source: 'ta'};
+  }
+  if (u.ul_rssi_dbm != null && u.center_hz) {
+    const freq_mhz = u.center_hz / 1e6;
+    const fspl_db = UE_TX_DBM_ASSUMED - u.ul_rssi_dbm;
+    const exponent = (fspl_db - 32.45 - 20 * Math.log10(freq_mhz)) / 20;
+    const d = Math.pow(10, exponent);
+    return {meters: Math.max(HALO_CLAMP_MIN_M,
+                              Math.min(HALO_CLAMP_MAX_M, d)),
+            source: 'rssi'};
+  }
+  return {meters: HALO_FIXED_M, source: 'unknown'};
+}
+
+// Haversine over the WGS84 sphere. Inputs are decimal degrees, output is
+// metres. Sub-meter accuracy is fine for our display purposes.
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371008.8;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+            Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+// Returns {meters, source} or null if no anchor exists.
+function distanceFromDroneMeters(u) {
+  const a = droneAnchor();
+  if (!a) return null;
+  if (u.est_position) {
+    return {meters: haversineMeters(a.lat, a.lon,
+                                     u.est_position.lat,
+                                     u.est_position.lon),
+            source: 'positioned'};
+  }
+  return estimateDistanceMeters(u);
+}
+
+// Project (anchor + bearing + range_m) → lat/lon in WGS84. Equirectangular
+// is sub-cm at the <1 km scale we're using for halos.
+function offsetLatLon(lat, lon, bearingRad, rangeMeters) {
+  const R = 6371008.8;
+  const dLat = (rangeMeters * Math.cos(bearingRad)) / R;
+  const dLon = (rangeMeters * Math.sin(bearingRad)) /
+               (R * Math.cos(lat * Math.PI / 180));
+  return [lat + dLat * 180 / Math.PI, lon + dLon * 180 / Math.PI];
+}
+
+function fmtDist(d) {
+  if (d == null) return '?m';
+  const m = d.meters;
+  const prefix = d.source === 'positioned' ? '' : '~';
+  if (m >= 1000) return prefix + (m/1000).toFixed(2) + 'km';
+  if (m >= 100) return prefix + m.toFixed(0) + 'm';
+  return prefix + m.toFixed(1) + 'm';
+}
+
 let totalUeSightings = 0;
 let latestGps = null;
 let selectedKey = null;
@@ -2318,10 +2429,21 @@ setInterval(renderSurveyCountdown, 200);
 // --- map ----------------------------------------------------------------
 let map = null;
 let droneMarker = null;
+let browserAnchorMarker = null;  // dashed-outline marker when GPS absent
 let droneTrailLine = null;
 let firstGpsFix = true;          // snap once, then track without re-centering
 const droneTrail = [];
-const ueLayers = new Map();   // key -> {marker, accuracy, label}
+const ueLayers = new Map();   // key -> {marker, accuracy, halo, link}
+const unpositionedKeys = new Set();  // u.key with no est_position
+let reanchorRaf = 0;
+
+// Offline fallback: when Leaflet/tiles can't load (no internet, the normal
+// case on the Pi), we draw a dependency-free canvas "uplink presence" radar
+// instead of a dead placeholder. UEs with uplink grants get plotted around
+// the receiver (relative, not geographic — we have no positions); UEs with
+// no uplink are omitted; an idle cell shows just the empty rings.
+let offlineMap = false;
+let presenceCanvas = null, presenceCtx = null;
 
 // Default view when no GPS yet — Tel Aviv area, the testing locale.
 // First real GPS fix snaps to that location and clears the placeholder.
@@ -2338,11 +2460,156 @@ function initMapIfReady(centerLat, centerLon, zoom) {
   }).addTo(map);
   droneTrailLine = L.polyline(droneTrail, { color:'#5dd5ff', weight:1.5, opacity:0.55, dashArray:'4 4' }).addTo(map);
   ues.forEach((u) => updateUeLayer(u));
+  requestBrowserAnchor();
+}
+
+// Ask the browser for a one-shot geolocation fix. Used as a drone-anchor
+// fallback when no real GPS is wired. Chrome restricts this to secure
+// origins (https or http://localhost / 127.0.0.1) — silently noop on
+// LAN IPs. If the user denies, do nothing; map keeps the default center.
+let browserAnchorRequested = false;
+function requestBrowserAnchor() {
+  if (browserAnchorRequested) return;
+  browserAnchorRequested = true;
+  if (!('geolocation' in navigator)) return;
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      browserAnchor = {
+        lat: pos.coords.latitude,
+        lon: pos.coords.longitude,
+        accuracy_m: pos.coords.accuracy,
+        ts: Date.now(),
+      };
+      if (map && !latestGps) {
+        // Re-center if we haven't snapped to real GPS yet.
+        map.setView([browserAnchor.lat, browserAnchor.lon], 16, {animate: true});
+        firstGpsFix = false;
+      }
+      updateBrowserAnchorMarker();
+      reanchorHalos();
+      renderMapOverlay();
+      renderLegend();
+      ues.forEach(renderCard);
+    },
+    () => { /* denied or unavailable; halos fall back to default */ },
+    {enableHighAccuracy: false, timeout: 8000, maximumAge: 60000}
+  );
+}
+
+function updateBrowserAnchorMarker() {
+  if (!map || !browserAnchor) return;
+  // Hide if real GPS arrived; that's now the canonical drone.
+  if (latestGps) {
+    if (browserAnchorMarker) {
+      map.removeLayer(browserAnchorMarker);
+      browserAnchorMarker = null;
+    }
+    return;
+  }
+  const ll = [browserAnchor.lat, browserAnchor.lon];
+  if (!browserAnchorMarker) {
+    browserAnchorMarker = L.circleMarker(ll, {
+      radius: 6, color: '#5dd5ff', weight: 2,
+      fillColor: '#04070a', fillOpacity: 1,
+      dashArray: '3 3', opacity: 0.85,
+    }).addTo(map).bindTooltip('SELF (browser)',
+      {permanent: false, direction: 'top', className: 'ue-tip'});
+  } else {
+    browserAnchorMarker.setLatLng(ll);
+  }
 }
 function leafletUnavailable() {
-  if (typeof L !== 'undefined' || mapEl.classList.contains('unavailable')) return;
-  mapEl.classList.add('unavailable');
-  mapEl.innerHTML = '<div style="padding:24px;color:var(--dim);font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.7;">// MAP UNAVAILABLE<br><span style="color:var(--dim-2);">leaflet tiles need internet · running offline</span><br><br>positions for tracked UEs are still being computed and shown in the right-hand panel when GPS is fixed.</div>';
+  if (typeof L !== 'undefined' || offlineMap) return;
+  // No internet for Leaflet/tiles — fall back to the offline presence radar.
+  mapEl.classList.add('presence');
+  mapEl.innerHTML = '';
+  presenceCanvas = document.createElement('canvas');
+  presenceCanvas.id = 'presence-canvas';
+  presenceCanvas.style.cssText =
+    'position:absolute;inset:0;width:100%;height:100%;display:block;';
+  mapEl.appendChild(presenceCanvas);
+  presenceCtx = presenceCanvas.getContext('2d');
+  offlineMap = true;
+  window.addEventListener('resize', renderPresenceCanvas);
+  renderPresenceCanvas();
+}
+// Deterministic 0..1 hash from a string so a UE keeps a stable spot frame to
+// frame (no jitter) instead of jumping around the radar each redraw.
+function hash01(s) {
+  s = String(s || '');
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return ((h >>> 0) % 100000) / 100000;
+}
+// Draw the offline uplink-presence radar. Receiver at center; each UE that has
+// uplink grants becomes a dot at a stable angle/radius (relative, not geo),
+// sized by uplink activity, dimmed when stale. No-uplink UEs are skipped; an
+// idle cell shows only the empty rings.
+function renderPresenceCanvas() {
+  if (!offlineMap || !presenceCtx) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = mapEl.getBoundingClientRect();
+  const W = Math.max(1, Math.floor(rect.width));
+  const H = Math.max(1, Math.floor(rect.height));
+  if (presenceCanvas.width !== W * dpr || presenceCanvas.height !== H * dpr) {
+    presenceCanvas.width = W * dpr; presenceCanvas.height = H * dpr;
+  }
+  const ctx = presenceCtx;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#06090d'; ctx.fillRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2;
+  const maxR = Math.max(20, Math.min(W, H) / 2 - 30);
+  // range rings + crosshair
+  ctx.strokeStyle = 'rgba(93,213,255,0.12)'; ctx.lineWidth = 1;
+  for (let i = 1; i <= 4; i++) {
+    ctx.beginPath(); ctx.arc(cx, cy, maxR * i / 4, 0, 2 * Math.PI); ctx.stroke();
+  }
+  ctx.strokeStyle = 'rgba(93,213,255,0.07)';
+  ctx.beginPath();
+  ctx.moveTo(cx - maxR, cy); ctx.lineTo(cx + maxR, cy);
+  ctx.moveTo(cx, cy - maxR); ctx.lineTo(cx, cy + maxR);
+  ctx.stroke();
+  // title
+  ctx.fillStyle = '#5dd5ff';
+  ctx.font = '10px ui-monospace,Menlo,monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('UPLINK PRESENCE · relative (offline · no GPS)', 10, 16);
+  // uplink UEs
+  const upUes = [...ues.values()].filter(u => (u.ul_count || 0) > 0);
+  upUes.forEach(u => {
+    const ang = hash01(u.c_rnti_hex || u.key) * 2 * Math.PI;
+    const rr = (0.30 + 0.60 * hash01((u.key || '') + 'r')) * maxR;
+    const x = cx + Math.cos(ang) * rr, y = cy + Math.sin(ang) * rr;
+    const age = u.last_seen ? (Date.now() - Date.parse(u.last_seen)) / 1000 : 1e9;
+    const fresh = age < 30;
+    const dotR = Math.max(3, Math.min(11, 3 + Math.sqrt(u.ul_count || 0)));
+    ctx.strokeStyle = fresh ? 'rgba(93,213,255,0.22)' : 'rgba(93,213,255,0.07)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
+    ctx.globalAlpha = fresh ? 1 : 0.4;
+    ctx.fillStyle = colorFor(u.key);
+    ctx.beginPath(); ctx.arc(x, y, dotR, 0, 2 * Math.PI); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = fresh ? '#cfe8f5' : '#5b6b78';
+    ctx.font = '9px ui-monospace,Menlo,monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(u.c_rnti_hex || '', x, y - dotR - 3);
+  });
+  // center receiver marker
+  ctx.fillStyle = '#04070a'; ctx.strokeStyle = '#5dd5ff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(cx, cy, 6, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+  let pci = (upUes[0] || [...ues.values()][0] || {}).pci;
+  ctx.fillStyle = '#5dd5ff';
+  ctx.font = '9px ui-monospace,Menlo,monospace'; ctx.textAlign = 'center';
+  ctx.fillText('RX' + (pci != null ? (' · PCI ' + pci) : ''), cx, cy + 19);
+  // footer count / empty caption
+  ctx.textAlign = 'left'; ctx.font = '10px ui-monospace,Menlo,monospace';
+  ctx.fillStyle = '#5b6b78';
+  ctx.fillText(upUes.length
+      ? (upUes.length + ' UE' + (upUes.length === 1 ? '' : 's') +
+         ' with uplink · ' + ues.size + ' total')
+      : 'no uplink UEs yet', 10, H - 12);
 }
 // Try to bring up the map with default view immediately. If Leaflet hasn't
 // loaded yet (deferred script still parsing), poll briefly; if still missing
@@ -2382,50 +2649,126 @@ function updateDroneMarker() {
     if (droneTrailLine) droneTrailLine.setLatLngs(droneTrail);
   }
 }
+function tooltipFor(u) {
+  const d = distanceFromDroneMeters(u);
+  if (!d) return u.c_rnti_hex;
+  return `${u.c_rnti_hex} · ${fmtDist(d)}`;
+}
+
+function setTooltip(marker, text) {
+  if (marker.getTooltip()) {
+    marker.setTooltipContent(text);
+  } else {
+    marker.bindTooltip(text,
+      {permanent: true, direction: 'right', offset: [10, 0], className: 'ue-tip'});
+  }
+}
+
+function removeLayerKeys(layer, keys) {
+  if (!layer) return;
+  keys.forEach(k => {
+    if (layer[k]) {
+      map.removeLayer(layer[k]);
+      layer[k] = null;
+    }
+  });
+}
+
 function updateUeLayer(u) {
   if (!map) return;
   const p = u.est_position;
   const color = colorFor(u.key);
   let layer = ueLayers.get(u.key);
-  if (!p) {
+  if (p) {
+    unpositionedKeys.delete(u.key);
+    if (!layer) { layer = {}; ueLayers.set(u.key, layer); }
+    // Transitioning halo → positioned: drop halo + link.
+    removeLayerKeys(layer, ['halo', 'link']);
+    const selected = (u.key === selectedKey);
+    const markerOpts = {
+      radius: selected ? 10 : 7,
+      color: color, weight: selected ? 3 : 2,
+      fillColor: color, fillOpacity: selected ? 0.75 : 0.55,
+    };
+    if (!layer.marker) {
+      layer.marker = L.circleMarker([p.lat, p.lon], markerOpts).addTo(map);
+      layer.marker.on('click', () => selectUe(u.key, true));
+      layer.accuracy = L.circle([p.lat, p.lon], {
+        radius: Math.max(2, p.cep95_m || 5),
+        color: color, weight: 1, opacity: 0.5,
+        fillColor: color, fillOpacity: 0.06,
+        dashArray: '4 3',
+      }).addTo(map);
+    } else {
+      layer.marker.setLatLng([p.lat, p.lon]);
+      layer.marker.setStyle(markerOpts);
+      layer.accuracy.setLatLng([p.lat, p.lon]);
+      layer.accuracy.setRadius(Math.max(2, p.cep95_m || 5));
+      layer.accuracy.setStyle({color: color, fillColor: color,
+                               opacity: selected ? 0.85 : 0.5,
+                               fillOpacity: selected ? 0.12 : 0.06});
+    }
+    setTooltip(layer.marker, tooltipFor(u));
+    return;
+  }
+  // Unpositioned: halo around drone anchor if we have one.
+  unpositionedKeys.add(u.key);
+  const anchor = droneAnchor();
+  if (!anchor) {
+    // No anchor → can't place a halo; tear down any stale layers.
     if (layer) {
-      if (layer.marker) map.removeLayer(layer.marker);
-      if (layer.accuracy) map.removeLayer(layer.accuracy);
+      removeLayerKeys(layer, ['marker', 'accuracy', 'halo', 'link']);
       ueLayers.delete(u.key);
     }
     return;
   }
-  if (!layer) {
-    layer = {};
-    ueLayers.set(u.key, layer);
-  }
+  if (!layer) { layer = {}; ueLayers.set(u.key, layer); }
+  // Transitioning positioned → halo: drop positioned marker + accuracy.
+  removeLayerKeys(layer, ['marker', 'accuracy']);
+  const dist = estimateDistanceMeters(u);
+  const angle = haloAngleFor(u);
+  const [hlat, hlon] = offsetLatLon(anchor.lat, anchor.lon, angle, dist.meters);
   const selected = (u.key === selectedKey);
-  const markerOpts = {
-    radius: selected ? 10 : 7,
-    color: color, weight: selected ? 3 : 2,
-    fillColor: color, fillOpacity: selected ? 0.75 : 0.55,
+  const haloOpts = {
+    radius: selected ? 8 : 6,
+    color: color, weight: selected ? 2 : 1,
+    fillColor: color,
+    fillOpacity: selected ? 0.55 : 0.25,
+    opacity: selected ? 0.95 : 0.7,
+    dashArray: '3 3',
+    className: 'halo-marker',
   };
-  if (!layer.marker) {
-    layer.marker = L.circleMarker([p.lat, p.lon], markerOpts).addTo(map);
-    layer.marker.bindTooltip(u.c_rnti_hex,
-      {permanent: true, direction: 'right', offset: [10, 0], className: 'ue-tip'});
-    layer.marker.on('click', () => selectUe(u.key, true));
-    layer.accuracy = L.circle([p.lat, p.lon], {
-      radius: Math.max(2, p.cep95_m || 5),
-      color: color, weight: 1, opacity: 0.5,
-      fillColor: color, fillOpacity: 0.06,
-      dashArray: '4 3',
+  if (!layer.halo) {
+    layer.halo = L.circleMarker([hlat, hlon], haloOpts).addTo(map);
+    layer.halo.on('click', () => selectUe(u.key, true));
+    layer.link = L.polyline([[anchor.lat, anchor.lon], [hlat, hlon]], {
+      color: color, weight: 1, opacity: 0.3,
+      dashArray: '2 4', interactive: false,
     }).addTo(map);
   } else {
-    layer.marker.setLatLng([p.lat, p.lon]);
-    layer.marker.setStyle(markerOpts);
-    layer.accuracy.setLatLng([p.lat, p.lon]);
-    layer.accuracy.setRadius(Math.max(2, p.cep95_m || 5));
-    layer.accuracy.setStyle({color: color, fillColor: color,
-                             opacity: selected ? 0.85 : 0.5,
-                             fillOpacity: selected ? 0.12 : 0.06});
+    layer.halo.setLatLng([hlat, hlon]);
+    layer.halo.setStyle(haloOpts);
+    layer.link.setLatLngs([[anchor.lat, anchor.lon], [hlat, hlon]]);
+    layer.link.setStyle({color: color,
+                          opacity: selected ? 0.6 : 0.3});
   }
+  setTooltip(layer.halo, tooltipFor(u));
 }
+
+// When the drone anchor moves (real GPS update, browser fix arrival, or
+// transition between sources), every UE's distance-from-drone changes —
+// positioned UEs need their tooltip refreshed, unpositioned UEs need their
+// halo re-projected. Throttled to rAF so a fast GPS stream doesn't thrash.
+function reanchorHalos() {
+  if (!map) return;
+  if (reanchorRaf) return;
+  reanchorRaf = requestAnimationFrame(() => {
+    reanchorRaf = 0;
+    ues.forEach(u => updateUeLayer(u));
+    ues.forEach(renderCard);
+  });
+}
+
 function refreshAllLayers() {
   ues.forEach(u => updateUeLayer(u));
 }
@@ -2436,16 +2779,25 @@ function focusUeOnMap(key) {
               {animate: true});
 }
 function renderMapOverlay() {
-  if (!latestGps) {
-    mapOverlay.innerHTML = 'map · <span style="color:var(--dim)">default view · waiting for GPS fix</span>';
-    return;
-  }
-  const g = latestGps.gps;
+  if (offlineMap) renderPresenceCanvas();
+  const anchor = droneAnchor();
   const positioned = [...ues.values()]
     .filter(u => u.est_position).length;
+  const halos = ues.size - positioned;
+  if (!anchor) {
+    mapOverlay.innerHTML = '<div><strong>drone</strong> ' +
+      '<span style="color:var(--dim)">default view · no fix</span></div>' +
+      `<div>${ues.size} CRNTI${ues.size === 1 ? '' : 's'} · halos awaiting anchor</div>`;
+    return;
+  }
+  const acc = anchor.source === 'browser' && anchor.accuracy_m != null
+    ? ` · ±${anchor.accuracy_m.toFixed(0)}m`
+    : '';
   mapOverlay.innerHTML =
-    `<div><strong>drone</strong> ${g.lat.toFixed(5)}, ${g.lon.toFixed(5)}</div>` +
-    `<div>trail ${droneTrail.length} pts · ${positioned}/${ues.size} positioned</div>`;
+    `<div><strong>drone</strong> (${anchor.source}) ` +
+    `${anchor.lat.toFixed(5)}, ${anchor.lon.toFixed(5)}${acc}</div>` +
+    `<div>trail ${droneTrail.length} pts · ` +
+    `${positioned} positioned · ${halos} halo</div>`;
 }
 function renderLegend() {
   if (!ues.size) { legendEl.style.display = 'none'; return; }
@@ -2456,10 +2808,13 @@ function renderLegend() {
     const posCls = u.est_position ? 'has-pos' : 'no-pos';
     const cls = ['row', posCls,
                  u.key === selectedKey ? 'active' : ''].join(' ');
+    const dist = distanceFromDroneMeters(u);
+    const distTxt = dist ? fmtDist(dist) : '';
     return `<div class="${cls}" data-key="${u.key}">
               <span class="sw" style="background:${c}"></span>
               <span>${u.c_rnti_hex}</span>
               <span style="color:var(--dim-2)">PCI ${u.pci}</span>
+              <span class="dist">${distTxt}</span>
             </div>`;
   }).join('');
   legendRows.querySelectorAll('.row').forEach(el => {
@@ -2582,6 +2937,10 @@ function renderCard(u) {
     ? `<span class="chip tp">DL ${fmtKbps(u.throughput_dl_kbps)}</span>` : '';
   const tpUl = u.throughput_ul_kbps != null && u.throughput_ul_kbps > 0
     ? `<span class="chip tp">UL ${fmtKbps(u.throughput_ul_kbps)}</span>` : '';
+  const dist = distanceFromDroneMeters(u);
+  const distChip = dist
+    ? `<span class="chip dist" title="distance from drone (${dist.source})">${fmtDist(dist)}</span>`
+    : '';
   // FalconEye histogram confidence (paper: ≥8 = trust, <4 = likely noise).
   // Map to a 3-level dot so the eye can scan a busy list.
   const conf = u.confidence_max || 0;
@@ -2609,7 +2968,7 @@ function renderCard(u) {
     </div>
     ${mcsSparkSvg(u.mcs_history, color)}
     ${positionBlock(u)}
-    <div class="foot">${tpDl}${tpUl}${ulChip}${dlChip}${dciTags}${mcs}${prb}${tbs}</div>
+    <div class="foot">${distChip}${tpDl}${tpUl}${ulChip}${dlChip}${dciTags}${mcs}${prb}${tbs}</div>
   `;
   if (!isNew) {
     card.classList.remove('fresh');
@@ -2975,7 +3334,10 @@ function setGps(rec) {
     gpsText.textContent = `${g.lat.toFixed(5)}, ${g.lon.toFixed(5)} · ${g.fix}`;
     initMapIfReady(g.lat, g.lon);
     updateDroneMarker();
+    // Real GPS supersedes browser fallback: drop that marker.
+    updateBrowserAnchorMarker();
   }
+  reanchorHalos();
   renderMapOverlay();
 }
 function logLine(html) {
@@ -3067,11 +3429,12 @@ function applyEvent(ev) {
     [...cardsEl.querySelectorAll('.card')].forEach(c => c.remove());
     ueLayers.forEach(layer => {
       if (!map) return;
-      ['marker', 'accuracy'].forEach(k => {
+      ['marker', 'accuracy', 'halo', 'link'].forEach(k => {
         if (layer[k]) map.removeLayer(layer[k]);
       });
     });
     ueLayers.clear();
+    unpositionedKeys.clear();
     droneTrail.length = 0;
     (ev.gps_trail || []).forEach(p => droneTrail.push([p.lat, p.lon]));
     if (droneTrailLine) droneTrailLine.setLatLngs(droneTrail);
@@ -3120,6 +3483,7 @@ setInterval(() => {
   });
   setCellGrantStats();
   updateCoach();
+  if (offlineMap) renderPresenceCanvas();
 }, 1000);
 // --- replay scrubber ----------------------------------------------------
 const scrubberEl   = document.getElementById('scrubber');
@@ -3578,7 +3942,10 @@ class _Handler(BaseHTTPRequestHandler):
                     continue
                 self.wfile.write(b"data: " + msg.encode("utf-8") + b"\n\n")
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
+            # Any client/network drop (broken pipe, connection reset, or
+            # "no route to host" on a flaky link-local link) just ends this
+            # SSE stream — not worth logging a traceback per disconnect.
             pass
         finally:
             self.state.unregister(q)
